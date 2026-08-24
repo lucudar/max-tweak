@@ -34,7 +34,7 @@ jobs:
           make clean
           make FINALPACKAGE=1
 
-      - name: Find and upload dylib
+      - name: Find dylib
         run: |
           DYLIB=$(find .theos -name "MAXMods.dylib" -type f | head -1)
           if [ -z "$DYLIB" ]; then
@@ -46,9 +46,11 @@ jobs:
           file "$DYLIB"
           cp "$DYLIB" ./MAXMods.dylib
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: MAXMods-dylib
-          path: MAXMods.dylib
-          retention-days: 30
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="1.0.$(git rev-list --count HEAD)"
+          gh release create "v${VERSION}" MAXMods.dylib \
+            --title "MAXMods v${VERSION}" \
+            --notes "Auto-build from $(git log -1 --format='%h %s')"
