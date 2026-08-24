@@ -8,11 +8,21 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
+// Forward declarations for hooked classes that use UIView methods
+@interface OVKSupplementaryAdView : UIView
+@end
+
+@interface BannerPromoView : UIView
+@end
+
 // ============================================================================
 // MARK: - Settings Storage
 // ============================================================================
 
-#define PREFS_PREFIX @"maxmods."
+static NSString *const kGhostKey = @"maxmods.ghostMode";
+static NSString *const kAntiDeleteKey = @"maxmods.antiDelete";
+static NSString *const kForceSaveKey = @"maxmods.forceSave";
+static NSString *const kRemoveAdsKey = @"maxmods.removeAds";
 
 static BOOL ghostModeEnabled = YES;
 static BOOL antiDeleteEnabled = YES;
@@ -21,31 +31,30 @@ static BOOL removeAdsEnabled = YES;
 
 static void loadPreferences(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    // Default: all enabled
-    if ([defaults objectForKey:@PREFS_PREFIX "ghostMode"] == nil) {
-        [defaults setBool:YES forKey:@PREFS_PREFIX "ghostMode"];
+    if ([defaults objectForKey:kGhostKey] == nil) {
+        [defaults setBool:YES forKey:kGhostKey];
     }
-    if ([defaults objectForKey:@PREFS_PREFIX "antiDelete"] == nil) {
-        [defaults setBool:YES forKey:@PREFS_PREFIX "antiDelete"];
+    if ([defaults objectForKey:kAntiDeleteKey] == nil) {
+        [defaults setBool:YES forKey:kAntiDeleteKey];
     }
-    if ([defaults objectForKey:@PREFS_PREFIX "forceSave"] == nil) {
-        [defaults setBool:YES forKey:@PREFS_PREFIX "forceSave"];
+    if ([defaults objectForKey:kForceSaveKey] == nil) {
+        [defaults setBool:YES forKey:kForceSaveKey];
     }
-    if ([defaults objectForKey:@PREFS_PREFIX "removeAds"] == nil) {
-        [defaults setBool:YES forKey:@PREFS_PREFIX "removeAds"];
+    if ([defaults objectForKey:kRemoveAdsKey] == nil) {
+        [defaults setBool:YES forKey:kRemoveAdsKey];
     }
-    ghostModeEnabled = [defaults boolForKey:@PREFS_PREFIX "ghostMode"];
-    antiDeleteEnabled = [defaults boolForKey:@PREFS_PREFIX "antiDelete"];
-    forceSaveEnabled = [defaults boolForKey:@PREFS_PREFIX "forceSave"];
-    removeAdsEnabled = [defaults boolForKey:@PREFS_PREFIX "removeAds"];
+    ghostModeEnabled = [defaults boolForKey:kGhostKey];
+    antiDeleteEnabled = [defaults boolForKey:kAntiDeleteKey];
+    forceSaveEnabled = [defaults boolForKey:kForceSaveKey];
+    removeAdsEnabled = [defaults boolForKey:kRemoveAdsKey];
 }
 
 static void savePreferences(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    [defaults setBool:ghostModeEnabled forKey:@PREFS_PREFIX "ghostMode"];
-    [defaults setBool:antiDeleteEnabled forKey:@PREFS_PREFIX "antiDelete"];
-    [defaults setBool:forceSaveEnabled forKey:@PREFS_PREFIX "forceSave"];
-    [defaults setBool:removeAdsEnabled forKey:@PREFS_PREFIX "removeAds"];
+    [defaults setBool:ghostModeEnabled forKey:kGhostKey];
+    [defaults setBool:antiDeleteEnabled forKey:kAntiDeleteKey];
+    [defaults setBool:forceSaveEnabled forKey:kForceSaveKey];
+    [defaults setBool:removeAdsEnabled forKey:kRemoveAdsKey];
     [defaults synchronize];
 }
 
