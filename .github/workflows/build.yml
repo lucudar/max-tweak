@@ -22,24 +22,24 @@ jobs:
           # Clone Theos
           git clone --recursive --depth=1 https://github.com/theos/theos.git $THEOS
 
-          # Download iOS SDK (16.5)
-          SDK_URL="https://github.com/theos/sdks/releases/download/master/iPhoneOS16.5.sdk.tar.xz"
-          curl -sL "$SDK_URL" -o /tmp/sdk.tar.xz
+          # Use the SDK from Xcode already installed on the runner
+          SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "Using SDK: $SDKROOT"
           mkdir -p $THEOS/sdks
-          tar xf /tmp/sdk.tar.xz -C $THEOS/sdks/
+          ln -s "$SDKROOT" "$THEOS/sdks/iPhoneOS16.5.sdk"
 
       - name: Build Tweak
         run: |
-          export PATH="$THEOS/bin:$PATH"
+          export PATH="/opt/homebrew/opt/make/libexec/gnubin:$THEOS/bin:$PATH"
           make clean
-          make FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+          make FINALPACKAGE=1
 
       - name: Find and upload dylib
         run: |
           DYLIB=$(find .theos -name "MAXMods.dylib" -type f | head -1)
           if [ -z "$DYLIB" ]; then
             echo "ERROR: dylib not found!"
-            find .theos -type f -name "*.dylib"
+            find .theos -type f
             exit 1
           fi
           echo "Found: $DYLIB"
