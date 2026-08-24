@@ -1,0 +1,6 @@
+*.dylib
+.theos/
+packages/
+obj/
+MAX_test
+__pycache__/

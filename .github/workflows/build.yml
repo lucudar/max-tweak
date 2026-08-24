@@ -1,0 +1,54 @@
+name: Build MAXMods Tweak
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    env:
+      THEOS: /tmp/theos
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Theos
+        run: |
+          set -e
+          # Install dependencies
+          brew install ldid make
+
+          # Clone Theos
+          git clone --recursive --depth=1 https://github.com/theos/theos.git $THEOS
+
+          # Download iOS SDK (16.5)
+          SDK_URL="https://github.com/theos/sdks/releases/download/master/iPhoneOS16.5.sdk.tar.xz"
+          curl -sL "$SDK_URL" -o /tmp/sdk.tar.xz
+          mkdir -p $THEOS/sdks
+          tar xf /tmp/sdk.tar.xz -C $THEOS/sdks/
+
+      - name: Build Tweak
+        run: |
+          export PATH="$THEOS/bin:$PATH"
+          make clean
+          make FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+
+      - name: Find and upload dylib
+        run: |
+          DYLIB=$(find .theos -name "MAXMods.dylib" -type f | head -1)
+          if [ -z "$DYLIB" ]; then
+            echo "ERROR: dylib not found!"
+            find .theos -type f -name "*.dylib"
+            exit 1
+          fi
+          echo "Found: $DYLIB"
+          file "$DYLIB"
+          cp "$DYLIB" ./MAXMods.dylib
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MAXMods-dylib
+          path: MAXMods.dylib
+          retention-days: 30
