@@ -324,10 +324,6 @@ static void maxmods_tabBarLongPressImp(id self, SEL _cmd, UILongPressGestureReco
         [tbc presentViewController:nav animated:YES completion:nil];
     }
 }
-    } else {
-        vc.navigationItem.rightBarButtonItem = btn;
-    }
-}
 
 static void maxmods_openSettingsImp(id self, SEL _cmd) {
     MAXModsSettingsController *modsVC = [[MAXModsSettingsController alloc]
