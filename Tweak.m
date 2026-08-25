@@ -162,7 +162,12 @@ static void hook_updateOnlineStatus2(id self, SEL _cmd) {
     if (orig_updateOnlineStatus2) ((void(*)(id,SEL))orig_updateOnlineStatus2)(self, _cmd);
 }
 static void hook_deleteMessages(id self, SEL _cmd, id pks, BOOL forAll, BOOL enqueue) {
-    if (antiDeleteEnabled) return;
+    // Always allow YOUR OWN deletions (when enqueue=YES, it's user-initiated)
+    // Only block when the deletion comes from remote (server push)
+    if (antiDeleteEnabled && !enqueue) {
+        NSLog(@"[MAXMods] Anti-delete: blocked remote deletion");
+        return;
+    }
     if (orig_deleteMessages) ((void(*)(id,SEL,id,BOOL,BOOL))orig_deleteMessages)(self, _cmd, pks, forAll, enqueue);
 }
 static void hook_processDelete(id self, SEL _cmd, id notification) {
