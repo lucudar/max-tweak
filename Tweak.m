@@ -209,11 +209,7 @@ static void hook_fetchBanners(id self, SEL _cmd) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"MAXMods";
-    self.tableView.separatorInset = UIEdgeInsetsMake(0, 16, 0, 0);
-    if (@available(iOS 13.0, *)) {
-        self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
-        self.tableView.style == UITableViewStyleGrouped;
-    }
+        self.tableView.separatorInset = UIEdgeInsetsMake(0, 16, 0, 0);
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 2; }
