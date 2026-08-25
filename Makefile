@@ -1,11 +1,13 @@
 TARGET := iphone:clang:16.5:15.0
-INSTALL_TARGET_PROCESSES = MAX
 ARCHS = arm64
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = MAXMods
-MAXMods_FILES = Tweak.xm
-MAXMods_CFLAGS = -fobjc-arc -Wno-unused-variable
+LIBRARY_NAME = MAXMods
+MAXMods_FILES = Tweak.m
+MAXMods_CFLAGS = -fobjc-arc -Wno-unused-variable -Wno-deprecated-declarations
+MAXMods_FRAMEWORKS = UIKit Foundation
+MAXMods_INSTALL_PATH = /Library/MobileSubstrate/DynamicLibraries
+MAXMods_LIBRARIES =
 
-include $(THEOS_MAKE_PATH)/tweak.mk
+include $(THEOS_MAKE_PATH)/library.mk
