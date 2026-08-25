@@ -278,6 +278,57 @@ static void hook_settingsViewDidLoad(id self, SEL _cmd) {
     }
 }
 
+// ============================================================================
+#pragma mark - Long-press on Settings tab to open MAXMods
+// ============================================================================
+
+static IMP orig_tabBarViewDidLoad = NULL;
+
+static void hook_tabBarViewDidLoad(id self, SEL _cmd) {
+    if (orig_tabBarViewDidLoad)
+        ((void(*)(id,SEL))orig_tabBarViewDidLoad)(self, _cmd);
+
+    // Add long press gesture to the tab bar
+    UITabBarController *tbc = (UITabBarController *)self;
+    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
+        initWithTarget:self action:@selector(maxmods_tabBarLongPress:)];
+    lp.minimumPressDuration = 0.5;
+    [tbc.tabBar addGestureRecognizer:lp];
+    NSLog(@"[MAXMods] Long-press gesture added to tab bar");
+}
+
+static void maxmods_tabBarLongPressImp(id self, SEL _cmd, UILongPressGestureRecognizer *gesture) {
+    if (gesture.state != UIGestureRecognizerStateBegan) return;
+
+    // Detect which tab was long-pressed
+    UITabBar *tabBar = (UITabBar *)gesture.view;
+    CGPoint point = [gesture locationInView:tabBar];
+
+    // Find the last tab item (Profile/Settings is usually last)
+    NSArray *items = tabBar.items;
+    if (!items.count) return;
+
+    CGFloat tabWidth = tabBar.bounds.size.width / items.count;
+    NSInteger tappedIndex = (NSInteger)(point.x / tabWidth);
+
+    // Last tab = Profile/Settings tab
+    if (tappedIndex == (NSInteger)items.count - 1) {
+        UITabBarController *tbc = (UITabBarController *)self;
+        MAXModsSettingsController *modsVC = [[MAXModsSettingsController alloc]
+            initWithStyle:UITableViewStyleGrouped];
+        UINavigationController *nav = [[UINavigationController alloc]
+            initWithRootViewController:modsVC];
+        modsVC.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc]
+            initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+            target:modsVC action:@selector(dismissSelf)];
+        [tbc presentViewController:nav animated:YES completion:nil];
+    }
+}
+    } else {
+        vc.navigationItem.rightBarButtonItem = btn;
+    }
+}
+
 static void maxmods_openSettingsImp(id self, SEL _cmd) {
     MAXModsSettingsController *modsVC = [[MAXModsSettingsController alloc]
         initWithStyle:UITableViewStyleGrouped];
@@ -430,14 +481,21 @@ static void maxmods_init(void) {
     // Settings tab: hook SettingsViewController viewDidLoad
     Class settingsVC = objc_getClass("_TtC10SettingsUI22SettingsViewController");
     if (settingsVC) {
-        // Add the maxmods_openSettings method to the class
         class_addMethod(settingsVC, @selector(maxmods_openSettings),
             (IMP)maxmods_openSettingsImp, "v@:");
         orig_settingsViewDidLoad = swizzle(settingsVC,
             @selector(viewDidLoad), (IMP)hook_settingsViewDidLoad);
         NSLog(@"[MAXMods] Settings tab hook: OK");
-    } else {
-        NSLog(@"[MAXMods] Settings VC not found, using shake only");
+    }
+
+    // Long-press on tab bar to open MAXMods
+    Class tabBarVC = objc_getClass("_TtC7OMUIKit16TabBarController");
+    if (tabBarVC) {
+        class_addMethod(tabBarVC, @selector(maxmods_tabBarLongPress:),
+            (IMP)maxmods_tabBarLongPressImp, "v@:@");
+        orig_tabBarViewDidLoad = swizzle(tabBarVC,
+            @selector(viewDidLoad), (IMP)hook_tabBarViewDidLoad);
+        NSLog(@"[MAXMods] Tab bar long-press hook: OK");
     }
 
     // Shake gesture (fallback)
