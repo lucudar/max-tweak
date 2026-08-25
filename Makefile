@@ -5,8 +5,8 @@ include $(THEOS)/makefiles/common.mk
 
 LIBRARY_NAME = MAXMods
 MAXMods_FILES = Tweak.m
-MAXMods_CFLAGS = -fobjc-arc -Wno-unused-variable -Wno-deprecated-declarations
-MAXMods_FRAMEWORKS = UIKit Foundation
+MAXMods_CFLAGS = -fobjc-arc -Wno-unused-variable -Wno-deprecated-declarations -Wno-objc-protocol-method-implementation
+MAXMods_FRAMEWORKS = UIKit Foundation Security
 MAXMods_INSTALL_PATH = /Library/MobileSubstrate/DynamicLibraries
 MAXMods_LIBRARIES =
 
