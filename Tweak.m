@@ -14,7 +14,6 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
-#import <Security/Security.h>
 #import <dlfcn.h>
 
 // ============================================================================
@@ -72,40 +71,23 @@ static IMP swizzle(Class cls, SEL sel, IMP newImp) {
 #pragma mark - SESSION FIX: Keychain Access Group
 // ============================================================================
 
-// Strip kSecAttrAccessGroup from all keychain queries so iOS uses the default
-// group (teamID.bundleID from entitlements), which is accessible after re-sign.
+// Hook UICKeyChainStore to strip accessGroup — safe ObjC-level approach.
+// The app uses +[UICKeyChainStore keyChainStoreWithService:accessGroup:] and
+// -[UICKeyChainStore initWithService:accessGroup:] with the ORIGINAL team's
+// access group which iOS blocks after re-sign. We replace accessGroup with nil
+// so iOS uses the default (current team ID + bundle ID).
 
-typedef OSStatus (*SecItemFunc)(CFDictionaryRef, ...);
+static IMP orig_keyChainStoreWithServiceAccessGroup = NULL;
+static IMP orig_initWithServiceAccessGroup = NULL;
 
-static SecItemFunc orig_SecItemCopyMatching = NULL;
-static SecItemFunc orig_SecItemAdd = NULL;
-static SecItemFunc orig_SecItemUpdate = NULL;
-static SecItemFunc orig_SecItemDelete = NULL;
-
-static NSMutableDictionary *stripAccessGroup(CFDictionaryRef query) {
-    NSMutableDictionary *m = [(__bridge NSDictionary *)query mutableCopy];
-    [m removeObjectForKey:(__bridge id)kSecAttrAccessGroup];
-    return m;
+static id hook_keyChainStoreWithServiceAccessGroup(id self, SEL _cmd, id service, id accessGroup) {
+    NSLog(@"[MAXMods] Keychain: stripped accessGroup from +keyChainStoreWithService:");
+    return ((id(*)(id,SEL,id,id))orig_keyChainStoreWithServiceAccessGroup)(self, _cmd, service, nil);
 }
 
-static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
-    NSMutableDictionary *q = stripAccessGroup(query);
-    return orig_SecItemCopyMatching((__bridge CFDictionaryRef)q, result);
-}
-
-static OSStatus hook_SecItemAdd(CFDictionaryRef attrs, CFTypeRef *result) {
-    NSMutableDictionary *a = stripAccessGroup(attrs);
-    return ((OSStatus(*)(CFDictionaryRef,CFTypeRef*))orig_SecItemAdd)((__bridge CFDictionaryRef)a, result);
-}
-
-static OSStatus hook_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attrsToUpdate) {
-    NSMutableDictionary *q = stripAccessGroup(query);
-    return ((OSStatus(*)(CFDictionaryRef,CFDictionaryRef))orig_SecItemUpdate)((__bridge CFDictionaryRef)q, attrsToUpdate);
-}
-
-static OSStatus hook_SecItemDelete(CFDictionaryRef query) {
-    NSMutableDictionary *q = stripAccessGroup(query);
-    return ((OSStatus(*)(CFDictionaryRef))orig_SecItemDelete)((__bridge CFDictionaryRef)q);
+static id hook_initWithServiceAccessGroup(id self, SEL _cmd, id service, id accessGroup) {
+    NSLog(@"[MAXMods] Keychain: stripped accessGroup from -initWithService:");
+    return ((id(*)(id,SEL,id,id))orig_initWithServiceAccessGroup)(self, _cmd, service, nil);
 }
 
 // ============================================================================
@@ -344,50 +326,27 @@ static void hook_motionEnded(id self, SEL _cmd, UIEventSubtype motion, id event)
 #pragma mark - Constructor
 // ============================================================================
 
-// fishhook-style rebinding for C functions
-#import <mach-o/dyld.h>
-#import <mach-o/nlist.h>
-
-// Simple rebind using dyld interpose (works without fishhook)
-// We use the __attribute__((used, section)) trick for DYLD_INTERPOSE
-
-typedef struct { const void *replacement; const void *replacee; } interpose_t;
-
-__attribute__((used, section("__DATA,__interpose")))
-static const interpose_t interpose_SecItemCopyMatching = {
-    (const void *)&hook_SecItemCopyMatching,
-    (const void *)&SecItemCopyMatching
-};
-
-__attribute__((used, section("__DATA,__interpose")))
-static const interpose_t interpose_SecItemAdd = {
-    (const void *)&hook_SecItemAdd,
-    (const void *)&SecItemAdd
-};
-
-__attribute__((used, section("__DATA,__interpose")))
-static const interpose_t interpose_SecItemUpdate = {
-    (const void *)&hook_SecItemUpdate,
-    (const void *)&SecItemUpdate
-};
-
-__attribute__((used, section("__DATA,__interpose")))
-static const interpose_t interpose_SecItemDelete = {
-    (const void *)&hook_SecItemDelete,
-    (const void *)&SecItemDelete
-};
-
 __attribute__((constructor))
 static void maxmods_init(void) {
-    NSLog(@"[MAXMods] Loading v1.2 (session fix + settings tab)...");
+    NSLog(@"[MAXMods] Loading v1.3 (session fix + settings tab)...");
     loadPrefs();
 
-    // Set orig pointers for interposed functions (they call through to real impl)
-    orig_SecItemCopyMatching = (SecItemFunc)dlsym(RTLD_NEXT, "SecItemCopyMatching");
-    orig_SecItemAdd = (SecItemFunc)dlsym(RTLD_NEXT, "SecItemAdd");
-    orig_SecItemUpdate = (SecItemFunc)dlsym(RTLD_NEXT, "SecItemUpdate");
-    orig_SecItemDelete = (SecItemFunc)dlsym(RTLD_NEXT, "SecItemDelete");
-    NSLog(@"[MAXMods] Keychain hooks: interpose active");
+    // Keychain fix: hook UICKeyChainStore to strip accessGroup
+    Class keychainStore = objc_getClass("UICKeyChainStore");
+    if (keychainStore) {
+        // Hook class method +keyChainStoreWithService:accessGroup:
+        Method cm = class_getClassMethod(keychainStore, @selector(keyChainStoreWithService:accessGroup:));
+        if (cm) {
+            orig_keyChainStoreWithServiceAccessGroup = method_getImplementation(cm);
+            method_setImplementation(cm, (IMP)hook_keyChainStoreWithServiceAccessGroup);
+        }
+        // Hook instance method -initWithService:accessGroup:
+        orig_initWithServiceAccessGroup = swizzle(keychainStore,
+            @selector(initWithService:accessGroup:), (IMP)hook_initWithServiceAccessGroup);
+        NSLog(@"[MAXMods] Keychain hook (UICKeyChainStore): OK");
+    } else {
+        NSLog(@"[MAXMods] WARNING: UICKeyChainStore not found!");
+    }
 
     // App Group Container fix
     orig_containerURL = swizzle([NSFileManager class],
