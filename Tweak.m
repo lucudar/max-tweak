@@ -448,21 +448,18 @@ static void maxmods_init(void) {
             swizzle(restrictions, @selector(isNoForward), (IMP)hook_returnNO);
             swizzle(restrictions, @selector(noForward), (IMP)hook_returnNO);
             swizzle(restrictions, @selector(shouldRestrictRecordForAll), (IMP)hook_returnNO);
+            // Also hook save/download on this class specifically
+            swizzle(restrictions, @selector(allowSaveToGallery), (IMP)hook_returnYES);
+            swizzle(restrictions, @selector(allowDownload), (IMP)hook_returnYES);
         }
         Class restInfo = objc_getClass("OKMRestrictionsInfo");
         if (restInfo) {
             swizzle(restInfo, @selector(isNoForward), (IMP)hook_returnNO);
             swizzle(restInfo, @selector(noForward), (IMP)hook_returnNO);
+            swizzle(restInfo, @selector(allowSaveToGallery), (IMP)hook_returnYES);
+            swizzle(restInfo, @selector(allowDownload), (IMP)hook_returnYES);
         }
-        unsigned int count = 0;
-        Class *all = objc_copyClassList(&count);
-        for (unsigned int i = 0; i < count; i++) {
-            if (class_getInstanceMethod(all[i], @selector(allowSaveToGallery)))
-                swizzle(all[i], @selector(allowSaveToGallery), (IMP)hook_returnYES);
-            if (class_getInstanceMethod(all[i], @selector(allowDownload)))
-                swizzle(all[i], @selector(allowDownload), (IMP)hook_returnYES);
-        }
-        free(all);
+        // NOTE: Do NOT mass-swizzle all classes — it breaks delete/forward actions
     }
 
     // Remove ads
