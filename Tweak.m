@@ -162,21 +162,13 @@ static void hook_updateOnlineStatus2(id self, SEL _cmd) {
     if (orig_updateOnlineStatus2) ((void(*)(id,SEL))orig_updateOnlineStatus2)(self, _cmd);
 }
 static void hook_deleteMessages(id self, SEL _cmd, id pks, BOOL forAll, BOOL enqueue) {
-    // Pass through always — anti-delete works only on OKMMessageDeleteListener level
+    // Pass through unconditionally — do NOT interfere with delete flow
     if (orig_deleteMessages) ((void(*)(id,SEL,id,BOOL,BOOL))orig_deleteMessages)(self, _cmd, pks, forAll, enqueue);
 }
 static void hook_processDelete(id self, SEL _cmd, id notification) {
-    // This is called when REMOTE user deletes their message
-    // We log it but let it through — blocking causes UI hangs
-    if (antiDeleteEnabled) {
-        NSLog(@"[MAXMods] Anti-delete: remote deletion detected (logged, not blocked)");
-    }
     if (orig_processDelete) ((void(*)(id,SEL,id))orig_processDelete)(self, _cmd, notification);
 }
 static void hook_handleDelete(id self, SEL _cmd, id messages, id chat) {
-    if (antiDeleteEnabled) {
-        NSLog(@"[MAXMods] Anti-delete: handleDelete detected (logged, not blocked)");
-    }
     if (orig_handleDelete) ((void(*)(id,SEL,id,id))orig_handleDelete)(self, _cmd, messages, chat);
 }
 static BOOL hook_returnNO(id self, SEL _cmd) { return NO; }
@@ -419,8 +411,7 @@ static void maxmods_init(void) {
             @selector(markChat:asReadTo:messageId:), (IMP)hook_markChat);
         orig_markChatsAsRead = swizzle(chatService,
             @selector(markChatsAsReadWithChats:readType:), (IMP)hook_markChatsAsRead);
-        orig_deleteMessages = swizzle(chatService,
-            @selector(_deleteMessagesWithPks:deleteForAll:enqueueTasks:), (IMP)hook_deleteMessages);
+        // NOTE: do NOT hook _deleteMessagesWithPks — wrong signature causes hang
     }
 
     // Ghost Mode: typing
@@ -442,14 +433,11 @@ static void maxmods_init(void) {
         orig_updateOnlineStatus2 = swizzle(chatPresenter,
             @selector(updateOnlineStatus), (IMP)hook_updateOnlineStatus2);
 
-    // Anti-delete
-    Class deleteListener = objc_getClass("OKMMessageDeleteListener");
-    if (deleteListener) {
-        orig_processDelete = swizzle(deleteListener,
-            @selector(processDeleteNotification:), (IMP)hook_processDelete);
-        orig_handleDelete = swizzle(deleteListener,
-            @selector(handleDeletedMessages:inChat:), (IMP)hook_handleDelete);
-    }
+    // Anti-delete: disabled for now — hooking delete methods causes UI hangs
+    // The delete flow uses completions/callbacks that break when intercepted.
+    // TODO: implement by saving message content BEFORE delete completes
+    // Class deleteListener = objc_getClass("OKMMessageDeleteListener");
+    // if (deleteListener) { ... }
 
     // Force save media
     if (forceSaveEnabled) {
