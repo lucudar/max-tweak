@@ -138,11 +138,19 @@ static IMP orig_processDelete __attribute__((unused)) = NULL;
 static IMP orig_handleDelete __attribute__((unused)) = NULL;
 
 static void hook_markChat(id self, SEL _cmd, id chat, id arg2, id msgId) {
-    if (ghostModeEnabled) return;
+    // Only block if ghost mode is on AND we're on main thread (user reading)
+    // Internal calls from delete/etc may come from background — let them through
+    if (ghostModeEnabled && [NSThread isMainThread] && msgId != nil) {
+        NSLog(@"[MAXMods] Ghost: blocked read receipt");
+        return;
+    }
     if (orig_markChat) ((void(*)(id,SEL,id,id,id))orig_markChat)(self, _cmd, chat, arg2, msgId);
 }
 static void hook_markChatsAsRead(id self, SEL _cmd, id chats, long long type) {
-    if (ghostModeEnabled) return;
+    if (ghostModeEnabled && [NSThread isMainThread]) {
+        NSLog(@"[MAXMods] Ghost: blocked bulk read");
+        return;
+    }
     if (orig_markChatsAsRead) ((void(*)(id,SEL,id,long long))orig_markChatsAsRead)(self, _cmd, chats, type);
 }
 static void hook_startTyping(id self, SEL _cmd, long long type, id chat, id key) {
@@ -441,25 +449,19 @@ static void maxmods_init(void) {
     // Class deleteListener = objc_getClass("OKMMessageDeleteListener");
     // if (deleteListener) { ... }
 
-    // Force save media
+    // Force save media — ONLY hook restriction flag methods, nothing else
     if (forceSaveEnabled) {
         Class restrictions = objc_getClass("OKMChatRestrictions");
         if (restrictions) {
             swizzle(restrictions, @selector(isNoForward), (IMP)hook_returnNO);
             swizzle(restrictions, @selector(noForward), (IMP)hook_returnNO);
             swizzle(restrictions, @selector(shouldRestrictRecordForAll), (IMP)hook_returnNO);
-            // Also hook save/download on this class specifically
-            swizzle(restrictions, @selector(allowSaveToGallery), (IMP)hook_returnYES);
-            swizzle(restrictions, @selector(allowDownload), (IMP)hook_returnYES);
         }
         Class restInfo = objc_getClass("OKMRestrictionsInfo");
         if (restInfo) {
             swizzle(restInfo, @selector(isNoForward), (IMP)hook_returnNO);
             swizzle(restInfo, @selector(noForward), (IMP)hook_returnNO);
-            swizzle(restInfo, @selector(allowSaveToGallery), (IMP)hook_returnYES);
-            swizzle(restInfo, @selector(allowDownload), (IMP)hook_returnYES);
         }
-        // NOTE: Do NOT mass-swizzle all classes — it breaks delete/forward actions
     }
 
     // Remove ads
