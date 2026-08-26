@@ -181,8 +181,8 @@ __attribute__((unused))
 static void hook_handleDelete(id self, SEL _cmd, id messages, id chat) {
     if (orig_handleDelete) ((void(*)(id,SEL,id,id))orig_handleDelete)(self, _cmd, messages, chat);
 }
-static BOOL hook_returnNO(id self, SEL _cmd) { return NO; }
-static BOOL hook_returnYES(id self, SEL _cmd) { return YES; }
+__attribute__((unused)) static BOOL hook_returnNO(id self, SEL _cmd) { return NO; }
+__attribute__((unused)) static BOOL hook_returnYES(id self, SEL _cmd) { return YES; }
 static void hook_fetchBanners(id self, SEL _cmd) {
     if (removeAdsEnabled) return;
 }
