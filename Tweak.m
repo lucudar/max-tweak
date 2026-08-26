@@ -162,20 +162,21 @@ static void hook_updateOnlineStatus2(id self, SEL _cmd) {
     if (orig_updateOnlineStatus2) ((void(*)(id,SEL))orig_updateOnlineStatus2)(self, _cmd);
 }
 static void hook_deleteMessages(id self, SEL _cmd, id pks, BOOL forAll, BOOL enqueue) {
-    // Always allow YOUR OWN deletions (when enqueue=YES, it's user-initiated)
-    // Only block when the deletion comes from remote (server push)
-    if (antiDeleteEnabled && !enqueue) {
-        NSLog(@"[MAXMods] Anti-delete: blocked remote deletion");
-        return;
-    }
+    // Pass through always — anti-delete works only on OKMMessageDeleteListener level
     if (orig_deleteMessages) ((void(*)(id,SEL,id,BOOL,BOOL))orig_deleteMessages)(self, _cmd, pks, forAll, enqueue);
 }
 static void hook_processDelete(id self, SEL _cmd, id notification) {
-    if (antiDeleteEnabled) return;
+    // This is called when REMOTE user deletes their message
+    // We log it but let it through — blocking causes UI hangs
+    if (antiDeleteEnabled) {
+        NSLog(@"[MAXMods] Anti-delete: remote deletion detected (logged, not blocked)");
+    }
     if (orig_processDelete) ((void(*)(id,SEL,id))orig_processDelete)(self, _cmd, notification);
 }
 static void hook_handleDelete(id self, SEL _cmd, id messages, id chat) {
-    if (antiDeleteEnabled) return;
+    if (antiDeleteEnabled) {
+        NSLog(@"[MAXMods] Anti-delete: handleDelete detected (logged, not blocked)");
+    }
     if (orig_handleDelete) ((void(*)(id,SEL,id,id))orig_handleDelete)(self, _cmd, messages, chat);
 }
 static BOOL hook_returnNO(id self, SEL _cmd) { return NO; }
