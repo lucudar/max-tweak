@@ -133,9 +133,9 @@ static IMP orig_startTyping = NULL;
 static IMP orig_stopTyping = NULL;
 static IMP orig_updateOnlineStatus = NULL;
 static IMP orig_updateOnlineStatus2 = NULL;
-static IMP orig_deleteMessages = NULL;
-static IMP orig_processDelete = NULL;
-static IMP orig_handleDelete = NULL;
+static IMP orig_deleteMessages __attribute__((unused)) = NULL;
+static IMP orig_processDelete __attribute__((unused)) = NULL;
+static IMP orig_handleDelete __attribute__((unused)) = NULL;
 
 static void hook_markChat(id self, SEL _cmd, id chat, id arg2, id msgId) {
     if (ghostModeEnabled) return;
@@ -161,13 +161,15 @@ static void hook_updateOnlineStatus2(id self, SEL _cmd) {
     if (ghostModeEnabled) return;
     if (orig_updateOnlineStatus2) ((void(*)(id,SEL))orig_updateOnlineStatus2)(self, _cmd);
 }
+__attribute__((unused))
 static void hook_deleteMessages(id self, SEL _cmd, id pks, BOOL forAll, BOOL enqueue) {
-    // Pass through unconditionally — do NOT interfere with delete flow
     if (orig_deleteMessages) ((void(*)(id,SEL,id,BOOL,BOOL))orig_deleteMessages)(self, _cmd, pks, forAll, enqueue);
 }
+__attribute__((unused))
 static void hook_processDelete(id self, SEL _cmd, id notification) {
     if (orig_processDelete) ((void(*)(id,SEL,id))orig_processDelete)(self, _cmd, notification);
 }
+__attribute__((unused))
 static void hook_handleDelete(id self, SEL _cmd, id messages, id chat) {
     if (orig_handleDelete) ((void(*)(id,SEL,id,id))orig_handleDelete)(self, _cmd, messages, chat);
 }
