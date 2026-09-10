@@ -191,16 +191,14 @@ static UIWindow *max_currentWindow(void) {
             cfg.image = [action.image imageWithTintColor:tint
                                           renderingMode:UIImageRenderingModeAlwaysTemplate];
         }
-        cfg.imagePlacement = NSImageLeading;
+        cfg.imagePlacement = NSDirectionalRectEdgeLeading;
         cfg.imagePadding = 12;
-        cfg.titleTextAttributesTransformer =
-            [NSTextAttributesTransformer textAttributesTransformerWithTransformer:
-                ^NSDictionary *(NSDictionary *attrs) {
-                    NSMutableDictionary *m = [attrs mutableCopy];
-                    m[NSFontAttributeName] = [UIFont systemFontOfSize:17 weight:UIFontWeightRegular];
-                    m[NSForegroundColorAttributeName] = tint;
-                    return m;
-                }];
+        cfg.baseForegroundColor = tint;
+        cfg.attributedTitle = [[NSAttributedString alloc]
+            initWithString:action.title attributes:@{
+                NSFontAttributeName: [UIFont systemFontOfSize:17 weight:UIFontWeightRegular],
+                NSForegroundColorAttributeName: tint,
+            }];
         cfg.contentInsets = NSDirectionalEdgeInsetsMake(0, 14, 0, 16);
         self.configuration = cfg;
 
