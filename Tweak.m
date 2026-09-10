@@ -1,34 +1,39 @@
 /**
- * MAXMods v4.5 — native menu without lifted preview + deferred handlers.
+ * MAXMods v5.0 — Telegram-style custom context menu for chat messages
+ * + file logging (Documents/maxmods_log.txt, visible in the Files app)
+ * + main-thread watchdog that records freezes into the same log
  *
- * v4.4 log evidence: freeze happens during menu PRESENTATION (before any
- * tap — no "action fired" line, watchdog silent), so the deadlock is in the
- * lifted-preview machinery of the old-SDK binary on iOS 26/27, not in the
- * action handlers. v4.5 drops the preview (nil) and keeps the deferred
- * handlers as belt-and-braces.
+ * Final diagnosis (v4.3/v4.4/v4.5 baseline tests): the STOCK system menu
+ * deadlocks during its own PRESENTATION (before any action tap, watchdog
+ * silent) on iOS 26/27 with this old-SDK binary — with or without preview,
+ * with or without deferred handlers. The system menu cannot be used at all.
+ * The custom overlay (v4.2) ran the same app handlers freeze-free, proving
+ * only the UIContextMenuInteraction machinery is broken.
  *
- * Confirmed diagnosis (baseline v4.3 test): with the stock system menu,
- * tapping Удалить freezes the app — the app's action handler mutates the
- * collection view / presents a confirmation alert while UIContextMenu's
- * dismissal transition is still running, which deadlocks the main thread on
- * iOS 26/27 with this old-SDK binary. With the custom overlay (v4.2) the same
- * handlers fired with no dismissal in flight — no freeze, proving the
- * handlers themselves are fine and only the timing is fatal.
+ * Root cause of the delete freeze (long-press -> Удалить -> app hangs):
+ *  - MessageCell (Swift, ChatHistoryUI) hosts a per-cell UIContextMenuInteraction
+ *    (MessageCell+ContextMenuInteraction.swift).
+ *  - The app binary targets an old SDK; on iOS 26/27 the system context-menu
+ *    dismissal racing with the collection-view update (message removed) deadlocks
+ *    the main thread. The app's own 300 ms action delay (OMContextMenu
+ *    convertItem:sender:applyActionDelay:) is not enough on the new iOS.
  *
- * Fix: capture the app's actionProvider (via the
- * +[UIContextMenuConfiguration configurationWith...:] hook), rebuild the
- * native menu WITHOUT the lifted preview, and wrap every UIAction handler
- * in a 0.75s
- * dispatch_after — by then the dismissal transition has finished. The menu
- * dispatch_after. The menu stays fully native; the message just no longer
- * lifts out of the list.
- * The app itself uses this exact pattern elsewhere (OMContextMenu
- * convertItem:sender:applyActionDelay: with a 300 ms constant).
+ * Fix — replace the system menu for message cells with our own overlay:
+ *  1. hook -[MessageCell contextMenuInteraction:configurationForMenuAtLocation:]
+ *     and call the original (which captures the app's actionProvider block via
+ *     the hooked +[UIContextMenuConfiguration configurationWith...:] below);
+ *  2. invoke the app's actionProvider ourselves -> UIMenu -> UIActions;
+ *  3. present our own Telegram-style overlay panel (blur, icons, haptics,
+ *     lifted message snapshot);
+ *  4. return nil so iOS never starts a system context menu at all — the
+ *     deadlock path (dismissal transition + collection mutation) is gone
+ *     by construction;
+ *  5. item taps fire the app's own UIAction handlers, so delete/edit/reply/
+ *     pin/forward and their confirmation alerts keep working untouched.
  *
- * File logging + main-thread watchdog retained from v4.2.
- *
- * Fallback: if any step fails (no provider, unsupported menu elements,
- * exception) we return the original configuration untouched.
+ * Fallback: if any step of the interception fails (no provider, empty menu,
+ * deferred menu elements, exception, no window) we return the original
+ * configuration and the stock system menu is shown exactly as before.
  *
  * Session persistence fixes (keychain / app-group / defaults suite) carried
  * over from v3.0 — required after re-signing with a different team id.
@@ -120,22 +125,24 @@ static void max_scheduleWatchdog(void) {
 }
 
 // ============================================================================
+#pragma mark - Telegram-style menu overlay (interface)
+// ============================================================================
+
+@interface MAXMenuOverlay : UIView
++ (BOOL)isShowing;
++ (BOOL)shouldSkip;
++ (BOOL)presentWithActions:(NSArray<UIAction *> *)actions cell:(UIView *)cell;
+@end
+
+// ============================================================================
 #pragma mark - Menu interception state
 // ============================================================================
 
 typedef UIMenu *_Nullable (^ActionProviderBlock)(NSArray<UIMenuElement *> *_Nonnull);
-typedef UIViewController *_Nullable (^PreviewProviderBlock)(void);
 
 static BOOL g_inMessageCellMenu = NO;   // set while orig cell config runs
 static ActionProviderBlock g_capturedProvider = nil;
-static PreviewProviderBlock g_capturedPreview = nil;
-static id g_capturedIdentifier = nil;
 static BOOL g_foundUnsupportedElement = NO;
-
-// How long to defer tapped menu actions so the system menu's dismissal
-// transition is fully over before the app's handler runs. The app's own
-// analogous delay is 300 ms; dismissal animations can take longer, so be safe.
-static NSTimeInterval const kMaxModsActionDelay = 0.75;
 
 // ============================================================================
 #pragma mark - Hook: +[UIContextMenuConfiguration configurationWith...]
@@ -147,8 +154,6 @@ static id hook_configCreate(id self, SEL _cmd,
                             id identifier, id previewProvider, id actionProvider) {
     if (g_inMessageCellMenu && actionProvider != nil) {
         g_capturedProvider = [actionProvider copy];
-        g_capturedPreview = [previewProvider copy];
-        g_capturedIdentifier = identifier;
         maxlog(@"menu: actionProvider captured");
     }
     return ((id(*)(id,SEL,id,id,id))orig_configCreate)(
@@ -156,114 +161,24 @@ static id hook_configCreate(id self, SEL _cmd,
 }
 
 // ============================================================================
-#pragma mark - Deferred-action menu rebuilding
+#pragma mark - Menu flattening
 // ============================================================================
 
-// Hidden control used to fire a captured UIAction's handler — the documented
-// way to invoke an action outside of a real control event.
-static UIControl *max_ghostControl(void) {
-    static UIControl *ghost = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ ghost = [UIControl new]; });
-    return ghost;
-}
-
-// Wrap a UIAction's handler in a dispatch_after so it runs after the system
-// menu has fully dismissed. Same title/image/identifier — the menu looks and
-// animates 100% native; only the handler timing changes.
-// The block strongly retains the original action (the replacement config does
-// not keep the original one alive).
-static UIAction *max_wrappedAction(UIAction *action) {
-    return [UIAction actionWithTitle:action.title
-                               image:action.image
-                          identifier:action.identifier
-                             handler:^(__kindof UIAction *_) {
-        (void)_;
-        maxlog(@"action fired (deferring %.2fs): %@",
-               kMaxModsActionDelay, action.title ?: @"?");
-        dispatch_after(
-            dispatch_time(DISPATCH_TIME_NOW,
-                          (int64_t)(kMaxModsActionDelay * NSEC_PER_SEC)),
-            dispatch_get_main_queue(), ^{
-            maxlog(@"action running: %@", action.title ?: @"?");
-            UIControl *ghost = max_ghostControl();
-            [ghost removeTarget:nil action:NULL forControlEvents:UIControlEventAllEvents];
-            [ghost addAction:action forControlEvents:UIControlEventPrimaryActionTriggered];
-            [ghost sendActionsForControlEvents:UIControlEventPrimaryActionTriggered];
-            maxlog(@"action done: %@", action.title ?: @"?");
-        });
-    }];
-}
-
-// Rebuild a UIMenu tree with every UIAction handler deferred.
-// Returns nil if the tree contains elements we can't rebuild (deferred
-// elements, commands) — caller then falls back to the original config.
-static UIMenuElement *max_wrappedElement(UIMenuElement *element) {
+// Recursively flatten a UIMenu tree into UIActions.
+// Anything we can't fire ourselves (UIDeferredMenuElement, UICommand, ...)
+// sets the unsupported flag so the caller falls back to the system menu.
+static void flattenMenu(UIMenuElement *element, NSMutableArray<UIAction *> *out) {
     if ([element isKindOfClass:[UIAction class]]) {
-        UIAction *a = (UIAction *)element;
-        if (a.title.length == 0) return nil;   // separators/unknowns — bail
-        return max_wrappedAction(a);
+        [out addObject:(UIAction *)element];
+        return;
     }
     if ([element isKindOfClass:[UIMenu class]]) {
-        UIMenu *menu = (UIMenu *)element;
-        NSMutableArray<UIMenuElement *> *children = [NSMutableArray array];
-        for (UIMenuElement *child in menu.children) {
-            UIMenuElement *wrapped = max_wrappedElement(child);
-            if (!wrapped) return nil;
-            [children addObject:wrapped];
-        }
-        return [UIMenu menuWithTitle:menu.title
-                             image:menu.image
-                        identifier:menu.identifier
-                           options:menu.options
-                          children:children];
+        for (UIMenuElement *child in ((UIMenu *)element).children)
+            flattenMenu(child, out);
+        return;
     }
-    return nil;   // UIDeferredMenuElement / UICommand / ... — not rebuildable
-}
-
-// Build a replacement configuration: same identifier and preview as the app's
-// own, but every action handler deferred past menu dismissal.
-// Returns nil when the menu can't be safely rebuilt.
-static UIContextMenuConfiguration *max_deferredConfig(UIContextMenuConfiguration *fallback) {
-    if (!g_capturedProvider) return nil;
-
-    UIMenu *menu = nil;
-    @try {
-        menu = g_capturedProvider(@[]);
-    } @catch (NSException *e) {
-        maxlog(@"menu: actionProvider threw: %@", e);
-        return nil;
-    }
-    if (!menu) return nil;
-
-    NSMutableArray<UIMenuElement *> *children = [NSMutableArray array];
-    for (UIMenuElement *element in menu.children) {
-        UIMenuElement *wrapped = max_wrappedElement(element);
-        if (!wrapped) {
-            maxlog(@"menu: not rebuildable (%@) — system fallback",
-                   NSStringFromClass([element class]));
-            return nil;
-        }
-        [children addObject:wrapped];
-    }
-    if (children.count == 0) return nil;
-
-    // v4.5: pass previewProvider:nil — the lifted-message preview is the
-    // prime deadlock suspect on iOS 26/27 (freeze happens during menu
-    // PRESENTATION, before any action is even tapped; the v4.2 log proves
-    // the app's handlers are fine). Without a preview the menu appears
-    // directly at the touch point — native look, no lifted animation.
-    UIContextMenuConfiguration *cfg =
-        [UIContextMenuConfiguration
-            configurationWithIdentifier:g_capturedIdentifier
-                          previewProvider:nil
-                           actionProvider:^UIMenu *(NSArray<UIMenuElement *> *suggested) {
-                (void)suggested;
-                return [UIMenu menuWithChildren:children];
-            }];
-    maxlog(@"menu: rebuilt native menu, no preview, deferred handlers (%lu items)",
-           (unsigned long)children.count);
-    return cfg;
+    maxlog(@"menu: unsupported element %@ — will fall back", NSStringFromClass([element class]));
+    g_foundUnsupportedElement = YES;
 }
 
 // ============================================================================
@@ -277,8 +192,6 @@ static UIContextMenuConfiguration *hook_cellConfig(
 
     maxlog(@"menu: entry (MessageCell path)");
     g_capturedProvider = nil;
-    g_capturedPreview = nil;
-    g_capturedIdentifier = nil;
     g_foundUnsupportedElement = NO;
     g_inMessageCellMenu = YES;
     UIContextMenuConfiguration *config =
@@ -286,8 +199,40 @@ static UIContextMenuConfiguration *hook_cellConfig(
             self, _cmd, interaction, point);
     g_inMessageCellMenu = NO;
 
-    UIContextMenuConfiguration *deferred = max_deferredConfig(config);
-    return deferred ?: config;
+    if (!g_capturedProvider) {
+        maxlog(@"menu: no provider captured — system fallback");
+        return config;   // preview-only menu — keep system behavior
+    }
+
+    // If a live overlay is still up (double delegate call for the same
+    // long-press), keep suppressing; a dismissing one is swapped below.
+    if ([MAXMenuOverlay shouldSkip]) return nil;
+
+    UIMenu *menu = nil;
+    @try {
+        menu = g_capturedProvider(@[]);
+    } @catch (NSException *e) {
+        maxlog(@"menu: actionProvider threw: %@", e);
+        return config;
+    }
+    g_capturedProvider = nil;
+
+    NSMutableArray<UIAction *> *actions = [NSMutableArray array];
+    for (UIMenuElement *element in menu.children)
+        flattenMenu(element, actions);
+
+    if (g_foundUnsupportedElement || actions.count == 0) {
+        maxlog(@"menu: not interceptable (deferred/empty, %lu actions) — system fallback",
+               (unsigned long)actions.count);
+        return config;
+    }
+
+    if (![MAXMenuOverlay presentWithActions:actions cell:(UIView *)self]) {
+        maxlog(@"menu: overlay present failed — system fallback");
+        return config;
+    }
+
+    return nil;   // no system context menu — no dismissal transition, no deadlock
 }
 
 // ============================================================================
@@ -306,8 +251,6 @@ static UIContextMenuConfiguration *hook_cvConfig(
 
     maxlog(@"menu: entry (ChatDetail path)");
     g_capturedProvider = nil;
-    g_capturedPreview = nil;
-    g_capturedIdentifier = nil;
     g_foundUnsupportedElement = NO;
     g_inMessageCellMenu = YES;
     UIContextMenuConfiguration *config =
@@ -315,9 +258,335 @@ static UIContextMenuConfiguration *hook_cvConfig(
             self, _cmd, collectionView, indexPath, point);
     g_inMessageCellMenu = NO;
 
-    UIContextMenuConfiguration *deferred = max_deferredConfig(config);
-    return deferred ?: config;
+    if (!g_capturedProvider) {
+        maxlog(@"menu: cv path — no provider captured — system fallback");
+        return config;
+    }
+
+    if ([MAXMenuOverlay shouldSkip]) return nil;
+
+    UIMenu *menu = nil;
+    @try {
+        menu = g_capturedProvider(@[]);
+    } @catch (NSException *e) {
+        maxlog(@"menu: cv actionProvider threw: %@", e);
+        return config;
+    }
+    g_capturedProvider = nil;
+
+    NSMutableArray<UIAction *> *actions = [NSMutableArray array];
+    for (UIMenuElement *element in menu.children)
+        flattenMenu(element, actions);
+
+    if (g_foundUnsupportedElement || actions.count == 0) {
+        maxlog(@"menu: cv not interceptable (deferred/empty, %lu actions) — system fallback",
+               (unsigned long)actions.count);
+        return config;
+    }
+
+    UIView *cell = [collectionView cellForItemAtIndexPath:indexPath];
+    if (!cell) {
+        maxlog(@"menu: cv path — no cell at index path — system fallback");
+        return config;
+    }
+
+    if (![MAXMenuOverlay presentWithActions:actions cell:cell]) {
+        maxlog(@"menu: cv overlay present failed — system fallback");
+        return config;
+    }
+
+    return nil;
 }
+
+// ============================================================================
+#pragma mark - Telegram-style menu overlay (implementation)
+// ============================================================================
+
+static UIWindow *max_currentWindow(void) {
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindow *key = ((UIWindowScene *)scene).keyWindow;
+        if (key) return key;
+        for (UIWindow *w in ((UIWindowScene *)scene).windows)
+            if (w) return w;
+    }
+    return UIApplication.sharedApplication.keyWindow;
+}
+
+// A menu row: fixed-size leading icon + left-aligned title, Telegram-like.
+@interface MAXMenuItemButton : UIButton
+@end
+
+@implementation MAXMenuItemButton {
+    UIView *_highlightView;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame action:(UIAction *)action {
+    if ((self = [super initWithFrame:frame])) {
+        UIColor *tint = UIColor.labelColor;
+        if (action.attributes & UIMenuElementAttributesDestructive)
+            tint = [UIColor systemRedColor];
+
+        UIButtonConfiguration *cfg = [UIButtonConfiguration plainButtonConfiguration];
+        cfg.titleAlignment = UIButtonConfigurationTitleAlignmentLeading;
+        cfg.imagePlacement = NSDirectionalRectEdgeLeading;
+        cfg.imagePadding = 14;
+        cfg.baseForegroundColor = tint;
+        cfg.attributedTitle = [[NSAttributedString alloc]
+            initWithString:action.title attributes:@{
+                NSFontAttributeName: [UIFont systemFontOfSize:17 weight:UIFontWeightRegular],
+                NSForegroundColorAttributeName: tint,
+            }];
+        if (action.image) {
+            // normalize every icon to a fixed 24pt box so rows align
+            UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc]
+                initWithSize:CGSizeMake(24, 24)];
+            UIImage *norm = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+                CGRect dst = CGRectMake((24 - action.image.size.width) / 2,
+                                        (24 - action.image.size.height) / 2,
+                                        action.image.size.width, action.image.size.height);
+                [action.image drawInRect:dst];
+            }];
+            cfg.image = [norm imageWithTintColor:tint
+                                 renderingMode:UIImageRenderingModeAlwaysTemplate];
+        }
+        cfg.contentInsets = NSDirectionalEdgeInsetsMake(0, 16, 0, 16);
+        self.configuration = cfg;
+        self.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
+
+        // fire the app's own handler on tap
+        [self addAction:action forControlEvents:UIControlEventPrimaryActionTriggered];
+
+        _highlightView = [[UIView alloc] initWithFrame:self.bounds];
+        _highlightView.autoresizingMask =
+            UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        _highlightView.backgroundColor =
+            [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+                return tc.userInterfaceStyle == UIUserInterfaceStyleDark
+                    ? [UIColor colorWithWhite:1 alpha:0.10]
+                    : [UIColor colorWithWhite:0 alpha:0.06];
+            }];
+        _highlightView.layer.cornerRadius = 10;
+        _highlightView.hidden = YES;
+        [self insertSubview:_highlightView atIndex:0];
+    }
+    return self;
+}
+
+- (void)setHighlighted:(BOOL)highlighted {
+    [super setHighlighted:highlighted];
+    _highlightView.hidden = !highlighted;
+}
+
+@end
+
+static MAXMenuOverlay *g_overlay = nil;
+
+@implementation MAXMenuOverlay {
+    UIControl *_background;        // tap-outside to dismiss
+    UIImageView *_snapshotView;    // Telegram-style "lifted" message
+    UIView *_panel;
+    BOOL _itemFired;
+}
+
++ (BOOL)isShowing { return g_overlay != nil; }
+
+// YES while a live (not dismissing) overlay is up — used to swallow repeated
+// delegate calls for the same long-press without eating a fresh one.
++ (BOOL)shouldSkip {
+    return g_overlay != nil && !g_overlay->_itemFired;
+}
+
+- (void)dismissAnimated:(BOOL)animated {
+    UIView *snapshot = _snapshotView;
+    void (^finish)(void) = ^void(void) {
+        [g_overlay removeFromSuperview];
+        g_overlay = nil;
+    };
+    if (!animated) { finish(); return; }
+    [UIView animateWithDuration:0.14 delay:0
+                        options:UIViewAnimationOptionCurveEaseIn
+                     animations:^{
+        _background.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0];
+        _panel.transform = CGAffineTransformMakeScale(0.92, 0.92);
+        _panel.alpha = 0;
+        snapshot.transform = CGAffineTransformIdentity;
+        snapshot.alpha = 0;
+    } completion:^(BOOL f) { finish(); }];
+}
+
+- (void)tapOutside {
+    if (_itemFired) return;
+    maxlog(@"overlay: tap outside — dismiss");
+    _itemFired = YES;
+    [self dismissAnimated:YES];
+}
+
+- (void)itemTapped:(UIButton *)sender {
+    if (_itemFired) return;
+    NSString *title = sender.configuration.attributedTitle.string
+                      ?: sender.currentTitle ?: @"?";
+    maxlog(@"overlay: tapped '%@' — dismissing, firing app handler", title);
+    _itemFired = YES;
+    [self dismissAnimated:YES];
+}
+
++ (BOOL)presentWithActions:(NSArray<UIAction *> *)actions cell:(UIView *)cell {
+    UIWindow *window = cell.window ?: max_currentWindow();
+    if (!window || !cell.superview) return NO;
+
+    if (g_overlay) [(MAXMenuOverlay *)g_overlay dismissAnimated:NO];
+
+    // Telegram-style lifted bubble: snapshot of the long-pressed cell.
+    UIImage *snapshot = nil;
+    @try {
+        UIGraphicsImageRenderer *r =
+            [[UIGraphicsImageRenderer alloc] initWithSize:cell.bounds.size];
+        snapshot = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+            [cell drawViewHierarchyInRect:cell.bounds afterScreenUpdates:NO];
+        }];
+    } @catch (NSException *e) {
+        snapshot = nil;
+    }
+
+    CGRect cellFrame = [cell convertRect:cell.bounds toView:window];
+
+    MAXMenuOverlay *ov = [[MAXMenuOverlay alloc] initWithFrame:window.bounds];
+    ov.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    g_overlay = ov;
+
+    // dim background + tap-outside
+    UIControl *bg = [[UIControl alloc] initWithFrame:window.bounds];
+    bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    bg.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0];
+    [bg addTarget:ov action:@selector(tapOutside)
+                 forControlEvents:UIControlEventPrimaryActionTriggered];
+    [ov addSubview:bg];
+    ov->_background = bg;
+
+    // panel with blur material
+    UIView *panel = [[UIView alloc] initWithFrame:CGRectZero];
+    panel.layer.cornerRadius = 14;
+    panel.layer.masksToBounds = YES;
+    panel.layer.cornerCurve = kCACornerCurveContinuous;
+    [ov addSubview:panel];
+    ov->_panel = panel;
+
+    UIVisualEffectView *blur =
+        [[UIVisualEffectView alloc] initWithEffect:
+            [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial]];
+    [panel addSubview:blur];
+
+    // ---- rows + separators
+    CGFloat const rowH = 46.0;
+    CGFloat const maxPanelWidth = 300.0;
+    CGFloat textWidth = 0;
+    for (UIAction *a in actions) {
+        CGSize sz = [a.title sizeWithAttributes:
+            @{NSFontAttributeName: [UIFont systemFontOfSize:17]}];
+        textWidth = MAX(textWidth, sz.width);
+    }
+    // icon(24) + imagePadding(14) + leading inset(16) + trailing(20) + slack
+    CGFloat panelWidth = MIN(MAX(textWidth + 24 + 14 + 16 + 20 + 10, 220), maxPanelWidth);
+
+    CGFloat y = 5;
+    for (NSUInteger i = 0; i < actions.count; i++) {
+        UIAction *action = actions[i];
+        MAXMenuItemButton *btn =
+            [[MAXMenuItemButton alloc] initWithFrame:CGRectMake(0, y, panelWidth, rowH)
+                                              action:action];
+        [btn addTarget:ov action:@selector(itemTapped:)
+              forControlEvents:UIControlEventPrimaryActionTriggered];
+        [blur.contentView addSubview:btn];
+        y += rowH;
+        if (i + 1 < actions.count) {
+            UIView *sep = [[UIView alloc]
+                initWithFrame:CGRectMake(16, y, panelWidth - 32, 0.5)];
+            sep.backgroundColor =
+                [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+                    return tc.userInterfaceStyle == UIUserInterfaceStyleDark
+                        ? [UIColor colorWithWhite:1 alpha:0.12]
+                        : [UIColor colorWithWhite:0 alpha:0.10];
+                }];
+            [blur.contentView addSubview:sep];
+            y += 0.5;
+        }
+    }
+    y += 5;
+
+    panel.frame = CGRectMake(0, 0, panelWidth, y);
+    blur.frame = panel.bounds;
+    blur.contentView.frame = blur.bounds;
+
+    // ---- position (Telegram-like): menu vertically centered on the message,
+    // horizontally clamped inside the screen; below/above when it doesn't fit.
+    CGFloat const margin = 10.0;
+    CGFloat wx = cellFrame.origin.x + (cellFrame.size.width - panelWidth) / 2;
+    wx = MAX(margin, MIN(wx, window.bounds.size.width - panelWidth - margin));
+
+    CGFloat panelH = panel.bounds.size.height;
+    CGFloat cy = CGRectGetMidY(cellFrame);
+    CGFloat wy;
+    if (cy - panelH / 2 >= margin + 40 &&
+        cy + panelH / 2 <= window.bounds.size.height - margin - 40) {
+        wy = cy - panelH / 2;                      // centered on the message
+    } else if (CGRectGetMaxY(cellFrame) + panelH + 12 <=
+               window.bounds.size.height - margin - 40) {
+        wy = CGRectGetMaxY(cellFrame) + 12;        // below
+    } else {
+        wy = cellFrame.origin.y - panelH - 12;     // above
+        if (wy < margin + 40) wy = margin + 40;    // keep clear of status bar
+    }
+    panel.center = CGPointMake(wx + panelWidth / 2, wy + panelH / 2);
+
+    // ---- lifted snapshot above the cell
+    if (snapshot) {
+        UIImageView *snapView = [[UIImageView alloc] initWithFrame:cellFrame];
+        snapView.image = snapshot;
+        snapView.layer.shadowColor = [UIColor blackColor].CGColor;
+        snapView.layer.shadowOpacity = 0.30;
+        snapView.layer.shadowRadius = 16;
+        snapView.layer.shadowOffset = CGSizeZero;
+        [ov addSubview:snapView];
+        ov->_snapshotView = snapView;
+    }
+
+    [window addSubview:ov];
+
+    UIImpactFeedbackGenerator *haptic =
+        [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+    [haptic impactOccurred];
+
+    // log the offered actions
+    NSMutableArray<NSString *> *titles = [NSMutableArray array];
+    for (UIAction *a in actions) [titles addObject:(a.title ?: @"?")];
+    maxlog(@"overlay: presenting %lu actions: %@",
+           (unsigned long)actions.count, [titles componentsJoinedByString:@", "]);
+
+    // entrance animation
+    UIImageView *snapView = ov->_snapshotView;
+    panel.transform = CGAffineTransformMakeScale(0.96, 0.96);
+    panel.alpha = 0;
+    if (snapView) {
+        snapView.alpha = 0;
+        snapView.transform = CGAffineTransformMakeTranslation(0, 6);
+    }
+    [UIView animateWithDuration:0.18 delay:0
+                        options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{
+        panel.transform = CGAffineTransformIdentity;
+        panel.alpha = 1;
+        bg.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.10];
+        if (snapView) {
+            snapView.alpha = 1;
+            snapView.transform = CGAffineTransformIdentity;
+        }
+    } completion:nil];
+
+    return YES;
+}
+
+@end
 
 // ============================================================================
 #pragma mark - Session Fix: Keychain (selective)
@@ -380,9 +649,9 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v4.5 loading (native menu, no preview, deferred handlers)...");
+    maxlog(@"v5.0 loading (polished custom menu, system menu unusable)...");
 
-    // 1) Capture the app's menu providers for message-cell menus.
+    // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
         @selector(configurationWithIdentifier:previewProvider:actionProvider:),
         (IMP)hook_configCreate);
@@ -439,5 +708,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v4.5 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v5.0 loaded OK — log file: %@", max_logPath());
 }
