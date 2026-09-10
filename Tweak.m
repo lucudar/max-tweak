@@ -1,6 +1,11 @@
 /**
- * MAXMods v4.4 — native menu preserved; action handlers deferred past the
- * context-menu dismissal animation to break the freeze deadlock.
+ * MAXMods v4.5 — native menu without lifted preview + deferred handlers.
+ *
+ * v4.4 log evidence: freeze happens during menu PRESENTATION (before any
+ * tap — no "action fired" line, watchdog silent), so the deadlock is in the
+ * lifted-preview machinery of the old-SDK binary on iOS 26/27, not in the
+ * action handlers. v4.5 drops the preview (nil) and keeps the deferred
+ * handlers as belt-and-braces.
  *
  * Confirmed diagnosis (baseline v4.3 test): with the stock system menu,
  * tapping Удалить freezes the app — the app's action handler mutates the
@@ -10,11 +15,13 @@
  * handlers fired with no dismissal in flight — no freeze, proving the
  * handlers themselves are fine and only the timing is fatal.
  *
- * Fix: capture the app's actionProvider + previewProvider (via the
+ * Fix: capture the app's actionProvider (via the
  * +[UIContextMenuConfiguration configurationWith...:] hook), rebuild the
- * identical native menu, but wrap every UIAction handler in a 0.75s
+ * native menu WITHOUT the lifted preview, and wrap every UIAction handler
+ * in a 0.75s
  * dispatch_after — by then the dismissal transition has finished. The menu
- * looks and behaves 100% native; only the handler timing changes.
+ * dispatch_after. The menu stays fully native; the message just no longer
+ * lifts out of the list.
  * The app itself uses this exact pattern elsewhere (OMContextMenu
  * convertItem:sender:applyActionDelay: with a 300 ms constant).
  *
@@ -241,15 +248,20 @@ static UIContextMenuConfiguration *max_deferredConfig(UIContextMenuConfiguration
     }
     if (children.count == 0) return nil;
 
+    // v4.5: pass previewProvider:nil — the lifted-message preview is the
+    // prime deadlock suspect on iOS 26/27 (freeze happens during menu
+    // PRESENTATION, before any action is even tapped; the v4.2 log proves
+    // the app's handlers are fine). Without a preview the menu appears
+    // directly at the touch point — native look, no lifted animation.
     UIContextMenuConfiguration *cfg =
         [UIContextMenuConfiguration
             configurationWithIdentifier:g_capturedIdentifier
-                          previewProvider:g_capturedPreview
+                          previewProvider:nil
                            actionProvider:^UIMenu *(NSArray<UIMenuElement *> *suggested) {
                 (void)suggested;
                 return [UIMenu menuWithChildren:children];
             }];
-    maxlog(@"menu: rebuilt native menu with deferred handlers (%lu items)",
+    maxlog(@"menu: rebuilt native menu, no preview, deferred handlers (%lu items)",
            (unsigned long)children.count);
     return cfg;
 }
@@ -368,7 +380,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v4.4 loading (native menu + deferred action handlers)...");
+    maxlog(@"v4.5 loading (native menu, no preview, deferred handlers)...");
 
     // 1) Capture the app's menu providers for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -427,5 +439,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v4.4 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v4.5 loaded OK — log file: %@", max_logPath());
 }
