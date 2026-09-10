@@ -1,7 +1,8 @@
 /**
- * MAXMods v4.2 — Telegram-style custom context menu for chat messages
- * + file logging (Documents/maxmods_log.txt, visible in the Files app)
- * + main-thread watchdog that records freezes into the same log
+ * MAXMods v4.3 — baseline test build: stock MAX system menu, no interception.
+ * File logging (Documents/maxmods_log.txt, visible in the Files app)
+ * + main-thread watchdog that records freezes into the same log.
+ * If the stock menu still freezes on this build, the log pins it down.
  *
  * Root cause of the delete freeze (long-press -> Удалить -> app hangs):
  *  - MessageCell (Swift, ChatHistoryUI) hosts a per-cell UIContextMenuInteraction
@@ -609,9 +610,20 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 #pragma mark - Constructor
 // ============================================================================
 
+// Baseline-test switch: 1 = do NOT intercept the menu at all (stock MAX system
+// menu is shown); logging + watchdog + session fixes stay active. Used to
+// verify the freeze diagnosis against the unmodified menu.
+#define MAXMODS_DISABLE_MENU_INTERCEPT 1
+
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v4.2 loading (custom menu + ChatDetail path + file log + watchdog)...");
+    maxlog(@"v4.3 loading (%@)...",
+           MAXMODS_DISABLE_MENU_INTERCEPT ? @"baseline: stock menu + log/watchdog"
+                                          : @"custom menu + ChatDetail path + log/watchdog");
+
+#if MAXMODS_DISABLE_MENU_INTERCEPT
+    maxlog(@"menu interception DISABLED (baseline test) — stock system menu will be used");
+#else
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -644,6 +656,7 @@ static void maxmods_init(void) {
     } else {
         maxlog(@"WARNING: ChatDetailController class not found");
     }
+#endif // menu interception block (compiled out in baseline)
 
     // 3) Session persistence fixes (unchanged from v3.0).
     Class kc = objc_getClass("UICKeyChainStore");
@@ -670,5 +683,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v4.2 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v4.3 loaded OK — log file: %@", max_logPath());
 }
