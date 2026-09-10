@@ -1,5 +1,5 @@
 /**
- * MAXMods v4.0 — Telegram-style custom context menu for chat messages
+ * MAXMods v4.1 — Telegram-style custom context menu for chat messages
  *
  * Root cause of the delete freeze (long-press -> Удалить -> app hangs):
  *  - MessageCell (Swift, ChatHistoryUI) hosts a per-cell UIContextMenuInteraction
@@ -155,6 +155,63 @@ static UIContextMenuConfiguration *hook_cellConfig(
         return config;
 
     return nil;   // no system context menu — no dismissal transition, no deadlock
+}
+
+// ============================================================================
+#pragma mark - Hook: -[ChatDetailController collectionView:contextMenuConfigurationForItemAtIndexPath:point:]
+//
+// The chat screen builds its message menu through the collection-view delegate
+// (ChatDetailController), NOT through MessageCell's per-cell interaction —
+// this is the path that actually runs in chats, so it must be intercepted too.
+// ============================================================================
+
+static IMP orig_cvConfig = NULL;
+
+static UIContextMenuConfiguration *hook_cvConfig(
+        id self, SEL _cmd, UICollectionView *collectionView,
+        NSIndexPath *indexPath, CGPoint point) {
+
+    g_capturedProvider = nil;
+    g_foundUnsupportedElement = NO;
+    g_inMessageCellMenu = YES;
+    UIContextMenuConfiguration *config =
+        ((UIContextMenuConfiguration *(*)(id,SEL,id,id,CGPoint))orig_cvConfig)(
+            self, _cmd, collectionView, indexPath, point);
+    g_inMessageCellMenu = NO;
+
+    if (!g_capturedProvider)
+        return config;
+
+    if ([MAXMenuOverlay shouldSkip]) return nil;
+
+    UIMenu *menu = nil;
+    @try {
+        menu = g_capturedProvider(@[]);
+    } @catch (NSException *e) {
+        NSLog(@"[MAXMods] cv actionProvider threw: %@", e);
+        return config;
+    }
+    g_capturedProvider = nil;
+
+    NSMutableArray<UIAction *> *actions = [NSMutableArray array];
+    for (UIMenuElement *element in menu.children)
+        flattenMenu(element, actions);
+
+    if (g_foundUnsupportedElement || actions.count == 0) {
+        NSLog(@"[MAXMods] cv menu not interceptable (deferred/empty) — system fallback");
+        return config;
+    }
+
+    UIView *cell = [collectionView cellForItemAtIndexPath:indexPath];
+    if (!cell) {
+        NSLog(@"[MAXMods] no cell for menu — system fallback");
+        return config;
+    }
+
+    if (![MAXMenuOverlay presentWithActions:actions cell:cell])
+        return config;
+
+    return nil;
 }
 
 // ============================================================================
@@ -468,7 +525,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    NSLog(@"[MAXMods] v4.0 loading (custom Telegram-style menu)...");
+    NSLog(@"[MAXMods] v4.1 loading (custom Telegram-style menu + ChatDetail path)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -477,7 +534,9 @@ static void maxmods_init(void) {
     NSLog(@"[MAXMods] UIContextMenuConfiguration hook: %@",
           orig_configCreate ? @"OK" : @"MISS");
 
-    // 2) Replace the system context menu on chat message cells.
+    // 2) Replace the system context menu on chat message cells — two entry
+    //    points: the per-cell interaction (MessageCell) and the collection-view
+    //    delegate (ChatDetailController), which is the one actually used in chats.
     Class messageCell = objc_getClass("_TtC13ChatHistoryUI11MessageCell");
     if (messageCell) {
         orig_cellConfig = swizzle(messageCell,
@@ -487,6 +546,17 @@ static void maxmods_init(void) {
               orig_cellConfig ? @"OK" : @"MISS");
     } else {
         NSLog(@"[MAXMods] WARNING: MessageCell class not found");
+    }
+
+    Class chatDetail = objc_getClass("_TtC14OMChatDetailUI20ChatDetailController");
+    if (chatDetail) {
+        orig_cvConfig = swizzle(chatDetail,
+            @selector(collectionView:contextMenuConfigurationForItemAtIndexPath:point:),
+            (IMP)hook_cvConfig);
+        NSLog(@"[MAXMods] ChatDetailController menu hook: %@",
+              orig_cvConfig ? @"OK" : @"MISS");
+    } else {
+        NSLog(@"[MAXMods] WARNING: ChatDetailController class not found");
     }
 
     // 3) Session persistence fixes (unchanged from v3.0).
@@ -512,5 +582,5 @@ static void maxmods_init(void) {
     orig_initSuite = swizzle([NSUserDefaults class],
         @selector(initWithSuiteName:), (IMP)hook_initSuite);
 
-    NSLog(@"[MAXMods] v4.0 loaded OK");
+    NSLog(@"[MAXMods] v4.1 loaded OK");
 }
