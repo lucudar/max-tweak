@@ -49,6 +49,7 @@ static IMP swizzle(Class cls, SEL sel, IMP newImp) {
     return orig;
 }
 
+__attribute__((unused))
 static IMP swizzleClassMethod(Class cls, SEL sel, IMP newImp) {
     Method method = class_getClassMethod(cls, sel);
     if (!method) return NULL;
@@ -144,6 +145,7 @@ static BOOL g_foundUnsupportedElement = NO;
 
 static IMP orig_configCreate = NULL;
 
+__attribute__((unused))
 static id hook_configCreate(id self, SEL _cmd,
                             id identifier, id previewProvider, id actionProvider) {
     if (g_inMessageCellMenu && actionProvider != nil) {
@@ -181,6 +183,7 @@ static void flattenMenu(UIMenuElement *element, NSMutableArray<UIAction *> *out)
 
 static IMP orig_cellConfig = NULL;
 
+__attribute__((unused))
 static UIContextMenuConfiguration *hook_cellConfig(
         id self, SEL _cmd, UIContextMenuInteraction *interaction, CGPoint point) {
 
@@ -239,6 +242,7 @@ static UIContextMenuConfiguration *hook_cellConfig(
 
 static IMP orig_cvConfig = NULL;
 
+__attribute__((unused))
 static UIContextMenuConfiguration *hook_cvConfig(
         id self, SEL _cmd, UICollectionView *collectionView,
         NSIndexPath *indexPath, CGPoint point) {
