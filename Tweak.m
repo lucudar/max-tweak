@@ -1,5 +1,7 @@
 /**
- * MAXMods v4.1 — Telegram-style custom context menu for chat messages
+ * MAXMods v4.2 — Telegram-style custom context menu for chat messages
+ * + file logging (Documents/maxmods_log.txt, visible in the Files app)
+ * + main-thread watchdog that records freezes into the same log
  *
  * Root cause of the delete freeze (long-press -> Удалить -> app hangs):
  *  - MessageCell (Swift, ChatHistoryUI) hosts a per-cell UIContextMenuInteraction
@@ -55,6 +57,67 @@ static IMP swizzleClassMethod(Class cls, SEL sel, IMP newImp) {
 }
 
 // ============================================================================
+#pragma mark - File logging (survives a frozen/killed app) + main-thread watchdog
+//
+// Everything important is appended to Documents/maxmods_log.txt immediately
+// (NSFileHandle writes are unbuffered). The app container is exposed in the
+// Files app via UIFileSharingEnabled (patched into Info.plist at repack time),
+// so the log can be shared straight from the device even when the app hangs.
+// ============================================================================
+
+static NSString *max_logPath(void) {
+    static NSString *path;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSString *docs = NSSearchPathForDirectoriesInDomains(
+            NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        path = [docs stringByAppendingPathComponent:@"maxmods_log.txt"];
+    });
+    return path;
+}
+
+static void maxlog(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+
+    NSLog(@"[MAXMods] %@", msg);
+
+    NSString *path = max_logPath();
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:path])
+        [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    // cap the file so a stuck logging loop can't grow it unbounded
+    NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
+    if ([attrs fileSize] > 2 * 1024 * 1024)
+        [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    NSString *line = [NSString stringWithFormat:@"%@ | %@\n", [NSDate date], msg];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) return;
+    [fh seekToEndOfFile];
+    [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+    [fh closeFile];
+}
+
+// Every 5s check that the main thread services its queue within 2s.
+// A frozen app keeps logging "MAIN THREAD STUCK" lines with timestamps —
+// the last lines before the hang pinpoint where it stopped.
+static void max_scheduleWatchdog(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        dispatch_async(dispatch_get_main_queue(), ^{ dispatch_semaphore_signal(sem); });
+        if (dispatch_semaphore_wait(sem,
+                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC))) != 0) {
+            maxlog(@"WATCHDOG: MAIN THREAD STUCK >2s — app frozen");
+        }
+        max_scheduleWatchdog();
+    });
+}
+
+// ============================================================================
 #pragma mark - Telegram-style menu overlay (interface)
 // ============================================================================
 
@@ -84,6 +147,7 @@ static id hook_configCreate(id self, SEL _cmd,
                             id identifier, id previewProvider, id actionProvider) {
     if (g_inMessageCellMenu && actionProvider != nil) {
         g_capturedProvider = [actionProvider copy];
+        maxlog(@"menu: actionProvider captured");
     }
     return ((id(*)(id,SEL,id,id,id))orig_configCreate)(
         self, _cmd, identifier, previewProvider, actionProvider);
@@ -106,6 +170,7 @@ static void flattenMenu(UIMenuElement *element, NSMutableArray<UIAction *> *out)
             flattenMenu(child, out);
         return;
     }
+    maxlog(@"menu: unsupported element %@ — will fall back", NSStringFromClass([element class]));
     g_foundUnsupportedElement = YES;
 }
 
@@ -118,6 +183,7 @@ static IMP orig_cellConfig = NULL;
 static UIContextMenuConfiguration *hook_cellConfig(
         id self, SEL _cmd, UIContextMenuInteraction *interaction, CGPoint point) {
 
+    maxlog(@"menu: entry (MessageCell path)");
     g_capturedProvider = nil;
     g_foundUnsupportedElement = NO;
     g_inMessageCellMenu = YES;
@@ -126,8 +192,10 @@ static UIContextMenuConfiguration *hook_cellConfig(
             self, _cmd, interaction, point);
     g_inMessageCellMenu = NO;
 
-    if (!g_capturedProvider)
+    if (!g_capturedProvider) {
+        maxlog(@"menu: no provider captured — system fallback");
         return config;   // preview-only menu — keep system behavior
+    }
 
     // If a live overlay is still up (double delegate call for the same
     // long-press), keep suppressing; a dismissing one is swapped below.
@@ -137,7 +205,7 @@ static UIContextMenuConfiguration *hook_cellConfig(
     @try {
         menu = g_capturedProvider(@[]);
     } @catch (NSException *e) {
-        NSLog(@"[MAXMods] actionProvider threw: %@", e);
+        maxlog(@"menu: actionProvider threw: %@", e);
         return config;
     }
     g_capturedProvider = nil;
@@ -147,12 +215,15 @@ static UIContextMenuConfiguration *hook_cellConfig(
         flattenMenu(element, actions);
 
     if (g_foundUnsupportedElement || actions.count == 0) {
-        NSLog(@"[MAXMods] menu not interceptable (deferred/empty) — system fallback");
+        maxlog(@"menu: not interceptable (deferred/empty, %lu actions) — system fallback",
+               (unsigned long)actions.count);
         return config;
     }
 
-    if (![MAXMenuOverlay presentWithActions:actions cell:(UIView *)self])
+    if (![MAXMenuOverlay presentWithActions:actions cell:(UIView *)self]) {
+        maxlog(@"menu: overlay present failed — system fallback");
         return config;
+    }
 
     return nil;   // no system context menu — no dismissal transition, no deadlock
 }
@@ -171,6 +242,7 @@ static UIContextMenuConfiguration *hook_cvConfig(
         id self, SEL _cmd, UICollectionView *collectionView,
         NSIndexPath *indexPath, CGPoint point) {
 
+    maxlog(@"menu: entry (ChatDetail path)");
     g_capturedProvider = nil;
     g_foundUnsupportedElement = NO;
     g_inMessageCellMenu = YES;
@@ -179,8 +251,10 @@ static UIContextMenuConfiguration *hook_cvConfig(
             self, _cmd, collectionView, indexPath, point);
     g_inMessageCellMenu = NO;
 
-    if (!g_capturedProvider)
+    if (!g_capturedProvider) {
+        maxlog(@"menu: cv path — no provider captured — system fallback");
         return config;
+    }
 
     if ([MAXMenuOverlay shouldSkip]) return nil;
 
@@ -188,7 +262,7 @@ static UIContextMenuConfiguration *hook_cvConfig(
     @try {
         menu = g_capturedProvider(@[]);
     } @catch (NSException *e) {
-        NSLog(@"[MAXMods] cv actionProvider threw: %@", e);
+        maxlog(@"menu: cv actionProvider threw: %@", e);
         return config;
     }
     g_capturedProvider = nil;
@@ -198,18 +272,21 @@ static UIContextMenuConfiguration *hook_cvConfig(
         flattenMenu(element, actions);
 
     if (g_foundUnsupportedElement || actions.count == 0) {
-        NSLog(@"[MAXMods] cv menu not interceptable (deferred/empty) — system fallback");
+        maxlog(@"menu: cv not interceptable (deferred/empty, %lu actions) — system fallback",
+               (unsigned long)actions.count);
         return config;
     }
 
     UIView *cell = [collectionView cellForItemAtIndexPath:indexPath];
     if (!cell) {
-        NSLog(@"[MAXMods] no cell for menu — system fallback");
+        maxlog(@"menu: cv path — no cell at index path — system fallback");
         return config;
     }
 
-    if (![MAXMenuOverlay presentWithActions:actions cell:cell])
+    if (![MAXMenuOverlay presentWithActions:actions cell:cell]) {
+        maxlog(@"menu: cv overlay present failed — system fallback");
         return config;
+    }
 
     return nil;
 }
@@ -322,12 +399,15 @@ static MAXMenuOverlay *g_overlay = nil;
 
 - (void)tapOutside {
     if (_itemFired) return;
+    maxlog(@"overlay: tap outside — dismiss");
     _itemFired = YES;
     [self dismissAnimated:YES];
 }
 
-- (void)itemTapped {
+- (void)itemTapped:(UIButton *)sender {
     if (_itemFired) return;
+    maxlog(@"overlay: tapped '%@' — dismissing, firing app handler",
+           sender.currentTitle ?: @"?");
     _itemFired = YES;
     [self dismissAnimated:YES];
 }
@@ -395,12 +475,18 @@ static MAXMenuOverlay *g_overlay = nil;
         MAXMenuItemButton *btn =
             [[MAXMenuItemButton alloc] initWithFrame:CGRectMake(5, y, panelWidth - 10, rowH)
                                               action:action];
-        [btn addTarget:ov action:@selector(itemTapped)
+        [btn addTarget:ov action:@selector(itemTapped:)
               forControlEvents:UIControlEventPrimaryActionTriggered];
         [blur.contentView addSubview:btn];
         y += rowH;
     }
     y += 6;
+
+    // log what the menu offered (one line) — helps match user reports to code paths
+    NSMutableArray<NSString *> *titles = [NSMutableArray array];
+    for (UIAction *a in actions) [titles addObject:(a.title ?: @"?")];
+    maxlog(@"overlay: presenting %lu actions: %@",
+           (unsigned long)actions.count, [titles componentsJoinedByString:@", "]);
 
     panel.frame = CGRectMake(0, 0, panelWidth, y);
     blur.frame = panel.bounds;
@@ -525,14 +611,14 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    NSLog(@"[MAXMods] v4.1 loading (custom Telegram-style menu + ChatDetail path)...");
+    maxlog(@"v4.2 loading (custom menu + ChatDetail path + file log + watchdog)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
         @selector(configurationWithIdentifier:previewProvider:actionProvider:),
         (IMP)hook_configCreate);
-    NSLog(@"[MAXMods] UIContextMenuConfiguration hook: %@",
-          orig_configCreate ? @"OK" : @"MISS");
+    maxlog(@"UIContextMenuConfiguration hook: %@",
+           orig_configCreate ? @"OK" : @"MISS");
 
     // 2) Replace the system context menu on chat message cells — two entry
     //    points: the per-cell interaction (MessageCell) and the collection-view
@@ -542,10 +628,10 @@ static void maxmods_init(void) {
         orig_cellConfig = swizzle(messageCell,
             @selector(contextMenuInteraction:configurationForMenuAtLocation:),
             (IMP)hook_cellConfig);
-        NSLog(@"[MAXMods] MessageCell menu hook: %@",
-              orig_cellConfig ? @"OK" : @"MISS");
+        maxlog(@"MessageCell menu hook: %@",
+               orig_cellConfig ? @"OK" : @"MISS");
     } else {
-        NSLog(@"[MAXMods] WARNING: MessageCell class not found");
+        maxlog(@"WARNING: MessageCell class not found");
     }
 
     Class chatDetail = objc_getClass("_TtC14OMChatDetailUI20ChatDetailController");
@@ -553,10 +639,10 @@ static void maxmods_init(void) {
         orig_cvConfig = swizzle(chatDetail,
             @selector(collectionView:contextMenuConfigurationForItemAtIndexPath:point:),
             (IMP)hook_cvConfig);
-        NSLog(@"[MAXMods] ChatDetailController menu hook: %@",
-              orig_cvConfig ? @"OK" : @"MISS");
+        maxlog(@"ChatDetailController menu hook: %@",
+               orig_cvConfig ? @"OK" : @"MISS");
     } else {
-        NSLog(@"[MAXMods] WARNING: ChatDetailController class not found");
+        maxlog(@"WARNING: ChatDetailController class not found");
     }
 
     // 3) Session persistence fixes (unchanged from v3.0).
@@ -572,7 +658,7 @@ static void maxmods_init(void) {
             orig_kcInit = method_getImplementation(im);
             method_setImplementation(im, (IMP)hook_kcInit);
         }
-        NSLog(@"[MAXMods] Keychain fix: OK");
+        maxlog(@"Keychain fix: OK");
     }
 
     orig_containerURL = swizzle([NSFileManager class],
@@ -582,5 +668,7 @@ static void maxmods_init(void) {
     orig_initSuite = swizzle([NSUserDefaults class],
         @selector(initWithSuiteName:), (IMP)hook_initSuite);
 
-    NSLog(@"[MAXMods] v4.1 loaded OK");
+    max_scheduleWatchdog();
+
+    maxlog(@"v4.2 loaded OK — log file: %@", max_logPath());
 }
