@@ -1,5 +1,6 @@
 /**
- * MAXMods v5.0 — Telegram-style custom context menu for chat messages
+ * MAXMods v5.1 — Telegram-style custom context menu for chat messages
+ * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
  * + main-thread watchdog that records freezes into the same log
  *
@@ -130,7 +131,6 @@ static void max_scheduleWatchdog(void) {
 
 @interface MAXMenuOverlay : UIView
 + (BOOL)isShowing;
-+ (BOOL)shouldSkip;
 + (BOOL)presentWithActions:(NSArray<UIAction *> *)actions cell:(UIView *)cell;
 @end
 
@@ -204,10 +204,6 @@ static UIContextMenuConfiguration *hook_cellConfig(
         return config;   // preview-only menu — keep system behavior
     }
 
-    // If a live overlay is still up (double delegate call for the same
-    // long-press), keep suppressing; a dismissing one is swapped below.
-    if ([MAXMenuOverlay shouldSkip]) return nil;
-
     UIMenu *menu = nil;
     @try {
         menu = g_capturedProvider(@[]);
@@ -262,8 +258,6 @@ static UIContextMenuConfiguration *hook_cvConfig(
         maxlog(@"menu: cv path — no provider captured — system fallback");
         return config;
     }
-
-    if ([MAXMenuOverlay shouldSkip]) return nil;
 
     UIMenu *menu = nil;
     @try {
@@ -391,12 +385,6 @@ static MAXMenuOverlay *g_overlay = nil;
 
 + (BOOL)isShowing { return g_overlay != nil; }
 
-// YES while a live (not dismissing) overlay is up — used to swallow repeated
-// delegate calls for the same long-press without eating a fresh one.
-+ (BOOL)shouldSkip {
-    return g_overlay != nil && !g_overlay->_itemFired;
-}
-
 - (void)dismissAnimated:(BOOL)animated {
     UIView *snapshot = _snapshotView;
     void (^finish)(void) = ^void(void) {
@@ -415,6 +403,9 @@ static MAXMenuOverlay *g_overlay = nil;
     } completion:^(BOOL f) { finish(); }];
 }
 
+// Dismiss on any tap outside the panel. Wired via BOTH a tap gesture and
+// UIControlEventTouchUpInside — a bare UIControl does not reliably deliver
+// UIControlEventPrimaryActionTriggered, which left the overlay stuck.
 - (void)tapOutside {
     if (_itemFired) return;
     maxlog(@"overlay: tap outside — dismiss");
@@ -437,7 +428,28 @@ static MAXMenuOverlay *g_overlay = nil;
 
     if (g_overlay) [(MAXMenuOverlay *)g_overlay dismissAnimated:NO];
 
-    // Telegram-style lifted bubble: snapshot of the long-pressed cell.
+    CGRect cellFrame = [cell convertRect:cell.bounds toView:window];
+
+    MAXMenuOverlay *ov = [[MAXMenuOverlay alloc] initWithFrame:window.bounds];
+    ov.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    g_overlay = ov;
+
+    // dim background + tap-outside to dismiss
+    UIControl *bg = [[UIControl alloc] initWithFrame:window.bounds];
+    bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    bg.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0];
+    [bg addTarget:ov action:@selector(tapOutside)
+                 forControlEvents:UIControlEventTouchUpInside];
+    [bg addTarget:ov action:@selector(tapOutside)
+                 forControlEvents:UIControlEventTouchDown];
+    UITapGestureRecognizer *bgTap = [[UITapGestureRecognizer alloc]
+        initWithTarget:ov action:@selector(tapOutside)];
+    [bg addGestureRecognizer:bgTap];
+    [ov addSubview:bg];
+    ov->_background = bg;
+
+    // Telegram-style lifted bubble: snapshot of the long-pressed cell,
+    // placed UNDER the panel (panel must draw above the message).
     UIImage *snapshot = nil;
     @try {
         UIGraphicsImageRenderer *r =
@@ -448,21 +460,16 @@ static MAXMenuOverlay *g_overlay = nil;
     } @catch (NSException *e) {
         snapshot = nil;
     }
-
-    CGRect cellFrame = [cell convertRect:cell.bounds toView:window];
-
-    MAXMenuOverlay *ov = [[MAXMenuOverlay alloc] initWithFrame:window.bounds];
-    ov.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    g_overlay = ov;
-
-    // dim background + tap-outside
-    UIControl *bg = [[UIControl alloc] initWithFrame:window.bounds];
-    bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    bg.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0];
-    [bg addTarget:ov action:@selector(tapOutside)
-                 forControlEvents:UIControlEventPrimaryActionTriggered];
-    [ov addSubview:bg];
-    ov->_background = bg;
+    if (snapshot) {
+        UIImageView *snapView = [[UIImageView alloc] initWithFrame:cellFrame];
+        snapView.image = snapshot;
+        snapView.layer.shadowColor = [UIColor blackColor].CGColor;
+        snapView.layer.shadowOpacity = 0.30;
+        snapView.layer.shadowRadius = 16;
+        snapView.layer.shadowOffset = CGSizeZero;
+        [ov addSubview:snapView];
+        ov->_snapshotView = snapView;
+    }
 
     // panel with blur material
     UIView *panel = [[UIView alloc] initWithFrame:CGRectZero];
@@ -518,38 +525,28 @@ static MAXMenuOverlay *g_overlay = nil;
     blur.frame = panel.bounds;
     blur.contentView.frame = blur.bounds;
 
-    // ---- position (Telegram-like): menu vertically centered on the message,
-    // horizontally clamped inside the screen; below/above when it doesn't fit.
+    // ---- position (Telegram-like): menu ABOVE the message bubble,
+    // below if there's no room above; horizontally centered on the bubble,
+    // clamped inside the screen.
     CGFloat const margin = 10.0;
+    CGFloat const safeTop = 54.0;    // status bar / dynamic island
+    CGFloat const safeBottom = 40.0;
     CGFloat wx = cellFrame.origin.x + (cellFrame.size.width - panelWidth) / 2;
     wx = MAX(margin, MIN(wx, window.bounds.size.width - panelWidth - margin));
 
     CGFloat panelH = panel.bounds.size.height;
-    CGFloat cy = CGRectGetMidY(cellFrame);
     CGFloat wy;
-    if (cy - panelH / 2 >= margin + 40 &&
-        cy + panelH / 2 <= window.bounds.size.height - margin - 40) {
-        wy = cy - panelH / 2;                      // centered on the message
-    } else if (CGRectGetMaxY(cellFrame) + panelH + 12 <=
-               window.bounds.size.height - margin - 40) {
-        wy = CGRectGetMaxY(cellFrame) + 12;        // below
+    if (cellFrame.origin.y - panelH - 10 >= safeTop) {
+        wy = cellFrame.origin.y - panelH - 10;               // above the bubble
+    } else if (CGRectGetMaxY(cellFrame) + panelH + 10 <=
+               window.bounds.size.height - safeBottom) {
+        wy = CGRectGetMaxY(cellFrame) + 10;                  // below
     } else {
-        wy = cellFrame.origin.y - panelH - 12;     // above
-        if (wy < margin + 40) wy = margin + 40;    // keep clear of status bar
+        // neither fits: clamp to the safe area (bubble is tall on screen)
+        wy = MAX(safeTop, MIN(cellFrame.origin.y - panelH - 6,
+                              window.bounds.size.height - safeBottom - panelH));
     }
     panel.center = CGPointMake(wx + panelWidth / 2, wy + panelH / 2);
-
-    // ---- lifted snapshot above the cell
-    if (snapshot) {
-        UIImageView *snapView = [[UIImageView alloc] initWithFrame:cellFrame];
-        snapView.image = snapshot;
-        snapView.layer.shadowColor = [UIColor blackColor].CGColor;
-        snapView.layer.shadowOpacity = 0.30;
-        snapView.layer.shadowRadius = 16;
-        snapView.layer.shadowOffset = CGSizeZero;
-        [ov addSubview:snapView];
-        ov->_snapshotView = snapView;
-    }
 
     [window addSubview:ov];
 
@@ -649,7 +646,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v5.0 loading (polished custom menu, system menu unusable)...");
+    maxlog(@"v5.1 loading (menu above bubble + reliable tap-outside)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -708,5 +705,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v5.0 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v5.1 loaded OK — log file: %@", max_logPath());
 }
