@@ -4,3 +4,4 @@ packages/
 obj/
 MAX_test
 __pycache__/
+inject_dylib.py
