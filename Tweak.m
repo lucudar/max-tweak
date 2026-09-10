@@ -245,7 +245,7 @@ static UIContextMenuConfiguration *max_deferredConfig(UIContextMenuConfiguration
         [UIContextMenuConfiguration
             configurationWithIdentifier:g_capturedIdentifier
                           previewProvider:g_capturedPreview
-                           actionProvider:^UIMenu *(_Nonnull NSArray<UIMenuElement *> *_Nonnull suggested) {
+                           actionProvider:^UIMenu *(NSArray<UIMenuElement *> *suggested) {
                 (void)suggested;
                 return [UIMenu menuWithChildren:children];
             }];
