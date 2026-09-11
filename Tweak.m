@@ -1,5 +1,5 @@
 /**
- * MAXMods v6.3 — «Потужно Мессенджер»: menu + ghost + ad blocker + long-press Моды
+ * MAXMods v6.4 — «Потужно Мессенджер»: keep-deleted now covers own deletes too
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
  * + main-thread watchdog that records freezes into the same log
@@ -786,6 +786,44 @@ static void max_installGhostHooks(void) {
 }
 
 // ============================================================================
+#pragma mark - Keep-deleted: block the user's OWN delete (switch-controlled)
+//
+// With the freeze fixed by the custom menu (v5+), it is safe to suppress the
+// app's own delete handler — same behavior the old Mods.dylib had, but
+// targeted at the single real implementor (OMMessageActionProcessor) instead
+// of a mass-swizzle over every class. When mod.del is ON, deleting a message
+// leaves it in place (locally and on the server); when OFF, normal delete.
+// ============================================================================
+
+static IMP orig_deleteMessageCtx = NULL;
+
+static void hook_deleteMessageCtx(id self, SEL _cmd, id message, id context) {
+    if (max_modOn(@"mod.del")) {
+        maxlog(@"keep-deleted: own delete suppressed (mod.del ON)");
+        return;
+    }
+    if (orig_deleteMessageCtx)
+        ((void(*)(id,SEL,id,id))orig_deleteMessageCtx)(self, _cmd, message, context);
+}
+
+static void max_installKeepDeletedHook(void) {
+    Class cls = objc_getClass("OMMessageActionProcessor");
+    if (!cls) {
+        maxlog(@"keep-deleted: OMMessageActionProcessor not found");
+        return;
+    }
+    SEL sel = sel_registerName("_deleteMessage:context:");
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) {
+        maxlog(@"keep-deleted: _deleteMessage:context: not found");
+        return;
+    }
+    orig_deleteMessageCtx = method_getImplementation(m);
+    method_setImplementation(m, (IMP)hook_deleteMessageCtx);
+    maxlog(@"keep-deleted: own-delete hook installed");
+}
+
+// ============================================================================
 #pragma mark - «Моды» settings tab (ported from Mods.dylib v6, in ObjC)
 // ============================================================================
 
@@ -1070,7 +1108,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v6.3 loading (potuzhno: long-press Settings for Моды)...");
+    maxlog(@"v6.4 loading (potuzhno: keep-deleted covers own deletes)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -1110,6 +1148,7 @@ static void maxmods_init(void) {
 
     // 4) Ghost mode + keep-deleted hooks (switch-controlled, Моды tab).
     max_installGhostHooks();
+    max_installKeepDeletedHook();
 
     // defaults: all mods ON until the user turns them off
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
@@ -1168,5 +1207,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v6.3 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v6.4 loaded OK — log file: %@", max_logPath());
 }
