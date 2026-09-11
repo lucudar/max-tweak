@@ -1,5 +1,5 @@
 /**
- * MAXModsDim.m — v7.0: reliable dimming of messages marked by the
+ * MAXModsDim.m — v7.1: reliable dimming of messages marked by the
  * two-phase delete (keep-deleted, mod.del).
  *
  * Why the v6.5 implementation never dimmed anything:
@@ -79,8 +79,10 @@ static void max_dimInvalidateMarked(void) {
 }
 
 static NSSet<NSString *> *max_dimMarkedSet(void) {
-    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (g_dimMarked && (now - g_dimMarkedStamp) < 0.25) return g_dimMarked;
+    // NSUserDefaultsDidChangeNotification proved unreliable to trigger the
+    // refresh (v7.0 log: no MATCH/NO MATCH lines at all). Read the defaults
+    // on every call instead — the system caches the plist in memory, so this
+    // is cheap — and drop the 0.25s staleness cache entirely.
     NSArray *saved = [[NSUserDefaults standardUserDefaults]
         stringArrayForKey:kMAXMarkedKey];
     NSMutableSet *set = [NSMutableSet setWithCapacity:saved.count];
@@ -337,6 +339,15 @@ static void max_dimApplyToCell(UIView *cell) {
         return;
     }
 
+    static BOOL g_dimLoggedNoMessage = NO;
+    if (!g_dimLoggedNoMessage) {
+        g_dimLoggedNoMessage = YES;
+        dimlog(@"marked=%lu but message lookup returned: %@ (cell %@)",
+               (unsigned long)marked.count,
+               max_dimMessageForCell(cell) ? @"found" : @"nil",
+               NSStringFromClass(cell.class));
+    }
+
     id message = max_dimMessageForCell(cell);
     BOOL isMarked = NO;
     for (NSString *key in max_dimKeysForMessage(message)) {
@@ -484,6 +495,21 @@ static void max_dimRefreshAll(void) {
 
 static MAXDimObserver *g_dimObserver = nil;
 
+static void max_dimSchedulePoll(void) {
+    // belt-and-braces: re-apply the dim every 0.5s; cells re-layout and
+    // re-read the marked set themselves, so this only costs a few checks
+    static BOOL scheduled = NO;
+    if (scheduled) return;
+    scheduled = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES
+            block:^(NSTimer *_) {
+                (void)_;
+                max_dimRefreshAll();
+            }] retain];
+    });
+}
+
 // ============================================================================
 #pragma mark - Constructor
 // ============================================================================
@@ -520,6 +546,8 @@ static void maxmods_dim_init(void) {
                                                  name:NSUserDefaultsDidChangeNotification
                                                object:nil];
 
-    dimlog(@"v7.0 dim module ready (%d cell class(es), alpha %.2f)",
+    max_dimSchedulePoll();
+
+    dimlog(@"v7.1 dim module ready (%d cell class(es), alpha %.2f, polling 0.5s)",
            g_nDimEntries, kMAXDimAlpha);
 }
