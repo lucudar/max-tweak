@@ -1,5 +1,6 @@
 /**
- * MAXMods v6.5 — «Потужно Мессенджер»: two-phase delete (mark dimmed, then real)
+ * MAXMods v6.7 — «Потужно Мессенджер»: slim build — stories, Digital ID,
+ * mini-apps and channel creation pruned
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
  * + main-thread watchdog that records freezes into the same log
@@ -684,6 +685,97 @@ static void max_installAdBlocker(void) {
 }
 
 // ============================================================================
+#pragma mark - Feature pruning: stories / Digital ID / mini-apps / channels
+//
+// Strip the super-app extras down to a plain messenger:
+//  - storiesEnabled -> NO            (stories circles never render)
+//  - Digital ID tab: router noop + filtered out of setViewControllers:
+//  - mini-apps list screen: router noop
+//  - channel creation: openCreateChannel noop on every implementor
+// Contacts/Chats/Settings stay; the Моды tab is added by our own injector.
+// ============================================================================
+
+static BOOL max_hookBoolNo(id self, SEL _cmd) { (void)self; (void)_cmd; return NO; }
+static void max_hookVoid3(id self, SEL _cmd, id a, id b, id c) {
+    (void)self; (void)_cmd; (void)a; (void)b; (void)c;
+}
+static void max_hookVoid1(id self, SEL _cmd, id a) { (void)self; (void)_cmd; (void)a; }
+static void max_hookVoid0(id self, SEL _cmd) { (void)self; (void)_cmd; }
+
+static IMP orig_setViewControllers = NULL;
+
+static BOOL max_isPrunedTab(UIViewController *vc) {
+    if (!vc) return NO;
+    NSString *cls = NSStringFromClass(vc.class);
+    if ([cls rangeOfString:@"Digital" options:NSCaseInsensitiveSearch].location != NSNotFound)
+        return YES;
+    NSString *title = vc.tabBarItem.title ?: @"";
+    if ([title rangeOfString:@"Цифровой"].location != NSNotFound ||
+        [title rangeOfString:@"Digital" options:NSCaseInsensitiveSearch].location != NSNotFound)
+        return YES;
+    return NO;
+}
+
+static void hook_setViewControllers(id self, SEL _cmd, NSArray *vcs) {
+    if ([vcs isKindOfClass:[NSArray class]]) {
+        NSMutableArray *kept = [NSMutableArray array];
+        for (UIViewController *vc in vcs)
+            if (!max_isPrunedTab(vc)) [kept addObject:vc];
+        if (kept.count != vcs.count)
+            maxlog(@"prune: dropped %lu tab(s) from the tab bar",
+                   (unsigned long)(vcs.count - kept.count));
+        vcs = kept;
+    }
+    ((void(*)(id,SEL,id))orig_setViewControllers)(self, _cmd, vcs);
+}
+
+static void max_installFeaturePruner(void) {
+    struct {
+        const char *cls;
+        const char *sel;
+        IMP hook;
+    } hooks[] = {
+        { "_TtC23OKMAppMessengerProtocol18OMPMSConfigStorage", "storiesEnabled",
+          (IMP)max_hookBoolNo },
+        { "OKMRouter", "_openDigitalIdTabWithReload:cancelSignal:completion:",
+          (IMP)max_hookVoid3 },
+        { "OKMRouter", "showWebAppListScreenWithWebAppSettings:",
+          (IMP)max_hookVoid1 },
+        { "OKMRouter", "openCreateChannel", (IMP)max_hookVoid0 },
+        { "_TtC13ContactListUI26ContactPickerClosureRouter", "openCreateChannel",
+          (IMP)max_hookVoid0 },
+        { "_TtC13ContactListUI13WeakRefRouter", "openCreateChannel",
+          (IMP)max_hookVoid0 },
+    };
+    for (NSUInteger i = 0; i < sizeof(hooks)/sizeof(hooks[0]); i++) {
+        Class cls = objc_getClass(hooks[i].cls);
+        if (!cls) {
+            maxlog(@"prune: class not found: %s", hooks[i].cls);
+            continue;
+        }
+        SEL sel = sel_registerName(hooks[i].sel);
+        Method m = class_getInstanceMethod(cls, sel);
+        if (!m) {
+            maxlog(@"prune: method not found: %s -> %s", hooks[i].cls, hooks[i].sel);
+            continue;
+        }
+        method_setImplementation(m, hooks[i].hook);
+        maxlog(@"prune: blocked %s -> %s", hooks[i].cls, hooks[i].sel);
+    }
+
+    // Digital ID tab: filter it out whenever the app rebuilds the tab bar
+    Class tbc = objc_getClass("_TtC7OMUIKit16TabBarController");
+    if (tbc) {
+        Method m = class_getInstanceMethod(tbc, @selector(setViewControllers:));
+        if (m) {
+            orig_setViewControllers = method_getImplementation(m);
+            method_setImplementation(m, (IMP)hook_setViewControllers);
+            maxlog(@"prune: tab-bar filter installed");
+        }
+    }
+}
+
+// ============================================================================
 #pragma mark - Ghost mode / keep-deleted hooks (switch-controlled)
 //
 // Ported from the old Mods.dylib v6 (mods_v6.c), but WITHOUT its two fatal
@@ -1186,7 +1278,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v6.5 loading (potuzhno: two-phase delete with dimmed marked)...");
+    maxlog(@"v6.7 loading (potuzhno: slim messenger — no stories/DigitalID/miniapps/channels)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -1224,7 +1316,10 @@ static void maxmods_init(void) {
     //    chats, myTarget ad id — all neutralized.
     max_installAdBlocker();
 
-    // 4) Ghost mode + keep-deleted hooks (switch-controlled, Моды tab).
+    // 4) Feature pruning: stories / Digital ID / mini-apps / channels.
+    max_installFeaturePruner();
+
+    // 5) Ghost mode + keep-deleted hooks (switch-controlled, Моды tab).
     max_installGhostHooks();
     max_installKeepDeletedHook();
 
@@ -1235,7 +1330,7 @@ static void maxmods_init(void) {
         if ([d objectForKey:e.key] == nil) [d setBool:YES forKey:e.key];
     }
 
-    // 5) «Моды» entry points:
+    // 6) «Моды» entry points:
     //    a) long-press (0.5s) the LAST tab (Settings) — the reliable way,
     //       ported from the old tweak (7a437bb);
     //    b) keep trying to inject a dedicated tab as well.
@@ -1260,7 +1355,7 @@ static void maxmods_init(void) {
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
                    ^{ max_periodicModsTabCheck(); });
 
-    // 6) Session persistence fixes (unchanged from v3.0).
+    // 7) Session persistence fixes (unchanged from v3.0).
     Class kc = objc_getClass("UICKeyChainStore");
     if (kc) {
         Method cm = class_getClassMethod(kc, @selector(keyChainStoreWithService:accessGroup:));
@@ -1285,5 +1380,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v6.5 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v6.7 loaded OK — log file: %@", max_logPath());
 }
