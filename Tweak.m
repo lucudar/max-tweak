@@ -1,5 +1,5 @@
 /**
- * MAXMods v7.5 — «Потужно Мессенджер»: remote-deleted kept, in-app log viewer,
+ * MAXMods v7.6 — «Потужно Мессенджер»: dim-fix (event-level remote delete only),
  * indexPath-based dim, settings view pruning
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
@@ -1047,13 +1047,11 @@ static id max_hook_read2(id self, SEL _cmd, id a, id b) {
 
 static void max_hook_void2(id self, SEL _cmd, id a, id b) {
     NSString *n = NSStringFromSelector(_cmd);
+    // Only the EVENT-level hook is suppressed. The db-level
+    // deleteLocallyMessagesWithIds: also fires during normal history sync
+    // and broke the whole chat when blocked (everything dimmed).
     if ([n hasPrefix:@"_handleDeletedMessages"] && max_modOn(@"mod.del")) {
-        maxlog(@"ghost: remote deletion event suppressed (2-arg)");
-        return;
-    }
-    if ([n isEqualToString:@"deleteLocallyMessagesWithIds:updateChat:"] &&
-        max_modOn(@"mod.del")) {
-        maxlog(@"ghost: local db delete-on-remote suppressed");
+        maxlog(@"ghost: remote deletion event suppressed");
         return;
     }
     IMP o = max_modOrig(object_getClass(self), _cmd);
@@ -1092,7 +1090,6 @@ static void max_installGhostHooks(void) {
         {"updateOnlineStatus",               0},
         {"_handleDeletedMessages",           0},
         {"_handleDeletedMessages:inChatWithId:", 2},   // real remote-delete path
-        {"deleteLocallyMessagesWithIds:updateChat:", 2}, // db removal on remote delete
     };
     unsigned int classCount = 0;
     Class *classes = objc_copyClassList(&classCount);
@@ -1608,7 +1605,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v7.5 loading (keep remote-deleted messages)...");
+    maxlog(@"v7.6 loading (dim fix: event-level remote delete only)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -1655,6 +1652,17 @@ static void maxmods_init(void) {
     // 5) Ghost mode + keep-deleted hooks (switch-controlled, Моды tab).
     max_installGhostHooks();
     max_installKeepDeletedHook();
+
+    // v7.6: reset the marked indexPath list once — the v7.5 db-hook bug
+    // poisoned it / made cells dim that should not. Keys (message ids)
+    // are kept; the dim list rebuilds from real 1st-deletes.
+    NSString *resetKey = @"mod.dimListReset.v7.6";
+    if (![[NSUserDefaults standardUserDefaults] boolForKey:resetKey]) {
+        [[NSUserDefaults standardUserDefaults] setObject:@[]
+                                                  forKey:@"mod.markedIndexPaths"];
+        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:resetKey];
+        maxlog(@"keep-deleted: dim list reset (one-time v7.6)");
+    }
 
     // defaults: all mods ON until the user turns them off
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
@@ -1713,5 +1721,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v7.5 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v7.6 loaded OK — log file: %@", max_logPath());
 }
