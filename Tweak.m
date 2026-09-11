@@ -797,7 +797,7 @@ static void max_retryModsTab(void) {
     if (triesLeft <= 0) return;
     triesLeft--;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC),
-                   dispatch_get_main_queue(), max_injectModsTab);
+                   dispatch_get_main_queue(), ^{ max_injectModsTab(); });
 }
 
 static void max_injectModsTab(void) {
@@ -826,7 +826,7 @@ static void max_periodicModsTabCheck(void) {
     dispatch_async(dispatch_get_main_queue(), ^{ max_injectModsTab(); });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
-                   max_periodicModsTabCheck);
+                   ^{ max_periodicModsTabCheck(); });
 }
 
 // ============================================================================
@@ -936,10 +936,10 @@ static void maxmods_init(void) {
 
     // 4) «Моды» tab — the tab bar appears after login, retry then re-check.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), max_injectModsTab);
+                   dispatch_get_main_queue(), ^{ max_injectModsTab(); });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
-                   max_periodicModsTabCheck);
+                   ^{ max_periodicModsTabCheck(); });
 
     // 5) Session persistence fixes (unchanged from v3.0).
     Class kc = objc_getClass("UICKeyChainStore");
