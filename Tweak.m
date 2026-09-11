@@ -1,5 +1,5 @@
 /**
- * MAXMods v6.2 — «Потужно Мессенджер»: menu + ghost mode + Моды tab + ad blocker
+ * MAXMods v6.3 — «Потужно Мессенджер»: menu + ghost + ad blocker + long-press Моды
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
  * + main-thread watchdog that records freezes into the same log
@@ -939,6 +939,77 @@ static void max_periodicModsTabCheck(void) {
 }
 
 // ============================================================================
+#pragma mark - Моды via long-press on the LAST tab (Settings/Profile)
+//
+// The reliable entry point from the old tweak (commit 7a437bb): a long-press
+// recognizer on the app's custom tab bar view — the tab bar exists no matter
+// how the controller tree is wrapped. Long-press the Settings/Profile tab
+// (the last one) for 0.5s to open the Моды screen as a modal.
+// ============================================================================
+
+static void maxmods_tabBarLongPressImp(id self, SEL _cmd,
+                                       UILongPressGestureRecognizer *gesture) {
+    if (gesture.state != UIGestureRecognizerStateBegan) return;
+
+    UIView *tabBarView = gesture.view;
+    CGPoint point = [gesture locationInView:tabBarView];
+
+    // custom tab bar: items laid out evenly across the width.
+    // 4 slots: chats / people / calls(hidden) / settings — but derive from
+    // the bar's direct subviews count when available.
+    NSInteger itemCount = 0;
+    for (UIView *sub in tabBarView.subviews) itemCount++;
+    if (itemCount < 2) itemCount = 4;
+    NSInteger tappedIndex =
+        (NSInteger)(point.x / (tabBarView.bounds.size.width / MAX(itemCount, 1)));
+
+    // any long-press on the last third of the bar = Settings/Profile area
+    if (tappedIndex >= itemCount - 1) {
+        UIViewController *host = nil;
+        // walk up from the tab bar view to a ViewController able to present
+        UIResponder *responder = tabBarView;
+        while (responder && ![responder isKindOfClass:[UIViewController class]])
+            responder = responder.nextResponder;
+        host = (UIViewController *)responder;
+        if (!host) return;
+
+        MAXModsViewController *modsVC = [[MAXModsViewController alloc]
+            initWithStyle:UITableViewStyleGrouped];
+        UINavigationController *nav = [[UINavigationController alloc]
+            initWithRootViewController:modsVC];
+        modsVC.navigationItem.leftBarButtonItem =
+            [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                                                           target:modsVC
+                                                           action:@selector(maxmods_dismiss)];
+        [host presentViewController:nav animated:YES completion:nil];
+        maxlog(@"mods: opened via long-press on tab bar");
+    }
+}
+
+// helper: dismiss for the Done button
+__attribute__((unused))
+static void maxmods_dismissImp(id self, SEL _cmd) {
+    UIViewController *vc = (UIViewController *)self;
+    [vc dismissViewControllerAnimated:YES completion:nil];
+}
+
+static IMP orig_tabBarViewDidLoad = NULL;
+
+static void hook_tabBarViewDidLoad(id self, SEL _cmd) {
+    ((void(*)(id,SEL))orig_tabBarViewDidLoad)(self, _cmd);
+
+    // attach the long-press recognizer to the tab bar's main view
+    UIView *barView = ((UIViewController *)self).view;
+    if (!barView) return;
+    UILongPressGestureRecognizer *lp =
+        [[UILongPressGestureRecognizer alloc]
+            initWithTarget:self action:@selector(maxmods_tabBarLongPress:)];
+    lp.minimumPressDuration = 0.5;
+    [barView addGestureRecognizer:lp];
+    maxlog(@"mods: long-press gesture attached to tab bar");
+}
+
+// ============================================================================
 #pragma mark - Session Fix: Keychain (selective)
 // ============================================================================
 
@@ -999,7 +1070,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v6.2 loading (potuzhno: menu layout fix + recursive tab search)...");
+    maxlog(@"v6.3 loading (potuzhno: long-press Settings for Моды)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -1047,7 +1118,25 @@ static void maxmods_init(void) {
         if ([d objectForKey:e.key] == nil) [d setBool:YES forKey:e.key];
     }
 
-    // 5) «Моды» tab — the tab bar appears after login, retry then re-check.
+    // 5) «Моды» entry points:
+    //    a) long-press (0.5s) the LAST tab (Settings) — the reliable way,
+    //       ported from the old tweak (7a437bb);
+    //    b) keep trying to inject a dedicated tab as well.
+    {
+        Class tabBarVC = objc_getClass("_TtC7OMUIKit16TabBarController");
+        if (tabBarVC) {
+            class_addMethod(tabBarVC, @selector(maxmods_tabBarLongPress:),
+                (IMP)maxmods_tabBarLongPressImp, "v@:@");
+            class_addMethod([MAXModsViewController class], @selector(maxmods_dismiss),
+                (IMP)maxmods_dismissImp, "v@:");
+            orig_tabBarViewDidLoad = swizzle(tabBarVC,
+                @selector(viewDidLoad), (IMP)hook_tabBarViewDidLoad);
+            maxlog(@"mods: tab-bar long-press hook: %@",
+                   orig_tabBarViewDidLoad ? @"OK" : @"MISS");
+        } else {
+            maxlog(@"WARNING: OMUIKit TabBarController class not found");
+        }
+    }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ max_injectModsTab(); });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
@@ -1079,5 +1168,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v6.2 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v6.3 loaded OK — log file: %@", max_logPath());
 }
