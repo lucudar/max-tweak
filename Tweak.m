@@ -607,8 +607,8 @@ static MAXMenuOverlay *g_overlay = nil;
 // ============================================================================
 
 static void max_hookVoidRet(id self, SEL _cmd) { (void)self; (void)_cmd; }
-static void max_hookIdRetNil(id self, SEL _cmd) { (void)self; (void)_cmd; return nil; }
-static void max_hookBoolRetNo(id self, SEL _cmd, void *x) { (void)self; (void)_cmd; (void)x; return NO; }
+static id max_hookIdRetNil(id self, SEL _cmd) { (void)self; (void)_cmd; return nil; }
+static BOOL max_hookBoolRetNo(id self, SEL _cmd) { (void)self; (void)_cmd; return NO; }
 
 // storage getters return a fixed empty array
 static id max_hookEmptyArrayRet(id self, SEL _cmd) {
