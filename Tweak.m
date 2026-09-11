@@ -1,6 +1,6 @@
 /**
- * MAXMods v6.9 — «Потужно Мессенджер»: settings-prune diagnostics — dumps real
- * section/row titles to the log so the exact junk strings can be matched
+ * MAXMods v7.1 — «Потужно Мессенджер»: dim polling fix + view-level settings
+ * pruning (Swift settings screens have no ObjC entry point)
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
  * + main-thread watchdog that records freezes into the same log
@@ -896,6 +896,99 @@ static void max_installSettingsPruner(void) {
 }
 
 // ============================================================================
+#pragma mark - Settings junk: view-level pruning + title dump
+//
+// The settings screens are pure Swift (SettingsUI SourceModels) — no ObjC
+// entry point to filter sections (OKMActionsViewModel is not used there:
+// v6.9 log had zero sections-dump lines). Fallback that always works:
+// when a SettingsUI view controller appears, walk its view tree, dump every
+// label text to the log (diagnostics), and hide rows whose labels match the
+// junk list. Hiding the label's ancestor UICollectionViewCell is enough —
+// an empty cell renders as nothing.
+// ============================================================================
+
+static BOOL max_settingsTitleIsJunk(NSString *title) {
+    if (title.length < 3) return NO;
+    static NSArray<NSString *> *junk = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        junk = @[
+            @"Госуслуг", @"Gosuslugi", @"Единый вход",
+            @"Вернуть уведомления",
+            @"Пригласить друзей", @"Invite Friends",
+            @"Устройства", @"Devices",
+            @"Папк",                       // Папки/Папка
+            @"Экономия батареи", @"Power and Data",
+            @"Память", @"Storage",
+            @"для бизнеса",
+            @"Мини-приложения", @"Мини приложения",
+        ];
+    });
+    for (NSString *bad in junk)
+        if ([title rangeOfString:bad options:NSCaseInsensitiveSearch].location != NSNotFound)
+            return YES;
+    return NO;
+}
+
+static int g_settingsDumpBudget = 40;   // log the first N labels once
+
+static void max_settingsPruneViews(UIView *view, int depth) {
+    if (!view || depth > 10) return;
+
+    if ([view isKindOfClass:[UILabel class]]) {
+        UILabel *label = (UILabel *)view;
+        NSString *text = label.text;
+        if (text.length > 0 && g_settingsDumpBudget > 0) {
+            g_settingsDumpBudget--;
+            maxlog(@"labels-dump: '%@'", text);
+        }
+        if (max_settingsTitleIsJunk(text)) {
+            // climb to the containing cell and collapse it
+            UIView *cursor = label;
+            for (int i = 0; i < 8 && cursor; i++) {
+                if ([cursor isKindOfClass:[UICollectionViewCell class]] ||
+                    [cursor isKindOfClass:[UITableViewCell class]]) {
+                    maxlog(@"settings-hide: '%@'", text);
+                    cursor.hidden = YES;
+                    [UIView animateWithDuration:0.15 animations:^{
+                        cursor.alpha = 0.0;
+                    }];
+                    break;
+                }
+                cursor = cursor.superview;
+            }
+        }
+    }
+    for (UIView *sub in view.subviews)
+        max_settingsPruneViews(sub, depth + 1);
+}
+
+static void max_installSettingsViewPruner(void) {
+    // hook viewDidAppear: on every SettingsUI view controller class we can find
+    maxlog(@"settings-view-pruner: window observer installed");
+
+    // simpler + universal: observe the key window's VC changes via a
+    // repeating light check — the screens re-prune on every appearance
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIWindowDidBecomeVisibleNotification
+                    object:nil
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *note) {
+        UIWindow *w = note.object;
+        if (![w isKindOfClass:[UIWindow class]]) return;
+        UIViewController *root = w.rootViewController;
+        if (!root) return;
+        NSString *cls = NSStringFromClass(root.class);
+        if ([cls rangeOfString:@"SettingsUI" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            maxlog(@"settings-screen(root): %@ visible", cls);
+            max_settingsPruneViews(root.view, 0);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ max_settingsPruneViews(root.view, 0); });
+        }
+    }];
+}
+
+// ============================================================================
 #pragma mark - Ghost mode / keep-deleted hooks (switch-controlled)
 //
 // Ported from the old Mods.dylib v6 (mods_v6.c), but WITHOUT its two fatal
@@ -1398,7 +1491,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v6.9 loading (settings-prune diagnostics + extended patterns)...");
+    maxlog(@"v7.1 loading (dim polling + settings view pruner + labels dump)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -1440,6 +1533,7 @@ static void maxmods_init(void) {
     //    plus junk rows on the settings screens.
     max_installFeaturePruner();
     max_installSettingsPruner();
+    max_installSettingsViewPruner();
 
     // 5) Ghost mode + keep-deleted hooks (switch-controlled, Моды tab).
     max_installGhostHooks();
@@ -1502,5 +1596,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v6.9 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v7.1 loaded OK — log file: %@", max_logPath());
 }
