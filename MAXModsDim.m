@@ -333,10 +333,24 @@ static void max_dimApplyToCell(UIView *cell) {
     static BOOL g_dimLoggedNoMessage = NO;
     if (!g_dimLoggedNoMessage) {
         g_dimLoggedNoMessage = YES;
-        dimlog(@"marked=%lu but message lookup returned: %@ (cell %@)",
-               (unsigned long)marked.count,
-               max_dimMessageForCell(cell) ? @"found" : @"nil",
-               NSStringFromClass(cell.class));
+        dimlog(@"marked=%lu but message lookup returned: nil (cell %@)",
+               (unsigned long)marked.count, NSStringFromClass(cell.class));
+        // dump the ivar tree once so the model path can be hard-coded after
+        for (Class c = object_getClass(cell); c && c != [UIView class];
+             c = class_getSuperclass(c)) {
+            unsigned int n = 0;
+            Ivar *ivars = class_copyIvarList(c, &n);
+            for (unsigned int i = 0; i < n; i++) {
+                const char *t = ivar_getTypeEncoding(ivars[i]);
+                if (!t || t[0] != '@') continue;
+                id v = object_getIvar(cell, ivars[i]);
+                if (!v) continue;
+                NSString *vcls = NSStringFromClass(object_getClass(v));
+                dimlog(@"ivar %@.%s = %@ (%@)",
+                       NSStringFromClass(c), ivar_getName(ivars[i]), vcls, v);
+            }
+            free(ivars);
+        }
     }
 
     id message = max_dimMessageForCell(cell);
