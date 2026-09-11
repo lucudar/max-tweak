@@ -71,13 +71,6 @@ static void dimlog(NSString *fmt, ...) {
 #pragma mark - Marked set (cached read of mod.markedDeleted)
 // ============================================================================
 
-static NSSet<NSString *> *g_dimMarked = nil;
-static NSTimeInterval g_dimMarkedStamp = 0;
-
-static void max_dimInvalidateMarked(void) {
-    g_dimMarkedStamp = 0;
-}
-
 static NSSet<NSString *> *max_dimMarkedSet(void) {
     // NSUserDefaultsDidChangeNotification proved unreliable to trigger the
     // refresh (v7.0 log: no MATCH/NO MATCH lines at all). Read the defaults
@@ -92,9 +85,7 @@ static NSSet<NSString *> *max_dimMarkedSet(void) {
         if (s.length == 0 || [s isEqualToString:@"(null)"]) continue;
         [set addObject:s];
     }
-    g_dimMarked = set;
-    g_dimMarkedStamp = now;
-    return g_dimMarked;
+    return set;
 }
 
 // ============================================================================
@@ -470,7 +461,6 @@ static void max_dimRefreshInView(UIView *view, int depth) {
 }
 
 static void max_dimRefreshAll(void) {
-    max_dimInvalidateMarked();
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (![scene isKindOfClass:[UIWindowScene class]]) continue;
         for (UIWindow *window in ((UIWindowScene *)scene).windows)
@@ -501,12 +491,13 @@ static void max_dimSchedulePoll(void) {
     static BOOL scheduled = NO;
     if (scheduled) return;
     scheduled = YES;
+    static NSTimer *timer = nil;   // static keeps it alive under ARC
     dispatch_async(dispatch_get_main_queue(), ^{
-        [[NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES
+        timer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES
             block:^(NSTimer *_) {
                 (void)_;
                 max_dimRefreshAll();
-            }] retain];
+            }];
     });
 }
 
