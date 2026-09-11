@@ -1,6 +1,6 @@
 /**
- * MAXMods v7.1 — «Потужно Мессенджер»: dim polling fix + view-level settings
- * pruning (Swift settings screens have no ObjC entry point)
+ * MAXMods v7.4 — «Потужно Мессенджер»: in-app log viewer (Моды → Логи),
+ * indexPath-based dim, settings view pruning
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
  * + main-thread watchdog that records freezes into the same log
@@ -1276,14 +1276,29 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
     self.title = @"Моды";
 }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 1; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 2; }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    return (NSInteger)kModCount;
+    return (s == 0) ? (NSInteger)kModCount : 3;   // 0: mods, 1: log actions
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv
          cellForRowAtIndexPath:(NSIndexPath *)ip {
+    if (ip.section == 1) {
+        // log actions: view / share / clear
+        static NSString *kLogCell = @"maxlogcell";
+        UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:kLogCell];
+        if (!cell) {
+            cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1
+                                    reuseIdentifier:kLogCell];
+            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+        }
+        NSArray *titles = @[ @"Посмотреть логи", @"Отправить логи", @"Очистить логи" ];
+        NSArray *icons = @[ @"doc.text", @"square.and.arrow.up", @"trash" ];
+        cell.textLabel.text = titles[ip.row];
+        cell.imageView.image = [UIImage systemImageNamed:icons[ip.row]];
+        return cell;
+    }
     UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:kModCell];
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
@@ -1302,6 +1317,56 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
         setOn:[[NSUserDefaults standardUserDefaults] boolForKey:e.key]];
     [(UISwitch *)cell.accessoryView setTag:ip.row];
     return cell;
+}
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    if (ip.section != 1) return;
+    [tv deselectRowAtIndexPath:ip animated:YES];
+
+    if (ip.row == 0) {
+        // viewer: last 800 lines of the log in a read-only text screen
+        UITextView *tv2 = [[UITextView alloc] initWithFrame:CGRectZero];
+        tv2.editable = NO;
+        tv2.font = [UIFont fontWithName:@"Menlo" size:11]
+                   ?: [UIFont systemFontOfSize:12];
+        tv2.backgroundColor = UIColor.systemBackgroundColor;
+        NSString *path = max_logPath();
+        NSString *full = [NSString stringWithContentsOfFile:path
+                                encoding:NSUTF8StringEncoding error:nil] ?: @"(пусто)";
+        NSArray *lines = [full componentsSeparatedByString:@"
+"];
+        if (lines.count > 800)
+            lines = [lines subarrayWithRange:
+                NSMakeRange(lines.count - 800, 800)];
+        tv2.text = [@"...
+" stringByAppendingString:
+                    [lines componentsJoinedByString:@"
+"]];
+        UIViewController *vc = [[UIViewController alloc] init];
+        vc.view = tv2;
+        vc.title = @"Логи";
+        tv2.frame = vc.view.bounds;
+        tv2.autoresizingMask = UIViewAutoresizingFlexibleWidth
+                               | UIViewAutoresizingFlexibleHeight;
+        [self.navigationController pushViewController:vc animated:YES];
+    } else if (ip.row == 1) {
+        // share sheet with the log file
+        NSURL *url = [NSURL fileURLWithPath:max_logPath()];
+        UIActivityViewController *av = [[UIActivityViewController alloc]
+            initWithActivityItems:@[url] applicationActivities:nil];
+        [self presentViewController:av animated:YES completion:nil];
+    } else if (ip.row == 2) {
+        // truncate the log
+        [@"" writeToFile:max_logPath() atomically:YES
+              encoding:NSUTF8StringEncoding error:nil];
+        maxlog(@"log: cleared by user");
+        UIAlertController *al = [UIAlertController
+            alertControllerWithTitle:@"Логи очищены" message:nil
+             preferredStyle:UIAlertControllerStyleAlert];
+        [al addAction:[UIAlertAction actionWithTitle:@"Ок" style:UIAlertActionStyleDefault
+                                             handler:nil]];
+        [self presentViewController:al animated:YES completion:nil];
+    }
 }
 
 - (void)switchChanged:(UISwitch *)sw {
@@ -1527,7 +1592,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v7.3 loading (indexPath-based dim)...");
+    maxlog(@"v7.4 loading (in-app log viewer + share/clear)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -1632,5 +1697,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v7.3 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v7.4 loaded OK — log file: %@", max_logPath());
 }
