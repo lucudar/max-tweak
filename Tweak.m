@@ -189,10 +189,21 @@ static void flattenMenu(UIMenuElement *element, NSMutableArray<UIAction *> *out)
 
 static IMP orig_cellConfig = NULL;
 
+// the cell the menu was opened on (weak; used to record its indexPath
+// when the message gets marked by the two-phase delete)
+@interface MaxMenuCellRef : NSObject
+@property (nonatomic, weak) id target;
+@end
+@implementation MaxMenuCellRef
+@end
+static MaxMenuCellRef *g_lastMenuCellRef = nil;
+
 static UIContextMenuConfiguration *hook_cellConfig(
         id self, SEL _cmd, UIContextMenuInteraction *interaction, CGPoint point) {
 
     maxlog(@"menu: entry (MessageCell path)");
+    if (!g_lastMenuCellRef) g_lastMenuCellRef = [MaxMenuCellRef new];
+    g_lastMenuCellRef.target = self;
     g_capturedProvider = nil;
     g_foundUnsupportedElement = NO;
     g_inMessageCellMenu = YES;
@@ -1129,20 +1140,45 @@ static void hook_deleteMessageCtx(id self, SEL _cmd, id message, id context) {
             maxlog(@"keep-deleted: message %@ marked (1st delete)", pk);
             [[NSUserDefaults standardUserDefaults] setObject:[g_markedDeleted allObjects]
                                                       forKey:@"mod.markedDeleted"];
-            // no real deletion happens; the UI dims the cell on its next layout pass
-            dispatch_async(dispatch_get_main_queue(), ^{
-                for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-                    if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-                    for (UIWindow *w in ((UIWindowScene *)scene).windows)
-                        [w.rootViewController.view setNeedsLayout];
+
+            // v7.3: remember the cell's indexPath for the dim module — the
+            // message stays in the data source (deletion blocked), so the
+            // indexPath is stable across reuse and restarts.
+            if (g_lastMenuCellRef) {
+                UIView *cell = (UIView *)g_lastMenuCellRef.target;
+                if (cell) {
+                    UIView *v = cell.superview;
+                    while (v && ![v isKindOfClass:[UICollectionView class]])
+                        v = v.superview;
+                    if (v) {
+                        NSIndexPath *ip = [(UICollectionView *)v indexPathForCell:
+                                           (UICollectionViewCell *)cell];
+                        if (ip) {
+                            NSString *ipKey = [NSString stringWithFormat:@"%ld-%ld",
+                                               (long)ip.section, (long)ip.item];
+                            NSMutableArray *ips = [[[NSUserDefaults standardUserDefaults]
+                                stringArrayForKey:@"mod.markedIndexPaths"] mutableCopy]
+                                ?: [NSMutableArray array];
+                            [ips addObject:ipKey];
+                            [[NSUserDefaults standardUserDefaults] setObject:ips
+                                                                      forKey:@"mod.markedIndexPaths"];
+                            maxlog(@"keep-deleted: marked indexPath %@", ipKey);
+                        }
+                    }
                 }
-            });
+            }
             return;
         }
         if (pk) {
             [g_markedDeleted removeObject:pk];
             [[NSUserDefaults standardUserDefaults] setObject:[g_markedDeleted allObjects]
                                                       forKey:@"mod.markedDeleted"];
+            // drop the recorded indexPath so the cell un-dims
+            NSMutableArray *ips = [[[NSUserDefaults standardUserDefaults]
+                stringArrayForKey:@"mod.markedIndexPaths"] mutableCopy];
+            [ips removeLastObject];
+            [[NSUserDefaults standardUserDefaults] setObject:(ips ?: @[])
+                                                      forKey:@"mod.markedIndexPaths"];
             maxlog(@"keep-deleted: message %@ really deleted (2nd delete)", pk);
         }
     }
@@ -1491,7 +1527,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v7.1 loading (dim polling + settings view pruner + labels dump)...");
+    maxlog(@"v7.3 loading (indexPath-based dim)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -1596,5 +1632,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v7.1 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v7.3 loaded OK — log file: %@", max_logPath());
 }
