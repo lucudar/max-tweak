@@ -1,5 +1,5 @@
 /**
- * MAXMods v6.1 — «Потужно Мессенджер»: menu + ghost mode + Моды tab + ad blocker
+ * MAXMods v6.2 — «Потужно Мессенджер»: menu + ghost mode + Моды tab + ad blocker
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
  * + main-thread watchdog that records freezes into the same log
@@ -307,49 +307,29 @@ static UIWindow *max_currentWindow(void) {
     return UIApplication.sharedApplication.keyWindow;
 }
 
-// A menu row: fixed-size leading icon + left-aligned title, Telegram-like.
-@interface MAXMenuItemButton : UIButton
+// A menu row: fixed-size leading icon + left-aligned title, laid out by hand.
+// UIButtonConfiguration misaligned icons over long titles (icon overlapping
+// "Delete", truncated "Save to Gallery") — manual layout is predictable.
+@interface MAXMenuItemButton : UIControl
+@property (nonatomic, strong, readonly) NSString *actionTitle;
 @end
 
-@implementation MAXMenuItemButton {
-    UIView *_highlightView;
-}
+@interface MAXMenuItemButton ()
+@property (nonatomic, strong) UIAction *action;
+@property (nonatomic, strong) UILabel *titleLabel2;
+@property (nonatomic, strong) UIImageView *iconView;
+@property (nonatomic, strong) UIView *highlightView;
+@end
+
+@implementation MAXMenuItemButton
 
 - (instancetype)initWithFrame:(CGRect)frame action:(UIAction *)action {
     if ((self = [super initWithFrame:frame])) {
         UIColor *tint = UIColor.labelColor;
         if (action.attributes & UIMenuElementAttributesDestructive)
             tint = [UIColor systemRedColor];
-
-        UIButtonConfiguration *cfg = [UIButtonConfiguration plainButtonConfiguration];
-        cfg.titleAlignment = UIButtonConfigurationTitleAlignmentLeading;
-        cfg.imagePlacement = NSDirectionalRectEdgeLeading;
-        cfg.imagePadding = 14;
-        cfg.baseForegroundColor = tint;
-        cfg.attributedTitle = [[NSAttributedString alloc]
-            initWithString:action.title attributes:@{
-                NSFontAttributeName: [UIFont systemFontOfSize:17 weight:UIFontWeightRegular],
-                NSForegroundColorAttributeName: tint,
-            }];
-        if (action.image) {
-            // normalize every icon to a fixed 24pt box so rows align
-            UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc]
-                initWithSize:CGSizeMake(24, 24)];
-            UIImage *norm = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-                CGRect dst = CGRectMake((24 - action.image.size.width) / 2,
-                                        (24 - action.image.size.height) / 2,
-                                        action.image.size.width, action.image.size.height);
-                [action.image drawInRect:dst];
-            }];
-            cfg.image = [norm imageWithTintColor:tint
-                                 renderingMode:UIImageRenderingModeAlwaysTemplate];
-        }
-        cfg.contentInsets = NSDirectionalEdgeInsetsMake(0, 16, 0, 16);
-        self.configuration = cfg;
-        self.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
-
-        // fire the app's own handler on tap
-        [self addAction:action forControlEvents:UIControlEventPrimaryActionTriggered];
+        _action = action;
+        _actionTitle = action.title ?: @"";
 
         _highlightView = [[UIView alloc] initWithFrame:self.bounds];
         _highlightView.autoresizingMask =
@@ -362,9 +342,54 @@ static UIWindow *max_currentWindow(void) {
             }];
         _highlightView.layer.cornerRadius = 10;
         _highlightView.hidden = YES;
-        [self insertSubview:_highlightView atIndex:0];
+        [self addSubview:_highlightView];
+
+        _iconView = [[UIImageView alloc] initWithFrame:CGRectZero];
+        _iconView.contentMode = UIViewContentModeCenter;
+        if (action.image) {
+            // normalize to a fixed 24x24 box, centered
+            UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc]
+                initWithSize:CGSizeMake(24, 24)];
+            UIImage *norm = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+                CGRect dst = CGRectMake((24 - action.image.size.width) / 2,
+                                        (24 - action.image.size.height) / 2,
+                                        action.image.size.width, action.image.size.height);
+                [action.image drawInRect:dst];
+            }];
+            _iconView.image = [norm imageWithTintColor:tint
+                                        renderingMode:UIImageRenderingModeAlwaysTemplate];
+        }
+        [self addSubview:_iconView];
+
+        _titleLabel2 = [[UILabel alloc] initWithFrame:CGRectZero];
+        _titleLabel2.text = action.title;
+        _titleLabel2.font = [UIFont systemFontOfSize:17 weight:UIFontWeightRegular];
+        _titleLabel2.textColor = tint;
+        _titleLabel2.lineBreakMode = NSLineBreakByTruncatingTail;
+        [self addSubview:_titleLabel2];
+
+        // fire the app's own handler on tap
+        [self addTarget:self action:@selector(fire)
+              forControlEvents:UIControlEventTouchUpInside];
     }
     return self;
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat const iconX = 18, iconSize = 24, gap = 14, trailing = 16;
+    _iconView.frame = CGRectMake(iconX,
+                                 (self.bounds.size.height - iconSize) / 2,
+                                 iconSize, iconSize);
+    CGFloat textX = iconX + iconSize + gap;
+    _titleLabel2.frame = CGRectMake(textX, 0,
+        self.bounds.size.width - textX - trailing, self.bounds.size.height);
+}
+
+- (void)fire {
+    UIControl *ghost = [[UIControl alloc] initWithFrame:CGRectZero];
+    [ghost addAction:_action forControlEvents:UIControlEventPrimaryActionTriggered];
+    [ghost sendActionsForControlEvents:UIControlEventPrimaryActionTriggered];
 }
 
 - (void)setHighlighted:(BOOL)highlighted {
@@ -413,10 +438,9 @@ static MAXMenuOverlay *g_overlay = nil;
     [self dismissAnimated:YES];
 }
 
-- (void)itemTapped:(UIButton *)sender {
+- (void)itemTapped:(MAXMenuItemButton *)sender {
     if (_itemFired) return;
-    NSString *title = sender.configuration.attributedTitle.string
-                      ?: sender.currentTitle ?: @"?";
+    NSString *title = sender.actionTitle ?: @"?";
     maxlog(@"overlay: tapped '%@' — dismissing, firing app handler", title);
     _itemFired = YES;
     [self dismissAnimated:YES];
@@ -513,7 +537,7 @@ static MAXMenuOverlay *g_overlay = nil;
             [[MAXMenuItemButton alloc] initWithFrame:CGRectMake(0, y, panelWidth, rowH)
                                               action:action];
         [btn addTarget:ov action:@selector(itemTapped:)
-              forControlEvents:UIControlEventPrimaryActionTriggered];
+              forControlEvents:UIControlEventTouchUpInside];
         [panel addSubview:btn];
         y += rowH;
         if (i + 1 < actions.count) {
@@ -865,22 +889,42 @@ static void max_retryModsTab(void) {
                    dispatch_get_main_queue(), ^{ max_injectModsTab(); });
 }
 
+// Depth-first search for a UITabBarController anywhere in the VC tree —
+// MAX wraps its tab bar in custom containers, so rootViewController is
+// not the tab bar itself.
+static UITabBarController *max_findTabBar(UIViewController *vc, int depth) {
+    if (!vc || depth > 6) return nil;
+    if ([vc isKindOfClass:[UITabBarController class]])
+        return (UITabBarController *)vc;
+    UITabBarController *found = max_findTabBar(vc.presentedViewController, depth + 1);
+    if (found) return found;
+    for (UIViewController *child in vc.children) {
+        found = max_findTabBar(child, depth + 1);
+        if (found) return found;
+    }
+    return nil;
+}
+
 static void max_injectModsTab(void) {
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (![scene isKindOfClass:[UIWindowScene class]]) continue;
         UIWindow *win = ((UIWindowScene *)scene).keyWindow
                         ?: ((UIWindowScene *)scene).windows.firstObject;
         if (!win) continue;
-        UITabBarController *tbc = nil;
-        if ([win.rootViewController isKindOfClass:[UITabBarController class]])
-            tbc = (UITabBarController *)win.rootViewController;
+
+        UITabBarController *tbc = max_findTabBar(win.rootViewController, 0);
         if (!tbc) continue;
+
         if (max_tabHasMods(tbc)) return;   // already there
         if (tbc.viewControllers.count < 2) { max_retryModsTab(); return; }
         NSMutableArray *vcs = [tbc.viewControllers mutableCopy];
         [vcs addObject:max_makeModsNav()];
         [tbc setViewControllers:vcs animated:NO];
-        maxlog(@"mods: tab injected");
+        // the app uses a custom tab bar that may not relayout on its own
+        [tbc.view setNeedsLayout];
+        [tbc.view layoutIfNeeded];
+        maxlog(@"mods: tab injected (root=%@)",
+               NSStringFromClass(win.rootViewController.class));
         return;
     }
     max_retryModsTab();
@@ -955,7 +999,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v6.1 loading (potuzhno: menu + ghost + mods tab + ad blocker)...");
+    maxlog(@"v6.2 loading (potuzhno: menu layout fix + recursive tab search)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -1035,5 +1079,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v6.1 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v6.2 loaded OK — log file: %@", max_logPath());
 }
