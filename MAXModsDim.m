@@ -1,5 +1,5 @@
 /**
- * MAXModsDim.m — v7.1: reliable dimming of messages marked by the
+ * MAXModsDim.m — v7.3: indexPath-based dimming of marked messages
  * two-phase delete (keep-deleted, mod.del).
  *
  * Why the v6.5 implementation never dimmed anything:
@@ -330,28 +330,47 @@ static void max_dimApplyToCell(UIView *cell) {
         return;
     }
 
-    static BOOL g_dimLoggedNoMessage = NO;
-    if (!g_dimLoggedNoMessage) {
-        g_dimLoggedNoMessage = YES;
-        dimlog(@"marked=%lu but message lookup returned: nil (cell %@)",
-               (unsigned long)marked.count, NSStringFromClass(cell.class));
-        // dump the ivar tree once so the model path can be hard-coded after
-        for (Class c = object_getClass(cell); c && c != [UIView class];
-             c = class_getSuperclass(c)) {
-            unsigned int n = 0;
-            Ivar *ivars = class_copyIvarList(c, &n);
-            for (unsigned int i = 0; i < n; i++) {
-                const char *t = ivar_getTypeEncoding(ivars[i]);
-                if (!t || t[0] != '@') continue;
-                id v = object_getIvar(cell, ivars[i]);
-                if (!v) continue;
-                NSString *vcls = NSStringFromClass(object_getClass(v));
-                dimlog(@"ivar %@.%s = %@ (%@)",
-                       NSStringFromClass(c), ivar_getName(ivars[i]), vcls, v);
-            }
-            free(ivars);
-        }
+    static BOOL g_dimLoggedLookup = NO;
+    if (!g_dimLoggedLookup) {
+        g_dimLoggedLookup = YES;
+        dimlog(@"dim v7.3: indexPath mode — cell %@, marked=%lu",
+               NSStringFromClass(cell.class), (unsigned long)marked.count);
     }
+
+    // v7.3: MessageCell holds NO message model (ivar dump proved it — only
+    // UIKit fields). Identity now comes from the cell's indexPath inside its
+    // collection view; Tweak.m records "section-item" of each marked message
+    // at delete time. The message stays in the data source (we block the
+    // actual deletion), so the indexPath is stable.
+    NSString *ipKey = nil;
+    @try {
+        if ([cell isKindOfClass:[UICollectionViewCell class]]) {
+            UICollectionView *cv = ((UICollectionViewCell *)cell).superview;
+            // walk up: contentView -> cell -> collectionView (transformed)
+            UIView *v = cell.superview;
+            while (v && ![v isKindOfClass:[UICollectionView class]])
+                v = v.superview;
+            cv = (UICollectionView *)v;
+            if (cv) {
+                NSIndexPath *ip = [cv indexPathForCell:(UICollectionViewCell *)cell];
+                if (ip) ipKey = [NSString stringWithFormat:@"%ld-%ld",
+                                              (long)ip.section, (long)ip.item];
+            }
+        }
+    } @catch (NSException *e) { }
+    NSArray *markedIndexPaths = [[NSUserDefaults standardUserDefaults]
+        stringArrayForKey:@"mod.markedIndexPaths"];
+    BOOL isMarked = ipKey && [markedIndexPaths containsObject:ipKey];
+
+    if (isMarked && !g_dimLoggedMatch) {
+        g_dimLoggedMatch = YES;
+        dimlog(@"MATCH: cell %@ at %@ dimmed", NSStringFromClass(cell.class), ipKey);
+    }
+
+    CGFloat wanted2 = isMarked ? kMAXDimAlpha : 1.0;
+    if (fabs(target.alpha - wanted2) > 0.001) target.alpha = wanted2;
+    return;
+    // (legacy model-based matching below is kept unreachable for reference)
 
     id message = max_dimMessageForCell(cell);
     BOOL isMarked = NO;
@@ -554,6 +573,6 @@ static void maxmods_dim_init(void) {
 
     max_dimSchedulePoll();
 
-    dimlog(@"v7.1 dim module ready (%d cell class(es), alpha %.2f, polling 0.5s)",
+    dimlog(@"v7.3 dim module ready (%d cell class(es), alpha %.2f, polling 0.5s)",
            g_nDimEntries, kMAXDimAlpha);
 }
