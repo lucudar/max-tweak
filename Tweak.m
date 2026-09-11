@@ -1,5 +1,5 @@
 /**
- * MAXMods v5.1 — Telegram-style custom context menu for chat messages
+ * MAXMods v6.0 — «Потужно Мессенджер»: custom menu + ghost mode + Моды tab
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
  * + main-thread watchdog that records freezes into the same log
@@ -471,18 +471,28 @@ static MAXMenuOverlay *g_overlay = nil;
         ov->_snapshotView = snapView;
     }
 
-    // panel with blur material
+    // panel: uniform semi-transparent background. Blur looked patchy over
+    // mixed content (transparent in places, solid in others); a translucent
+    // solid color gives the consistent Telegram-menu look.
     UIView *panel = [[UIView alloc] initWithFrame:CGRectZero];
     panel.layer.cornerRadius = 14;
     panel.layer.masksToBounds = YES;
     panel.layer.cornerCurve = kCACornerCurveContinuous;
+    panel.backgroundColor =
+        [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+            return tc.userInterfaceStyle == UIUserInterfaceStyleDark
+                ? [UIColor colorWithWhite:0.10 alpha:0.72]
+                : [UIColor colorWithWhite:1.0 alpha:0.82];
+        }];
+    panel.layer.borderWidth = 0.5;
+    panel.layer.borderColor =
+        [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+            return tc.userInterfaceStyle == UIUserInterfaceStyleDark
+                ? [UIColor colorWithWhite:1 alpha:0.14]
+                : [UIColor colorWithWhite:0 alpha:0.10];
+        }].CGColor;
     [ov addSubview:panel];
     ov->_panel = panel;
-
-    UIVisualEffectView *blur =
-        [[UIVisualEffectView alloc] initWithEffect:
-            [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial]];
-    [panel addSubview:blur];
 
     // ---- rows + separators
     CGFloat const rowH = 46.0;
@@ -504,7 +514,7 @@ static MAXMenuOverlay *g_overlay = nil;
                                               action:action];
         [btn addTarget:ov action:@selector(itemTapped:)
               forControlEvents:UIControlEventPrimaryActionTriggered];
-        [blur.contentView addSubview:btn];
+        [panel addSubview:btn];
         y += rowH;
         if (i + 1 < actions.count) {
             UIView *sep = [[UIView alloc]
@@ -515,15 +525,13 @@ static MAXMenuOverlay *g_overlay = nil;
                         ? [UIColor colorWithWhite:1 alpha:0.12]
                         : [UIColor colorWithWhite:0 alpha:0.10];
                 }];
-            [blur.contentView addSubview:sep];
+            [panel addSubview:sep];
             y += 0.5;
         }
     }
     y += 5;
 
     panel.frame = CGRectMake(0, 0, panelWidth, y);
-    blur.frame = panel.bounds;
-    blur.contentView.frame = blur.bounds;
 
     // ---- position (Telegram-like): menu ABOVE the message bubble,
     // below if there's no room above; horizontally centered on the bubble,
@@ -586,6 +594,242 @@ static MAXMenuOverlay *g_overlay = nil;
 @end
 
 // ============================================================================
+#pragma mark - Ghost mode / keep-deleted hooks (switch-controlled)
+//
+// Ported from the old Mods.dylib v6 (mods_v6.c), but WITHOUT its two fatal
+// mistakes: no mass-swizzle of _deleteMessage:context: (that broke message
+// deletion), and no default-on blocking of the app's own delete flow.
+// Only privacy selectors are hooked, discovered per-class at startup.
+//
+// Switches live in NSUserDefaults and are toggled from the Моды tab:
+//   mod.read    — don't send read receipts      (block markAsReadTo:messageId:)
+//   mod.typing  — don't send typing indicators  (block sendTyping*)
+//   mod.online  — always appear offline         (block updateOnline*)
+//   mod.del     — keep remotely deleted messages visible (block
+//                 _handleDeletedMessages, the INCOMING-deletion handler —
+//                 the user's own deletes are untouched)
+// ============================================================================
+
+static BOOL max_modOn(NSString *key) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:key];
+}
+
+typedef struct {
+    Class cls;
+    SEL sel;
+    IMP orig;
+} ModHook;
+
+static ModHook g_modHooks[128];
+static int g_nModHooks = 0;
+
+static IMP max_modOrig(Class cls, SEL sel) {
+    for (int i = 0; i < g_nModHooks; i++)
+        if (g_modHooks[i].sel == sel && g_modHooks[i].cls == cls)
+            return g_modHooks[i].orig;
+    for (int i = 0; i < g_nModHooks; i++)     // subclass fallback
+        if (g_modHooks[i].sel == sel)
+            return g_modHooks[i].orig;
+    return NULL;
+}
+
+static id max_hook_read2(id self, SEL _cmd, id a, id b) {
+    if (max_modOn(@"mod.read")) return nil;   // don't send the receipt
+    IMP o = max_modOrig(object_getClass(self), _cmd);
+    return o ? ((id(*)(id,SEL,id,id))o)(self, _cmd, a, b) : nil;
+}
+
+static void max_hook_void1(id self, SEL _cmd, id a) {
+    NSString *n = NSStringFromSelector(_cmd);
+    if ([n hasPrefix:@"sendTyping"] && max_modOn(@"mod.typing")) return;
+    if (([n hasPrefix:@"updateOnline"] || [n isEqualToString:@"userOnlineStatus:"])
+        && max_modOn(@"mod.online")) return;
+    IMP o = max_modOrig(object_getClass(self), _cmd);
+    if (o) ((void(*)(id,SEL,id))o)(self, _cmd, a);
+}
+
+static void max_hook_void0(id self, SEL _cmd) {
+    NSString *n = NSStringFromSelector(_cmd);
+    if ([n hasPrefix:@"sendTyping"] && max_modOn(@"mod.typing")) return;
+    if ([n hasPrefix:@"updateOnline"] && max_modOn(@"mod.online")) return;
+    if ([n isEqualToString:@"_handleDeletedMessages"] && max_modOn(@"mod.del")) {
+        maxlog(@"ghost: suppressed incoming deletion event");
+        return;
+    }
+    IMP o = max_modOrig(object_getClass(self), _cmd);
+    if (o) ((void(*)(id,SEL))o)(self, _cmd);
+}
+
+static void max_installGhostHooks(void) {
+    struct { const char *sel; int args; } targets[] = {
+        {"markAsReadTo:messageId:",          2},
+        {"sendTypingNotificationIfNeeded:",  1},
+        {"updateOnlineIfNeeded:",            1},
+        {"userOnlineStatus:",                1},
+        {"sendTypingNotification",           0},
+        {"sendStickerTypingNotification",    0},
+        {"updateOnlineStatus",               0},
+        {"_handleDeletedMessages",           0},
+    };
+    unsigned int classCount = 0;
+    Class *classes = objc_copyClassList(&classCount);
+    for (unsigned t = 0; t < sizeof(targets)/sizeof(targets[0]); t++) {
+        SEL sel = sel_registerName(targets[t].sel);
+        IMP hook = (targets[t].args == 2) ? (IMP)max_hook_read2
+                 : (targets[t].args == 1) ? (IMP)max_hook_void1
+                 : (IMP)max_hook_void0;
+        int hits = 0;
+        for (unsigned i = 0; i < classCount; i++) {
+            Method m = class_getInstanceMethod(classes[i], sel);
+            if (!m) continue;
+            if (g_nModHooks < 128) {
+                g_modHooks[g_nModHooks].cls = classes[i];
+                g_modHooks[g_nModHooks].sel = sel;
+                g_modHooks[g_nModHooks].orig = method_getImplementation(m);
+                g_nModHooks++;
+            }
+            method_setImplementation(m, hook);
+            hits++;
+        }
+        maxlog(@"ghost: hook %s -> %d class(es)", targets[t].sel, hits);
+    }
+    free(classes);
+}
+
+// ============================================================================
+#pragma mark - «Моды» settings tab (ported from Mods.dylib v6, in ObjC)
+// ============================================================================
+
+@interface MAXModsViewController : UITableViewController
+@end
+
+static NSString *const kModCell = @"maxmodcell";
+
+typedef struct {
+    NSString *title;
+    NSString *key;
+    NSString *subtitle;
+} ModEntry;
+
+static ModEntry max_modEntries[] = {
+    { .title = @"Не отправлять «прочитано»", .key = @"mod.read",
+      .subtitle = @"Собеседник не увидит, что вы прочитали сообщение" },
+    { .title = @"Скрывать «печатает…»", .key = @"mod.typing",
+      .subtitle = @"Статус набора текста не отправляется" },
+    { .title = @"Всегда офлайн", .key = @"mod.online",
+      .subtitle = @"Ваш онлайн-статус не обновляется" },
+    { .title = @"Сохранять удалённые", .key = @"mod.del",
+      .subtitle = @"Удалённые у собеседника сообщения остаются у вас" },
+};
+static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntries[0]);
+
+@implementation MAXModsViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Моды";
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 1; }
+
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
+    return (NSInteger)kModCount;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tv
+         cellForRowAtIndexPath:(NSIndexPath *)ip {
+    UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:kModCell];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
+                                    reuseIdentifier:kModCell];
+        UISwitch *sw = [UISwitch new];
+        [sw addTarget:self action:@selector(switchChanged:)
+             forControlEvents:UIControlEventValueChanged];
+        cell.accessoryView = sw;
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    }
+    ModEntry e = max_modEntries[ip.row];
+    cell.textLabel.text = e.title;
+    cell.detailTextLabel.text = e.subtitle;
+    cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+    [(UISwitch *)cell.accessoryView
+        setOn:[[NSUserDefaults standardUserDefaults] boolForKey:e.key]];
+    [(UISwitch *)cell.accessoryView setTag:ip.row];
+    return cell;
+}
+
+- (void)switchChanged:(UISwitch *)sw {
+    if (sw.tag >= (NSInteger)kModCount) return;
+    ModEntry e = max_modEntries[sw.tag];
+    [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:e.key];
+    maxlog(@"mods: %@ -> %@", e.key, sw.on ? @"ON" : @"OFF");
+}
+
+@end
+
+static BOOL max_tabHasMods(UITabBarController *tbc) {
+    for (UIViewController *vc in tbc.viewControllers) {
+        if ([vc isKindOfClass:[MAXModsViewController class]]) return YES;
+        if ([vc isKindOfClass:[UINavigationController class]]) {
+            UIViewController *top = ((UINavigationController *)vc).topViewController;
+            if ([top isKindOfClass:[MAXModsViewController class]]) return YES;
+        }
+    }
+    return NO;
+}
+
+static UINavigationController *max_makeModsNav(void) {
+    MAXModsViewController *vc = [MAXModsViewController new];
+    UINavigationController *nav = [[UINavigationController alloc]
+        initWithRootViewController:vc];
+    UITabBarItem *item = [[UITabBarItem alloc]
+        initWithTitle:@"Моды"
+                image:[UIImage systemImageNamed:@"gearshape.2"]
+                  tag:999];
+    nav.tabBarItem = item;
+    return nav;
+}
+
+static void max_injectModsTab(void);
+
+static void max_retryModsTab(void) {
+    static int triesLeft = 180;   // ~3 min of retries after launch
+    if (triesLeft <= 0) return;
+    triesLeft--;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC),
+                   dispatch_get_main_queue(), max_injectModsTab);
+}
+
+static void max_injectModsTab(void) {
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindow *win = ((UIWindowScene *)scene).keyWindow
+                        ?: ((UIWindowScene *)scene).windows.firstObject;
+        if (!win) continue;
+        UITabBarController *tbc = nil;
+        if ([win.rootViewController isKindOfClass:[UITabBarController class]])
+            tbc = (UITabBarController *)win.rootViewController;
+        if (!tbc) continue;
+        if (max_tabHasMods(tbc)) return;   // already there
+        if (tbc.viewControllers.count < 2) { max_retryModsTab(); return; }
+        NSMutableArray *vcs = [tbc.viewControllers mutableCopy];
+        [vcs addObject:max_makeModsNav()];
+        [tbc setViewControllers:vcs animated:NO];
+        maxlog(@"mods: tab injected");
+        return;
+    }
+    max_retryModsTab();
+}
+
+static void max_periodicModsTabCheck(void) {
+    // the app can rebuild its tab bar (e.g. after login state changes)
+    dispatch_async(dispatch_get_main_queue(), ^{ max_injectModsTab(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
+                   max_periodicModsTabCheck);
+}
+
+// ============================================================================
 #pragma mark - Session Fix: Keychain (selective)
 // ============================================================================
 
@@ -646,7 +890,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v5.1 loading (menu above bubble + reliable tap-outside)...");
+    maxlog(@"v6.0 loading (potuzhno: menu + ghost mode + mods tab)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -680,7 +924,24 @@ static void maxmods_init(void) {
         maxlog(@"WARNING: ChatDetailController class not found");
     }
 
-    // 3) Session persistence fixes (unchanged from v3.0).
+    // 3) Ghost mode + keep-deleted hooks (switch-controlled, Моды tab).
+    max_installGhostHooks();
+
+    // defaults: all mods ON until the user turns them off
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    for (NSUInteger i = 0; i < kModCount; i++) {
+        ModEntry e = max_modEntries[i];
+        if ([d objectForKey:e.key] == nil) [d setBool:YES forKey:e.key];
+    }
+
+    // 4) «Моды» tab — the tab bar appears after login, retry then re-check.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), max_injectModsTab);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
+                   max_periodicModsTabCheck);
+
+    // 5) Session persistence fixes (unchanged from v3.0).
     Class kc = objc_getClass("UICKeyChainStore");
     if (kc) {
         Method cm = class_getClassMethod(kc, @selector(keyChainStoreWithService:accessGroup:));
@@ -705,5 +966,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v5.1 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v6.0 loaded OK — log file: %@", max_logPath());
 }
