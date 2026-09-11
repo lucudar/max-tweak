@@ -345,12 +345,11 @@ static void max_dimApplyToCell(UIView *cell) {
     NSString *ipKey = nil;
     @try {
         if ([cell isKindOfClass:[UICollectionViewCell class]]) {
-            UICollectionView *cv = ((UICollectionViewCell *)cell).superview;
-            // walk up: contentView -> cell -> collectionView (transformed)
+            // walk up from the cell to its collection view
             UIView *v = cell.superview;
             while (v && ![v isKindOfClass:[UICollectionView class]])
                 v = v.superview;
-            cv = (UICollectionView *)v;
+            UICollectionView *cv = (UICollectionView *)v;
             if (cv) {
                 NSIndexPath *ip = [cv indexPathForCell:(UICollectionViewCell *)cell];
                 if (ip) ipKey = [NSString stringWithFormat:@"%ld-%ld",
@@ -373,26 +372,20 @@ static void max_dimApplyToCell(UIView *cell) {
     // (legacy model-based matching below is kept unreachable for reference)
 
     id message = max_dimMessageForCell(cell);
-    BOOL isMarked = NO;
+    BOOL legacyIsMarked = NO;
     for (NSString *key in max_dimKeysForMessage(message)) {
-        if ([marked containsObject:key]) { isMarked = YES; break; }
+        if ([marked containsObject:key]) { legacyIsMarked = YES; break; }
     }
 
     static BOOL g_dimLoggedNoMatch = NO;
-    if (isMarked && !g_dimLoggedMatch) {
+    if (legacyIsMarked && !g_dimLoggedMatch) {
         g_dimLoggedMatch = YES;
-        dimlog(@"MATCH: cell %@ / message %@ dimmed",
+        dimlog(@"legacy MATCH: cell %@ / message %@",
                NSStringFromClass([cell class]),
                message ? NSStringFromClass([message class]) : @"nil");
     }
-    if (!isMarked && !g_dimLoggedNoMatch && marked.count > 0 && message) {
-        g_dimLoggedNoMatch = YES;
-        dimlog(@"NO MATCH: cell keys [%@] vs marked [%@]",
-               [max_dimKeysForMessage(message) componentsJoinedByString:@", "],
-               [marked.allObjects componentsJoinedByString:@", "]);
-    }
 
-    CGFloat wanted = isMarked ? kMAXDimAlpha : 1.0;
+    CGFloat wanted = legacyIsMarked ? kMAXDimAlpha : 1.0;
     if (fabs(target.alpha - wanted) > 0.001) target.alpha = wanted;
 }
 
