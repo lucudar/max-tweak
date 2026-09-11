@@ -506,8 +506,8 @@ static MAXMenuOverlay *g_overlay = nil;
     panel.backgroundColor =
         [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
             return tc.userInterfaceStyle == UIUserInterfaceStyleDark
-                ? [UIColor colorWithWhite:0.10 alpha:0.72]
-                : [UIColor colorWithWhite:1.0 alpha:0.82];
+                ? [UIColor colorWithWhite:0.10 alpha:0.97]
+                : [UIColor colorWithWhite:1.0 alpha:0.98];
         }];
     panel.layer.borderWidth = 0.5;
     panel.layer.borderColor =
