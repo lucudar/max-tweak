@@ -498,6 +498,7 @@ static void max_dimSchedulePoll(void) {
                 (void)_;
                 max_dimRefreshAll();
             }];
+        (void)timer;   // owned by the static; silence set-but-unused
     });
 }
 
