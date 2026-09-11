@@ -1333,15 +1333,12 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
         NSString *path = max_logPath();
         NSString *full = [NSString stringWithContentsOfFile:path
                                 encoding:NSUTF8StringEncoding error:nil] ?: @"(пусто)";
-        NSArray *lines = [full componentsSeparatedByString:@"
-"];
+        NSArray *lines = [full componentsSeparatedByString:@"\n"];
         if (lines.count > 800)
             lines = [lines subarrayWithRange:
                 NSMakeRange(lines.count - 800, 800)];
-        tv2.text = [@"...
-" stringByAppendingString:
-                    [lines componentsJoinedByString:@"
-"]];
+        tv2.text = [[NSString alloc] initWithFormat:@"...\n%@",
+                     [lines componentsJoinedByString:@"\n"]];
         UIViewController *vc = [[UIViewController alloc] init];
         vc.view = tv2;
         vc.title = @"Логи";
