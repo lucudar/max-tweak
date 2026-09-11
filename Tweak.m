@@ -1,6 +1,6 @@
 /**
- * MAXMods v6.7 — «Потужно Мессенджер»: slim build — stories, Digital ID,
- * mini-apps and channel creation pruned
+ * MAXMods v6.8 — «Потужно Мессенджер»: settings junk pruned (Госуслуги block,
+ * Invite Friends, Devices, Folders, Power, Storage, Business, mini-apps)
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
  * + main-thread watchdog that records freezes into the same log
@@ -776,6 +776,97 @@ static void max_installFeaturePruner(void) {
 }
 
 // ============================================================================
+#pragma mark - Settings screen pruning
+//
+// OKMActionsViewModel drives the settings screens: setSections: receives
+// OKMActionsSection objects (title/footer/actions), each action an
+// OKMActionCellViewModel with a plain `title` property. Filter out the
+// junk rows the user selected: the Госуслуги login block, Invite Friends,
+// Devices, Folders, Power and Data Saving, Storage, Потужно для бизнеса.
+// ============================================================================
+
+static IMP orig_setSections = NULL;
+
+static BOOL max_titleIsPruned(NSString *title) {
+    if (title.length == 0) return NO;
+    NSArray<NSString *> *pruned = @[
+        @"Госуслуг",           // Госуслуги block + Войти по Госуслугам
+        @"Пригласить друзей",  // Invite Friends
+        @"Устройства",         // Devices
+        @"Папки",              // Folders
+        @"Экономия батареи",   // Power and Data Saving
+        @"Память",             // Storage
+        @"для бизнеса",        // Потужно для бизнеса
+        @"Мини-приложения",    // Web apps leftovers
+    ];
+    for (NSString *bad in pruned)
+        if ([title rangeOfString:bad options:NSCaseInsensitiveSearch].location != NSNotFound)
+            return YES;
+    return NO;
+}
+
+static void hook_setSections(id self, SEL _cmd, NSArray *sections) {
+    @try {
+        if ([sections isKindOfClass:[NSArray class]] && sections.count > 0) {
+            NSMutableArray *kept = [NSMutableArray array];
+            NSUInteger droppedSections = 0, droppedActions = 0;
+            for (id section in sections) {
+                NSString *stitle = [section respondsToSelector:@selector(title)]
+                    ? [section title] : nil;
+                if (max_titleIsPruned(stitle)) {
+                    droppedSections++;
+                    continue;
+                }
+                NSArray *actions = [section respondsToSelector:@selector(actions)]
+                    ? [section actions] : nil;
+                if ([actions isKindOfClass:[NSArray class]] && actions.count > 0) {
+                    NSMutableArray *keptActions = [NSMutableArray array];
+                    for (id action in actions) {
+                        NSString *atitle = [action respondsToSelector:@selector(title)]
+                            ? [action title] : nil;
+                        if (max_titleIsPruned(atitle)) {
+                            droppedActions++;
+                            continue;
+                        }
+                        [keptActions addObject:action];
+                    }
+                    if (keptActions.count != actions.count) {
+                        if ([section respondsToSelector:@selector(setActions:)])
+                            [section setActions:keptActions];
+                        actions = keptActions;
+                    }
+                }
+                [kept addObject:section];
+            }
+            if (droppedSections || droppedActions) {
+                maxlog(@"settings-prune: dropped %lu section(s), %lu row(s)",
+                       (unsigned long)droppedSections, (unsigned long)droppedActions);
+                sections = kept;
+            }
+        }
+    } @catch (NSException *e) {
+        maxlog(@"settings-prune: filter error %@", e);
+    }
+    ((void(*)(id,SEL,id))orig_setSections)(self, _cmd, sections);
+}
+
+static void max_installSettingsPruner(void) {
+    Class cls = objc_getClass("OKMActionsViewModel");
+    if (!cls) {
+        maxlog(@"settings-prune: OKMActionsViewModel not found");
+        return;
+    }
+    Method m = class_getInstanceMethod(cls, @selector(setSections:));
+    if (!m) {
+        maxlog(@"settings-prune: setSections: not found");
+        return;
+    }
+    orig_setSections = method_getImplementation(m);
+    method_setImplementation(m, (IMP)hook_setSections);
+    maxlog(@"settings-prune: installed");
+}
+
+// ============================================================================
 #pragma mark - Ghost mode / keep-deleted hooks (switch-controlled)
 //
 // Ported from the old Mods.dylib v6 (mods_v6.c), but WITHOUT its two fatal
@@ -1278,7 +1369,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v6.7 loading (potuzhno: slim messenger — no stories/DigitalID/miniapps/channels)...");
+    maxlog(@"v6.8 loading (potuzhno: settings junk pruned)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -1316,8 +1407,10 @@ static void maxmods_init(void) {
     //    chats, myTarget ad id — all neutralized.
     max_installAdBlocker();
 
-    // 4) Feature pruning: stories / Digital ID / mini-apps / channels.
+    // 4) Feature pruning: stories / Digital ID / mini-apps / channels,
+    //    plus junk rows on the settings screens.
     max_installFeaturePruner();
+    max_installSettingsPruner();
 
     // 5) Ghost mode + keep-deleted hooks (switch-controlled, Моды tab).
     max_installGhostHooks();
@@ -1380,5 +1473,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v6.7 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v6.8 loaded OK — log file: %@", max_logPath());
 }
