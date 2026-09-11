@@ -1,6 +1,6 @@
 /**
- * MAXMods v6.8 — «Потужно Мессенджер»: settings junk pruned (Госуслуги block,
- * Invite Friends, Devices, Folders, Power, Storage, Business, mini-apps)
+ * MAXMods v6.9 — «Потужно Мессенджер»: settings-prune diagnostics — dumps real
+ * section/row titles to the log so the exact junk strings can be matched
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
  * + main-thread watchdog that records freezes into the same log
@@ -791,7 +791,11 @@ static BOOL max_titleIsPruned(NSString *title) {
     if (title.length == 0) return NO;
     NSArray<NSString *> *pruned = @[
         @"Госуслуг",           // Госуслуги block + Войти по Госуслугам
+        @"Gosuslugi",          // latin server variant
+        @"Вернуть уведомления",
+        @"Единый вход",
         @"Пригласить друзей",  // Invite Friends
+        @"Invite Friends",
         @"Устройства",         // Devices
         @"Папки",              // Folders
         @"Экономия батареи",   // Power and Data Saving
@@ -805,9 +809,33 @@ static BOOL max_titleIsPruned(NSString *title) {
     return NO;
 }
 
+static int g_setSectionsLogBudget = 12;   // log titles for the first N calls
+
 static void hook_setSections(id self, SEL _cmd, NSArray *sections) {
     @try {
         if ([sections isKindOfClass:[NSArray class]] && sections.count > 0) {
+            if (g_setSectionsLogBudget > 0) {
+                g_setSectionsLogBudget--;
+                NSString *cls = NSStringFromClass(object_getClass(self));
+                for (id section in sections) {
+                    NSString *stitle = [section respondsToSelector:@selector(title)]
+                        ? [section title] : nil;
+                    NSMutableString *rows = [NSMutableString string];
+                    if ([section respondsToSelector:@selector(actions)]) {
+                        NSArray *acts =
+                            ((id(*)(id,SEL))objc_msgSend)(section, @selector(actions));
+                        if ([acts isKindOfClass:[NSArray class]]) {
+                            NSMutableArray *t = [NSMutableArray array];
+                            for (id a in acts)
+                                if ([a respondsToSelector:@selector(title)])
+                                    [t addObject:([a title] ?: @"-")];
+                            [rows appendFormat:@" | %@", [t componentsJoinedByString:@", "]];
+                        }
+                    }
+                    maxlog(@"sections-dump [%@] section '%@'%@", cls,
+                           stitle ?: @"-", rows);
+                }
+            }
             NSMutableArray *kept = [NSMutableArray array];
             NSUInteger droppedSections = 0, droppedActions = 0;
             for (id section in sections) {
@@ -1370,7 +1398,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v6.8 loading (potuzhno: settings junk pruned)...");
+    maxlog(@"v6.9 loading (settings-prune diagnostics + extended patterns)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -1474,5 +1502,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v6.8 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v6.9 loaded OK — log file: %@", max_logPath());
 }
