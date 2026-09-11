@@ -1,5 +1,5 @@
 /**
- * MAXModsDim.m — v6.6: reliable dimming of messages marked by the
+ * MAXModsDim.m — v7.0: reliable dimming of messages marked by the
  * two-phase delete (keep-deleted, mod.del).
  *
  * Why the v6.5 implementation never dimmed anything:
@@ -175,6 +175,17 @@ static NSArray<NSString *> *max_dimKeysForMessage(id message) {
         NSString *v = max_dimStringValue(message, sel_registerName(name.UTF8String));
         if (v.length && ![keys containsObject:v]) [keys addObject:v];
     }
+    // composite keys like "412015008-117248111465992677": also match each half
+    for (NSString *k in [keys copy]) {
+        NSRange r = [k rangeOfString:@"-"];
+        if (r.location != NSNotFound && r.length > 0 && r.location > 0 &&
+            r.location + 1 < k.length) {
+            NSString *a = [k substringToIndex:r.location];
+            NSString *b = [k substringFromIndex:r.location + 1];
+            if (a.length && ![keys containsObject:a]) [keys addObject:a];
+            if (b.length && ![keys containsObject:b]) [keys addObject:b];
+        }
+    }
     // the message may wrap the real model (view model -> message)
     for (NSString *path in @[ @"message", @"model", @"messageModel" ]) {
         id inner = nil;
@@ -234,6 +245,50 @@ static id max_dimScanForMessage(id obj, int depth) {
     return nil;
 }
 
+// Swift stored properties are NOT exposed as @objc properties — KVC and
+// class_copyPropertyList see nothing. They ARE visible as ivars, though:
+// object ivars (type '@') can be read with object_getIvar. Scan the ivar
+// chain of the cell and one level of children for an object that answers
+// primaryKey/messageId, caching the successful path per class.
+static NSMutableDictionary<NSString *, id> *g_dimIvarPathCache = nil;
+
+static NSArray *max_dimIvarsOfClassChain(Class start) {
+    NSMutableArray *out = [NSMutableArray array];
+    for (Class c = start; c && c != [NSObject class] && c != [UIView class];
+         c = class_getSuperclass(c)) {
+        unsigned int n = 0;
+        Ivar *ivars = class_copyIvarList(c, &n);
+        for (unsigned int i = 0; i < n; i++) [out addObject:[NSValue valueWithPointer:ivars[i]]];
+        free(ivars);
+    }
+    return out;
+}
+
+static id max_dimIvarObject(id obj, NSValue *v) {
+    Ivar iv = (Ivar)[v pointerValue];
+    if (!iv) return nil;
+    const char *t = ivar_getTypeEncoding(iv);
+    if (!t || t[0] != '@') return nil;   // object ivars only
+    return object_getIvar(obj, iv);
+}
+
+static id max_dimFindMessageViaIvars(id obj) {
+    if (!obj) return nil;
+    if (max_dimLooksLikeMessage(obj)) return obj;
+    for (NSValue *v in max_dimIvarsOfClassChain(object_getClass(obj))) {
+        id child = max_dimIvarObject(obj, v);
+        if (!child || [child isKindOfClass:[UIView class]]) continue;
+        if (max_dimLooksLikeMessage(child)) return child;
+        for (NSValue *v2 in max_dimIvarsOfClassChain(object_getClass(child))) {
+            id grand = max_dimIvarObject(child, v2);
+            if (grand && ![grand isKindOfClass:[UIView class]] &&
+                max_dimLooksLikeMessage(grand))
+                return grand;
+        }
+    }
+    return nil;
+}
+
 static id max_dimMessageForCell(UIView *cell) {
     static NSArray *paths = nil;
     static dispatch_once_t once;
@@ -251,7 +306,17 @@ static id max_dimMessageForCell(UIView *cell) {
         id inner = max_dimScanForMessage(value, 1);
         if (inner) return inner;
     }
-    return max_dimScanForMessage(cell, 0);
+    // Swift route: ivars of the cell and one level of children (cached)
+    if (!g_dimIvarPathCache) g_dimIvarPathCache = [NSMutableDictionary new];
+    NSString *cacheKey = NSStringFromClass(cell.class);
+    id cached = g_dimIvarPathCache[cacheKey];
+    if (!cached) {
+        id found = max_dimFindMessageViaIvars(cell);
+        g_dimIvarPathCache[cacheKey] = found ?: [NSNull null];
+        return found;
+    }
+    if ([cached isKindOfClass:[NSNull class]]) return nil;
+    return max_dimFindMessageViaIvars(cell);   // cheap: cached hit class
 }
 
 // ============================================================================
@@ -278,10 +343,18 @@ static void max_dimApplyToCell(UIView *cell) {
         if ([marked containsObject:key]) { isMarked = YES; break; }
     }
 
+    static BOOL g_dimLoggedNoMatch = NO;
     if (isMarked && !g_dimLoggedMatch) {
         g_dimLoggedMatch = YES;
-        dimlog(@"first match: cell %@ / message %@",
-               NSStringFromClass([cell class]), NSStringFromClass([message class]));
+        dimlog(@"MATCH: cell %@ / message %@ dimmed",
+               NSStringFromClass([cell class]),
+               message ? NSStringFromClass([message class]) : @"nil");
+    }
+    if (!isMarked && !g_dimLoggedNoMatch && marked.count > 0 && message) {
+        g_dimLoggedNoMatch = YES;
+        dimlog(@"NO MATCH: cell keys [%@] vs marked [%@]",
+               [max_dimKeysForMessage(message) componentsJoinedByString:@", "],
+               [marked.allObjects componentsJoinedByString:@", "]);
     }
 
     CGFloat wanted = isMarked ? kMAXDimAlpha : 1.0;
@@ -447,6 +520,6 @@ static void maxmods_dim_init(void) {
                                                  name:NSUserDefaultsDidChangeNotification
                                                object:nil];
 
-    dimlog(@"v6.6 dim module ready (%d cell class(es), alpha %.2f)",
+    dimlog(@"v7.0 dim module ready (%d cell class(es), alpha %.2f)",
            g_nDimEntries, kMAXDimAlpha);
 }
