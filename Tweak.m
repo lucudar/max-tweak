@@ -1,5 +1,5 @@
 /**
- * MAXMods v6.0 — «Потужно Мессенджер»: custom menu + ghost mode + Моды tab
+ * MAXMods v6.1 — «Потужно Мессенджер»: menu + ghost mode + Моды tab + ad blocker
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
  * + main-thread watchdog that records freezes into the same log
@@ -594,6 +594,71 @@ static MAXMenuOverlay *g_overlay = nil;
 @end
 
 // ============================================================================
+#pragma mark - Ad & junk blocker
+//
+// Kill the promo/banners/suggested content entirely:
+//  - OKMInAppBannerPresenter.showPromoBannerWith...  -> no promo ever shown
+//  - InformerBannerFetcher.fetchRemoteNotifBanners   -> banners never fetched
+//  - SuggestedChatIdsStorage.loadChatIds             -> no suggested chats
+//  - InformerBannersStorage (all reads)              -> no stored banners
+//  - MRAdSupportWrapper.advertisingIdentifier        -> zeroed ad id
+// The Calls tab and MyTracker are already statically patched out in the
+// app binary; stats endpoints return zero via the same static patches.
+// ============================================================================
+
+static void max_hookVoidRet(id self, SEL _cmd) { (void)self; (void)_cmd; }
+static void max_hookIdRetNil(id self, SEL _cmd) { (void)self; (void)_cmd; return nil; }
+static void max_hookBoolRetNo(id self, SEL _cmd, void *x) { (void)self; (void)_cmd; (void)x; return NO; }
+
+// storage getters return a fixed empty array
+static id max_hookEmptyArrayRet(id self, SEL _cmd) {
+    (void)self; (void)_cmd;
+    return @[];
+}
+
+static void max_installAdBlocker(void) {
+    // direct class hooks — each of these exists in the app binary
+    struct {
+        const char *cls;
+        const char *sel;
+        IMP hook;
+    } hooks[] = {
+        // promo banners in-app
+        { "OKMInAppBannerPresenter",
+          "showPromoBannerWithTitle:text:imageUrl:actionBlock:",
+          (IMP)max_hookVoidRet },
+        // chat-list "informer" banners: never fetch, never store, show none
+        { "_TtC10OMChatList21InformerBannerFetcher",
+          "fetchRemoteNotifBanners",
+          (IMP)max_hookVoidRet },
+        { "OMInformerBannersStorage", "banners", (IMP)max_hookEmptyArrayRet },
+        // suggested chats
+        { "_TtC10OMChatList23SuggestedChatIdsStorage",
+          "loadChatIds", (IMP)max_hookEmptyArrayRet },
+        { "_TtC10OMChatList23SuggestedChatIdsStorage",
+          "saveChatIds:", (IMP)max_hookVoidRet },
+        // myTarget ad id: zeroed, tracking off
+        { "MRAdSupportWrapper", "advertisingIdentifier", (IMP)max_hookIdRetNil },
+        { "MRAdSupportWrapper", "advertisingTrackingEnabled", (IMP)max_hookBoolRetNo },
+    };
+    for (NSUInteger i = 0; i < sizeof(hooks)/sizeof(hooks[0]); i++) {
+        Class cls = objc_getClass(hooks[i].cls);
+        if (!cls) {
+            maxlog(@"ads: class not found: %s", hooks[i].cls);
+            continue;
+        }
+        SEL sel = sel_registerName(hooks[i].sel);
+        Method m = class_getInstanceMethod(cls, sel);
+        if (!m) {
+            maxlog(@"ads: method not found: %s -> %s", hooks[i].cls, hooks[i].sel);
+            continue;
+        }
+        method_setImplementation(m, hooks[i].hook);
+        maxlog(@"ads: blocked %s -> %s", hooks[i].cls, hooks[i].sel);
+    }
+}
+
+// ============================================================================
 #pragma mark - Ghost mode / keep-deleted hooks (switch-controlled)
 //
 // Ported from the old Mods.dylib v6 (mods_v6.c), but WITHOUT its two fatal
@@ -890,7 +955,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v6.0 loading (potuzhno: menu + ghost mode + mods tab)...");
+    maxlog(@"v6.1 loading (potuzhno: menu + ghost + mods tab + ad blocker)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -924,7 +989,11 @@ static void maxmods_init(void) {
         maxlog(@"WARNING: ChatDetailController class not found");
     }
 
-    // 3) Ghost mode + keep-deleted hooks (switch-controlled, Моды tab).
+    // 3) Ads & junk blocker: promo banners, informer banners, suggested
+    //    chats, myTarget ad id — all neutralized.
+    max_installAdBlocker();
+
+    // 4) Ghost mode + keep-deleted hooks (switch-controlled, Моды tab).
     max_installGhostHooks();
 
     // defaults: all mods ON until the user turns them off
@@ -934,14 +1003,14 @@ static void maxmods_init(void) {
         if ([d objectForKey:e.key] == nil) [d setBool:YES forKey:e.key];
     }
 
-    // 4) «Моды» tab — the tab bar appears after login, retry then re-check.
+    // 5) «Моды» tab — the tab bar appears after login, retry then re-check.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ max_injectModsTab(); });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
                    ^{ max_periodicModsTabCheck(); });
 
-    // 5) Session persistence fixes (unchanged from v3.0).
+    // 6) Session persistence fixes (unchanged from v3.0).
     Class kc = objc_getClass("UICKeyChainStore");
     if (kc) {
         Method cm = class_getClassMethod(kc, @selector(keyChainStoreWithService:accessGroup:));
@@ -966,5 +1035,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v6.0 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v6.1 loaded OK — log file: %@", max_logPath());
 }
