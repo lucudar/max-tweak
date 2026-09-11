@@ -1,5 +1,5 @@
 /**
- * MAXMods v7.4 — «Потужно Мессенджер»: in-app log viewer (Моды → Логи),
+ * MAXMods v7.5 — «Потужно Мессенджер»: remote-deleted kept, in-app log viewer,
  * indexPath-based dim, settings view pruning
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
@@ -1045,6 +1045,21 @@ static id max_hook_read2(id self, SEL _cmd, id a, id b) {
     return o ? ((id(*)(id,SEL,id,id))o)(self, _cmd, a, b) : nil;
 }
 
+static void max_hook_void2(id self, SEL _cmd, id a, id b) {
+    NSString *n = NSStringFromSelector(_cmd);
+    if ([n hasPrefix:@"_handleDeletedMessages"] && max_modOn(@"mod.del")) {
+        maxlog(@"ghost: remote deletion event suppressed (2-arg)");
+        return;
+    }
+    if ([n isEqualToString:@"deleteLocallyMessagesWithIds:updateChat:"] &&
+        max_modOn(@"mod.del")) {
+        maxlog(@"ghost: local db delete-on-remote suppressed");
+        return;
+    }
+    IMP o = max_modOrig(object_getClass(self), _cmd);
+    if (o) ((void(*)(id,SEL,id,id))o)(self, _cmd, a, b);
+}
+
 static void max_hook_void1(id self, SEL _cmd, id a) {
     NSString *n = NSStringFromSelector(_cmd);
     if ([n hasPrefix:@"sendTyping"] && max_modOn(@"mod.typing")) return;
@@ -1076,12 +1091,16 @@ static void max_installGhostHooks(void) {
         {"sendStickerTypingNotification",    0},
         {"updateOnlineStatus",               0},
         {"_handleDeletedMessages",           0},
+        {"_handleDeletedMessages:inChatWithId:", 2},   // real remote-delete path
+        {"deleteLocallyMessagesWithIds:updateChat:", 2}, // db removal on remote delete
     };
     unsigned int classCount = 0;
     Class *classes = objc_copyClassList(&classCount);
     for (unsigned t = 0; t < sizeof(targets)/sizeof(targets[0]); t++) {
         SEL sel = sel_registerName(targets[t].sel);
-        IMP hook = (targets[t].args == 2) ? (IMP)max_hook_read2
+        BOOL isRead = strcmp(targets[t].sel, "markAsReadTo:messageId:") == 0;
+        IMP hook = isRead ? (IMP)max_hook_read2
+                 : (targets[t].args == 2) ? (IMP)max_hook_void2
                  : (targets[t].args == 1) ? (IMP)max_hook_void1
                  : (IMP)max_hook_void0;
         int hits = 0;
@@ -1589,7 +1608,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v7.4 loading (in-app log viewer + share/clear)...");
+    maxlog(@"v7.5 loading (keep remote-deleted messages)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -1694,5 +1713,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v7.4 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v7.5 loaded OK — log file: %@", max_logPath());
 }
