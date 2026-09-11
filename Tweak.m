@@ -1,5 +1,5 @@
 /**
- * MAXMods v6.4 — «Потужно Мессенджер»: keep-deleted now covers own deletes too
+ * MAXMods v6.5 — «Потужно Мессенджер»: two-phase delete (mark dimmed, then real)
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
  * + main-thread watchdog that records freezes into the same log
@@ -786,27 +786,89 @@ static void max_installGhostHooks(void) {
 }
 
 // ============================================================================
-#pragma mark - Keep-deleted: block the user's OWN delete (switch-controlled)
+#pragma mark - Keep-deleted: TWO-PHASE delete (switch-controlled)
 //
-// With the freeze fixed by the custom menu (v5+), it is safe to suppress the
-// app's own delete handler — same behavior the old Mods.dylib had, but
-// targeted at the single real implementor (OMMessageActionProcessor) instead
-// of a mass-swizzle over every class. When mod.del is ON, deleting a message
-// leaves it in place (locally and on the server); when OFF, normal delete.
+// With mod.del ON:
+//   1st delete of a message -> the message STAYS but gets visually marked
+//                              (cell rendered at 45% opacity);
+//   2nd delete of an already-marked message -> deleted for real.
+// The user sees what was "deleted" and can confirm-kill each one by
+// deleting it again. With mod.del OFF — normal deletes throughout.
+//
+// Marking: the message's primaryKey is remembered in a set; a swizzle on
+// the message cell's layout dims the cell when its message is marked.
 // ============================================================================
 
-static IMP orig_deleteMessageCtx = NULL;
+static NSMutableSet<NSString *> *g_markedDeleted = nil;
+
+static NSString *max_primaryKeyOfMessage(id message) {
+    if (!message) return nil;
+    SEL sel = sel_registerName("primaryKey");
+    if ([message respondsToSelector:sel])
+        return [NSString stringWithFormat:@"%@", ((id(*)(id,SEL))objc_msgSend)(message, sel)];
+    @try {
+        return [NSString stringWithFormat:@"%@", [message valueForKey:@"primaryKey"]];
+    } @catch (NSException *e) {
+        return nil;
+    }
+}
 
 static void hook_deleteMessageCtx(id self, SEL _cmd, id message, id context) {
-    if (max_modOn(@"mod.del")) {
-        maxlog(@"keep-deleted: own delete suppressed (mod.del ON)");
-        return;
+    if (max_modOn(@"mod.del") && message) {
+        NSString *pk = max_primaryKeyOfMessage(message);
+        if (pk && ![g_markedDeleted containsObject:pk]) {
+            [g_markedDeleted addObject:pk];
+            maxlog(@"keep-deleted: message %@ marked (1st delete)", pk);
+            [[NSUserDefaults standardUserDefaults] setObject:[g_markedDeleted allObjects]
+                                                      forKey:@"mod.markedDeleted"];
+            // no real deletion happens; the UI dims the cell on its next layout pass
+            dispatch_async(dispatch_get_main_queue(), ^{
+                for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+                    if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+                    for (UIWindow *w in ((UIWindowScene *)scene).windows)
+                        [w.rootViewController.view setNeedsLayout];
+                }
+            });
+            return;
+        }
+        if (pk) {
+            [g_markedDeleted removeObject:pk];
+            [[NSUserDefaults standardUserDefaults] setObject:[g_markedDeleted allObjects]
+                                                      forKey:@"mod.markedDeleted"];
+            maxlog(@"keep-deleted: message %@ really deleted (2nd delete)", pk);
+        }
     }
     if (orig_deleteMessageCtx)
         ((void(*)(id,SEL,id,id))orig_deleteMessageCtx)(self, _cmd, message, context);
 }
 
+// dim marked cells: hook MessageCell's applyLayoutAttributes/layoutSubviews
+static IMP orig_cellLayout = NULL;
+
+static void hook_cellApplyLayout(id self, SEL _cmd, id attrs) {
+    ((void(*)(id,SEL,id))orig_cellLayout)(self, _cmd, attrs);
+    @try {
+        id msg = [self valueForKey:@"message"];
+        // MessageCell keeps the message in a viewModel; try common paths
+        if (!msg) {
+            id vm = [self valueForKey:@"viewModel"];
+            if (vm) msg = [vm valueForKey:@"message"];
+        }
+        NSString *pk = max_primaryKeyOfMessage(msg);
+        [self setAlpha:([g_markedDeleted containsObject:pk] ? 0.45 : 1.0)];
+    } @catch (NSException *e) {
+        // keep the cell visible whatever its internals are
+    }
+}
+
 static void max_installKeepDeletedHook(void) {
+    // restore the marked set from previous runs
+    NSArray *saved = [[NSUserDefaults standardUserDefaults]
+        stringArrayForKey:@"mod.markedDeleted"];
+    g_markedDeleted = [NSMutableSet setWithArray:(saved ?: @[])];
+    maxlog(@"keep-deleted: %lu message(s) marked from previous run",
+           (unsigned long)g_markedDeleted.count);
+
     Class cls = objc_getClass("OMMessageActionProcessor");
     if (!cls) {
         maxlog(@"keep-deleted: OMMessageActionProcessor not found");
@@ -820,7 +882,20 @@ static void max_installKeepDeletedHook(void) {
     }
     orig_deleteMessageCtx = method_getImplementation(m);
     method_setImplementation(m, (IMP)hook_deleteMessageCtx);
-    maxlog(@"keep-deleted: own-delete hook installed");
+    maxlog(@"keep-deleted: two-phase own-delete hook installed");
+
+    // dim rendering on the message cell
+    Class cell = objc_getClass("_TtC13ChatHistoryUI11MessageCell");
+    if (cell) {
+        Method lm = class_getInstanceMethod(cell, @selector(applyLayoutAttributes:));
+        if (lm) {
+            orig_cellLayout = method_getImplementation(lm);
+            method_setImplementation(lm, (IMP)hook_cellApplyLayout);
+            maxlog(@"keep-deleted: cell dim hook installed");
+        } else {
+            maxlog(@"keep-deleted: applyLayoutAttributes: not found on cell");
+        }
+    }
 }
 
 // ============================================================================
@@ -1108,7 +1183,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v6.4 loading (potuzhno: keep-deleted covers own deletes)...");
+    maxlog(@"v6.5 loading (potuzhno: two-phase delete with dimmed marked)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -1207,5 +1282,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v6.4 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v6.5 loaded OK — log file: %@", max_logPath());
 }
