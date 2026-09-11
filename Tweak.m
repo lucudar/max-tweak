@@ -43,6 +43,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 // ============================================================================
 #pragma mark - Swizzle helpers
@@ -784,6 +785,8 @@ static void max_installGhostHooks(void) {
     }
     free(classes);
 }
+
+static IMP orig_deleteMessageCtx = NULL;
 
 // ============================================================================
 #pragma mark - Keep-deleted: TWO-PHASE delete (switch-controlled)
