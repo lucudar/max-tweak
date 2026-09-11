@@ -817,23 +817,24 @@ static void hook_setSections(id self, SEL _cmd, NSArray *sections) {
                     droppedSections++;
                     continue;
                 }
-                NSArray *actions = [section respondsToSelector:@selector(actions)]
-                    ? [section actions] : nil;
-                if ([actions isKindOfClass:[NSArray class]] && actions.count > 0) {
-                    NSMutableArray *keptActions = [NSMutableArray array];
-                    for (id action in actions) {
-                        NSString *atitle = [action respondsToSelector:@selector(title)]
-                            ? [action title] : nil;
-                        if (max_titleIsPruned(atitle)) {
-                            droppedActions++;
-                            continue;
+                if ([section respondsToSelector:@selector(actions)]) {
+                    NSArray *actions =
+                        ((id(*)(id,SEL))objc_msgSend)(section, @selector(actions));
+                    if ([actions isKindOfClass:[NSArray class]] && actions.count > 0) {
+                        NSMutableArray *keptActions = [NSMutableArray array];
+                        for (id action in actions) {
+                            NSString *atitle = [action respondsToSelector:@selector(title)]
+                                ? [action title] : nil;
+                            if (max_titleIsPruned(atitle)) {
+                                droppedActions++;
+                                continue;
+                            }
+                            [keptActions addObject:action];
                         }
-                        [keptActions addObject:action];
-                    }
-                    if (keptActions.count != actions.count) {
-                        if ([section respondsToSelector:@selector(setActions:)])
-                            [section setActions:keptActions];
-                        actions = keptActions;
+                        if (keptActions.count != actions.count) {
+                            ((void(*)(id,SEL,id))objc_msgSend)(
+                                section, @selector(setActions:), keptActions);
+                        }
                     }
                 }
                 [kept addObject:section];
