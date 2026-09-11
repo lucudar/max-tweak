@@ -898,7 +898,7 @@ static UITabBarController *max_findTabBar(UIViewController *vc, int depth) {
         return (UITabBarController *)vc;
     UITabBarController *found = max_findTabBar(vc.presentedViewController, depth + 1);
     if (found) return found;
-    for (UIViewController *child in vc.children) {
+    for (UIViewController *child in vc.childViewControllers) {
         found = max_findTabBar(child, depth + 1);
         if (found) return found;
     }
