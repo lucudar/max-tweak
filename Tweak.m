@@ -1316,9 +1316,10 @@ static void hook_enqueueTasks(id self, SEL _cmd, id pks, BOOL deleteForAll, id t
     ((void(*)(id,SEL,id,BOOL,id))orig_enqueueTasks)(self, _cmd, pks, deleteForAll, tasks);
 }
 
-static void hook_taskPerformWork(id self, SEL _cmd) {
+static id hook_taskPerformWork(id self, SEL _cmd) {
     maxlog(@"task-trace: OKMDeleteMessagesTask performWorkSignal fired");
-    ((void(*)(id,SEL))orig_taskPerformWork)(self, _cmd);
+    // v8.9: performWorkSignal RETURNS the work signal — must pass it through
+    return ((id(*)(id,SEL))orig_taskPerformWork)(self, _cmd);
 }
 
 static IMP orig_taskSetup = NULL;
@@ -1330,11 +1331,12 @@ static void hook_taskSetup(id self, SEL _cmd, id registry) {
     ((void(*)(id,SEL,id))orig_taskSetup)(self, _cmd, registry);
 }
 
-static void hook_taskPrecond(id self, SEL _cmd) {
+static id hook_taskPrecond(id self, SEL _cmd) {
     id result = ((id(*)(id,SEL))orig_taskPrecond)(self, _cmd);
-    maxlog(@"task-trace: preConditionSignals = %@ (%@)",
-           NSStringFromClass([result class]), result);
-    return;   // already called the original above
+    // v8.9: return the signal! The v8.4 trace hook was declared void and
+    // dropped the return value — the queue received garbage instead of the
+    // precondition signal and the app crashed right after task start.
+    return result;
 }
 
 // ============================================================================
@@ -2048,7 +2050,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v8.8 loading (delete-task dependency drop)...");
+    maxlog(@"v8.9 loading (precond/performWork return-value fix)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -2167,5 +2169,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v8.8 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v8.9 loaded OK — log file: %@", max_logPath());
 }
