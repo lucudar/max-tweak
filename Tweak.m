@@ -1,5 +1,5 @@
 /**
- * MAXMods v8.3 — «Потужно Мессенджер»: delete task queue trace (enqueue/perform/send),
+ * MAXMods v8.4 — «Потужно Мессенджер»: delete task registration/precondition trace,
  * indexPath-based dim, settings view pruning
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
@@ -1273,14 +1273,34 @@ static void hook_sendDeleteCommand(id self, SEL _cmd, id messages) {
 static IMP orig_enqueueTasks = NULL;
 static IMP orig_taskPerformWork = NULL;
 
-static void hook_enqueueTasks(id self, SEL _cmd, id pks, BOOL deleteForAll, BOOL enqueue) {
-    maxlog(@"task-trace: enqueueTasks fired, enqueue=%d", (int)enqueue);
-    ((void(*)(id,SEL,id,BOOL,BOOL))orig_enqueueTasks)(self, _cmd, pks, deleteForAll, enqueue);
+static void hook_enqueueTasks(id self, SEL _cmd, id pks, BOOL deleteForAll, id tasks) {
+    maxlog(@"task-trace: enqueueTasks fired, tasks=%@ (pks=%@ forAll=%d)",
+           [tasks isKindOfClass:[NSArray class]] ? @([tasks count])
+               : [NSString stringWithFormat:@"%@", tasks],
+           [pks isKindOfClass:[NSArray class]]
+               ? [pks componentsJoinedByString:@","] : @"?", (int)deleteForAll);
+    ((void(*)(id,SEL,id,BOOL,id))orig_enqueueTasks)(self, _cmd, pks, deleteForAll, tasks);
 }
 
 static void hook_taskPerformWork(id self, SEL _cmd) {
     maxlog(@"task-trace: OKMDeleteMessagesTask performWorkSignal fired");
     ((void(*)(id,SEL))orig_taskPerformWork)(self, _cmd);
+}
+
+static IMP orig_taskSetup = NULL;
+static IMP orig_taskPrecond = NULL;
+
+static void hook_taskSetup(id self, SEL _cmd, id registry) {
+    maxlog(@"task-trace: setupWithRegistry: %@ (%@)",
+           NSStringFromClass([registry class]), registry);
+    ((void(*)(id,SEL,id))orig_taskSetup)(self, _cmd, registry);
+}
+
+static void hook_taskPrecond(id self, SEL _cmd) {
+    id result = ((id(*)(id,SEL))orig_taskPrecond)(self, _cmd);
+    maxlog(@"task-trace: preConditionSignals = %@ (%@)",
+           NSStringFromClass([result class]), result);
+    return;   // already called the original above
 }
 
 static void max_installDeleteForAllHook(void) {
@@ -1313,6 +1333,18 @@ static void max_installDeleteForAllHook(void) {
                 orig_taskPerformWork = method_getImplementation(pw);
                 method_setImplementation(pw, (IMP)hook_taskPerformWork);
                 maxlog(@"keep-deleted: task performWork trace hook installed");
+            }
+            Method su = class_getInstanceMethod(task, @selector(setupWithRegistry:));
+            if (su) {
+                orig_taskSetup = method_getImplementation(su);
+                method_setImplementation(su, (IMP)hook_taskSetup);
+                maxlog(@"keep-deleted: task setup trace hook installed");
+            }
+            Method pc = class_getInstanceMethod(task, @selector(preConditionSignals));
+            if (pc) {
+                orig_taskPrecond = method_getImplementation(pc);
+                method_setImplementation(pc, (IMP)hook_taskPrecond);
+                maxlog(@"keep-deleted: task precondition trace hook installed");
             }
         }
     }
@@ -1892,7 +1924,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v8.3 loading (task queue trace)...");
+    maxlog(@"v8.4 loading (task registration/precondition trace)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -2010,5 +2042,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v8.3 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v8.4 loaded OK — log file: %@", max_logPath());
 }
