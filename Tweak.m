@@ -1,5 +1,5 @@
 /**
- * MAXMods v7.7 — «Потужно Мессенджер»: server deleted-flag neutralized (OKMMessage.deleted),
+ * MAXMods v7.8 — «Потужно Мессенджер»: delete-for-all also two-phased (OKMChatService),
  * indexPath-based dim, settings view pruning
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
@@ -1098,6 +1098,102 @@ static BOOL hook_messageDeleted(id self, SEL _cmd) {
     return ((BOOL(*)(id,SEL))orig_messageDeletedGetter)(self, _cmd);
 }
 
+// ============================================================================
+#pragma mark - Keep-deleted: block "delete for everyone" at the chat service
+//
+// The menu-level hook (_deleteMessage:context:) covers the message action,
+// but the CONFIRMATION of "удалить у всех" goes straight to
+// OKMChatService deleteMessagesWithPks:deleteForAll: (and the private
+// variants) — that path bypassed the two-phase logic. Same rules here:
+// 1st delete of a pk marks it (cell dims), 2nd delete of a marked pk
+// really deletes. Mod.del OFF — normal behavior.
+// ============================================================================
+
+static IMP orig_deleteWithPks = NULL;
+static IMP orig_deleteWithPksComplaint = NULL;
+static IMP orig_deleteWithPksEnqueue = NULL;
+
+static BOOL max_pksContainMarked(NSArray *pks) {
+    if (![pks isKindOfClass:[NSArray class]]) return NO;
+    for (id pk in pks) {
+        NSString *s = [NSString stringWithFormat:@"%@", pk];
+        if ([g_markedDeleted containsObject:s]) return YES;
+    }
+    return NO;
+}
+
+static NSArray *max_unmarkPks(NSArray *pks) {
+    NSMutableArray *out = [NSMutableArray array];
+    for (id pk in pks) {
+        NSString *s = [NSString stringWithFormat:@"%@", pk];
+        if (![g_markedDeleted containsObject:s]) [out addObject:pk];
+        else [g_markedDeleted removeObject:s];
+    }
+    [[NSUserDefaults standardUserDefaults] setObject:[g_markedDeleted allObjects]
+                                              forKey:@"mod.markedDeleted"];
+    return out;
+}
+
+static void max_deletePksBlocked(NSArray *pks, SEL _cmd) {
+    // two-phase: mark every pk (1st delete) and swallow the call
+    NSMutableArray *markedNow = [NSMutableArray array];
+    for (id pk in (pks ?: @[])) {
+        NSString *s = [NSString stringWithFormat:@"%@", pk];
+        if (![g_markedDeleted containsObject:s]) {
+            [g_markedDeleted addObject:s];
+            [markedNow addObject:s];
+        }
+    }
+    [[NSUserDefaults standardUserDefaults] setObject:[g_markedDeleted allObjects]
+                                              forKey:@"mod.markedDeleted"];
+    maxlog(@"keep-deleted: delete-for-all blocked, %lu pk(s) newly marked (sel %@)",
+           (unsigned long)markedNow.count, NSStringFromSelector(_cmd));
+}
+
+static void hook_deleteWithPks(id self, SEL _cmd, id pks, BOOL deleteForAll) {
+    if (max_modOn(@"mod.del") && !max_pksContainMarked((NSArray *)pks)) {
+        max_deletePksBlocked((NSArray *)pks, _cmd);
+        return;   // swallow: nothing leaves the device, nothing is removed
+    }
+    ((void(*)(id,SEL,id,BOOL))orig_deleteWithPks)(self, _cmd, pks, deleteForAll);
+}
+
+static void hook_deleteWithPks2(id self, SEL _cmd, id pks, BOOL deleteForAll, id complaint) {
+    if (max_modOn(@"mod.del") && !max_pksContainMarked((NSArray *)pks)) {
+        max_deletePksBlocked((NSArray *)pks, _cmd);
+        return;
+    }
+    ((void(*)(id,SEL,id,BOOL,id))orig_deleteWithPks2)(self, _cmd, pks, deleteForAll, complaint);
+}
+
+static void max_installDeleteForAllHook(void) {
+    Class cls = objc_getClass("OKMChatService");
+    if (!cls) {
+        maxlog(@"keep-deleted: OKMChatService not found");
+        return;
+    }
+    struct { SEL sel; IMP *orig; IMP hook; int kind; } hooks[] = {
+        { @selector(deleteMessagesWithPks:deleteForAll:),
+          &orig_deleteWithPks, (IMP)hook_deleteWithPks, 0 },
+        { @selector(_deleteMessagesWithPks:deleteForAll:withLegacyComplaint:),
+          &orig_deleteWithPks2, (IMP)hook_deleteWithPks2, 1 },
+        { @selector(_deleteMessagesWithPks:deleteForAll:withComplaint:),
+          &orig_deleteWithPks2, (IMP)hook_deleteWithPks2, 1 },
+    };
+    for (NSUInteger i = 0; i < sizeof(hooks)/sizeof(hooks[0]); i++) {
+        Method m = class_getInstanceMethod(cls, hooks[i].sel);
+        if (!m) {
+            maxlog(@"keep-deleted: method not found: %@",
+                   NSStringFromSelector(hooks[i].sel));
+            continue;
+        }
+        *hooks[i].orig = method_getImplementation(m);
+        method_setImplementation(m, hooks[i].hook);
+        maxlog(@"keep-deleted: hooked %@",
+               NSStringFromSelector(hooks[i].sel));
+    }
+}
+
 static void max_installDeletedFlagHook(void) {
     Class cls = objc_getClass("OKMMessage");
     if (!cls) {
@@ -1640,7 +1736,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v7.7 loading (server deleted-flag neutralized)...");
+    maxlog(@"v7.8 loading (delete-for-all two-phase at chat service)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -1687,6 +1783,7 @@ static void maxmods_init(void) {
     // 5) Ghost mode + keep-deleted hooks (switch-controlled, Моды tab).
     max_installGhostHooks();
     max_installDeletedFlagHook();
+    max_installDeleteForAllHook();
     max_installKeepDeletedHook();
 
     // v7.6: reset the marked indexPath list once — the v7.5 db-hook bug
@@ -1757,5 +1854,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v7.7 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v7.8 loaded OK — log file: %@", max_logPath());
 }
