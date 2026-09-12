@@ -47,6 +47,7 @@
 #import <objc/message.h>
 
 static BOOL max_pkIsApproved(NSString *s);   // defined in the keep-deleted section
+static BOOL max_ghostPaused(void);           // defined in the keep-deleted section
 
 // ============================================================================
 #pragma mark - Swizzle helpers
