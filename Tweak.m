@@ -1,5 +1,5 @@
 /**
- * MAXMods v8.1 — «Потужно Мессенджер»: own-delete confirmations pass the ghost hook,
+ * MAXMods v8.2 — «Потужно Мессенджер»: delete-svc/server-delete diagnostics,
  * indexPath-based dim, settings view pruning
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
@@ -1234,6 +1234,11 @@ static BOOL max_deletePksShouldPass(NSArray *pks, BOOL consume) {
 }
 
 static void hook_deleteWithPks(id self, SEL _cmd, id pks, BOOL deleteForAll) {
+    maxlog(@"delete-svc: %@ pks=%@ forAll=%d",
+           NSStringFromSelector(_cmd),
+           [pks isKindOfClass:[NSArray class]]
+               ? [pks componentsJoinedByString:@","] : [NSString stringWithFormat:@"%@", pks],
+           (int)deleteForAll);
     if (max_modOn(@"mod.del") && !max_deletePksShouldPass((NSArray *)pks, YES)) {
         max_deletePksBlocked((NSArray *)pks, _cmd);
         return;   // swallow: nothing leaves the device, nothing is removed
@@ -1242,6 +1247,11 @@ static void hook_deleteWithPks(id self, SEL _cmd, id pks, BOOL deleteForAll) {
 }
 
 static void hook_deleteWithPks2(id self, SEL _cmd, id pks, BOOL deleteForAll, id complaint) {
+    maxlog(@"delete-svc: %@ pks=%@ forAll=%d",
+           NSStringFromSelector(_cmd),
+           [pks isKindOfClass:[NSArray class]]
+               ? [pks componentsJoinedByString:@","] : [NSString stringWithFormat:@"%@", pks],
+           (int)deleteForAll);
     if (max_modOn(@"mod.del") && !max_deletePksShouldPass((NSArray *)pks, YES)) {
         max_deletePksBlocked((NSArray *)pks, _cmd);
         return;
@@ -1249,7 +1259,31 @@ static void hook_deleteWithPks2(id self, SEL _cmd, id pks, BOOL deleteForAll, id
     ((void(*)(id,SEL,id,BOOL,id))orig_deleteWithPks2)(self, _cmd, pks, deleteForAll, complaint);
 }
 
+// The task that actually sends the delete command to the server — logs the
+// fact of sending so the next log shows whether deletions reach the wire.
+static IMP orig_sendDeleteCommand = NULL;
+
+static void hook_sendDeleteCommand(id self, SEL _cmd, id messages) {
+    maxlog(@"server-delete: _sendDeleteCommandForMessages: fired (%@ messages)",
+           [messages isKindOfClass:[NSArray class]]
+               ? @([messages count]) : @"?");
+    ((void(*)(id,SEL,id))orig_sendDeleteCommand)(self, _cmd, messages);
+}
+
 static void max_installDeleteForAllHook(void) {
+    {
+        Class task = objc_getClass("OKMDeleteMessagesTask");
+        if (task) {
+            Method m = class_getInstanceMethod(task,
+                @selector(_sendDeleteCommandForMessages:));
+            if (m) {
+                orig_sendDeleteCommand = method_getImplementation(m);
+                method_setImplementation(m, (IMP)hook_sendDeleteCommand);
+                maxlog(@"keep-deleted: server-delete command hook installed");
+            }
+        }
+    }
+
     Class cls = objc_getClass("OKMChatService");
     if (!cls) {
         maxlog(@"keep-deleted: OKMChatService not found");
@@ -1825,7 +1859,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v8.1 loading (own-delete confirmations pass)...");
+    maxlog(@"v8.2 loading (delete-svc + server-delete diagnostics)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -1943,5 +1977,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v8.1 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v8.2 loaded OK — log file: %@", max_logPath());
 }
