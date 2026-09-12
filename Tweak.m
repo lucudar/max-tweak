@@ -1,5 +1,5 @@
 /**
- * MAXMods v8.6 — «Потужно Мессенджер»: 15s ghost-pause window after an approved delete,
+ * MAXMods v8.7 — «Потужно Мессенджер»: full OKMTasksService queue trace,
  * indexPath-based dim, settings view pruning
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
@@ -1337,6 +1337,78 @@ static void hook_taskPrecond(id self, SEL _cmd) {
     return;   // already called the original above
 }
 
+// ============================================================================
+#pragma mark - OKMTasksService: full queue trace
+//
+// v8.7: the delete task registers (setupWithRegistry) but never runs.
+// OKMTasksService is the executor: enqueueTasks:withDependencies: ->
+// enqueueTask: -> _performTask:. Hook every link to see exactly where
+// the chain breaks.
+// ============================================================================
+
+static IMP orig_svcEnqueueDeps = NULL;
+static IMP orig_svcEnqueue = NULL;
+static IMP orig_svcPerform = NULL;
+static IMP orig_svcEphemeral = NULL;
+
+static void hook_svcEnqueueDeps(id self, SEL _cmd, id tasks, id deps) {
+    maxlog(@"queue: enqueueTasks:withDependencies: tasks=%@ deps=%@",
+           [tasks isKindOfClass:[NSArray class]] ? @([tasks count])
+               : [NSString stringWithFormat:@"%@", tasks],
+           [deps isKindOfClass:[NSArray class]] ? @([deps count])
+               : [NSString stringWithFormat:@"%@", deps]);
+    ((void(*)(id,SEL,id,id))orig_svcEnqueueDeps)(self, _cmd, tasks, deps);
+}
+
+static void hook_svcEnqueue(id self, SEL _cmd, id task) {
+    maxlog(@"queue: enqueueTask: %@",
+           NSStringFromClass([task class]));
+    ((void(*)(id,SEL,id))orig_svcEnqueue)(self, _cmd, task);
+}
+
+static void hook_svcPerform(id self, SEL _cmd, id task) {
+    maxlog(@"queue: _performTask: START %@",
+           NSStringFromClass([task class]));
+    ((void(*)(id,SEL,id))orig_svcPerform)(self, _cmd, task);
+    maxlog(@"queue: _performTask: END %@",
+           NSStringFromClass([task class]));
+}
+
+static void hook_svcEphemeral(id self, SEL _cmd, id task) {
+    maxlog(@"queue: performEphemeralTask: %@",
+           NSStringFromClass([task class]));
+    ((void(*)(id,SEL,id))orig_svcEphemeral)(self, _cmd, task);
+}
+
+static void max_installTasksServiceTrace(void) {
+    Class svc = objc_getClass("OKMTasksService");
+    if (!svc) {
+        maxlog(@"queue: OKMTasksService class not found");
+        return;
+    }
+    struct { const char *sel; IMP *orig; IMP hook; } hooks[] = {
+        { "enqueueTasks:withDependencies:", &orig_svcEnqueueDeps,
+          (IMP)hook_svcEnqueueDeps },
+        { "enqueueTask:", &orig_svcEnqueue,
+          (IMP)hook_svcEnqueue },
+        { "_performTask:", &orig_svcPerform,
+          (IMP)hook_svcPerform },
+        { "performEphemeralTask:", &orig_svcEphemeral,
+          (IMP)hook_svcEphemeral },
+    };
+    for (NSUInteger i = 0; i < sizeof(hooks)/sizeof(hooks[0]); i++) {
+        SEL sel = sel_registerName(hooks[i].sel);
+        Method m = class_getInstanceMethod(svc, sel);
+        if (!m) {
+            maxlog(@"queue: method not found: %s", hooks[i].sel);
+            continue;
+        }
+        *hooks[i].orig = method_getImplementation(m);
+        method_setImplementation(m, hooks[i].hook);
+        maxlog(@"queue: hooked %s", hooks[i].sel);
+    }
+}
+
 static void max_installDeleteForAllHook(void) {
     {
         Class svc = objc_getClass("OKMChatService");
@@ -1959,7 +2031,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v8.6 loading (ghost-pause window on approved deletes)...");
+    maxlog(@"v8.7 loading (full tasks-queue trace)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -2007,6 +2079,7 @@ static void maxmods_init(void) {
     max_installGhostHooks();
     max_installDeletedFlagHook();
     max_installDeleteForAllHook();
+    max_installTasksServiceTrace();
     max_installKeepDeletedHook();
 
     // v7.6: reset the marked indexPath list once — the v7.5 db-hook bug
@@ -2077,5 +2150,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v8.6 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v8.7 loaded OK — log file: %@", max_logPath());
 }
