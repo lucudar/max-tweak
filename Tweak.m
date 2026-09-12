@@ -1102,6 +1102,18 @@ static NSMutableSet<NSString *> *g_markedDeleted = nil;
 static NSMutableDictionary<NSString *, NSDate *> *g_approvedDeletePks = nil; // pk -> approval time
 static NSTimeInterval const kMaxApprovalWindow = 30.0;   // deletion chains fan out (public -> private methods); an approval must survive them all
 
+static BOOL max_pkIsApproved(NSString *s) {
+    if (!g_approvedDeletePks.count) return NO;
+    NSDate *t = g_approvedDeletePks[s];
+    if (!t) return NO;
+    if (-[t timeIntervalSinceNow] > kMaxApprovalWindow) {
+        [g_approvedDeletePks removeObjectForKey:s];   // expired
+        return NO;
+    }
+    return YES;
+}
+
+
 // ============================================================================
 #pragma mark - Keep-deleted: block "delete for everyone" at the chat service
 //
@@ -1174,17 +1186,6 @@ static BOOL max_pkInSet(id pk, NSSet<NSString *> *set) {
         }
     }
     return NO;
-}
-
-static BOOL max_pkIsApproved(NSString *s) {
-    if (!g_approvedDeletePks.count) return NO;
-    NSDate *t = g_approvedDeletePks[s];
-    if (!t) return NO;
-    if (-[t timeIntervalSinceNow] > kMaxApprovalWindow) {
-        [g_approvedDeletePks removeObjectForKey:s];   // expired
-        return NO;
-    }
-    return YES;
 }
 
 // Decision for a delete request with mod.del ON:
