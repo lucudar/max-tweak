@@ -1116,6 +1116,7 @@ static IMP orig_deleteWithPks = NULL;
 static IMP orig_deleteWithPks2 = NULL;
 static IMP orig_deleteWithPksEnqueue = NULL;
 
+__attribute__((unused))
 static BOOL max_pksContainMarked(NSArray *pks) {
     if (![pks isKindOfClass:[NSArray class]]) return NO;
     for (id pk in pks) {
