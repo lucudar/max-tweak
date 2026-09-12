@@ -1,5 +1,5 @@
 /**
- * MAXMods v7.8 — «Потужно Мессенджер»: delete-for-all also two-phased (OKMChatService),
+ * MAXMods v7.9 — «Потужно Мессенджер»: menu-approved deletions pass the chat service,
  * indexPath-based dim, settings view pruning
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
@@ -1099,6 +1099,7 @@ static BOOL hook_messageDeleted(id self, SEL _cmd) {
 }
 
 static NSMutableSet<NSString *> *g_markedDeleted = nil;
+static NSMutableSet<NSString *> *g_allowedDeletePks = nil;   // pks approved by the menu hook
 
 // ============================================================================
 #pragma mark - Keep-deleted: block "delete for everyone" at the chat service
@@ -1149,12 +1150,57 @@ static void max_deletePksBlocked(NSArray *pks, SEL _cmd) {
     }
     [[NSUserDefaults standardUserDefaults] setObject:[g_markedDeleted allObjects]
                                               forKey:@"mod.markedDeleted"];
-    maxlog(@"keep-deleted: delete-for-all blocked, %lu pk(s) newly marked (sel %@)",
-           (unsigned long)markedNow.count, NSStringFromSelector(_cmd));
+    maxlog(@"keep-deleted: delete-for-all blocked [%@] (sel %@)",
+           [markedNow componentsJoinedByString:@","], NSStringFromSelector(_cmd));
+}
+
+// pk resolution: the menu hook stores "%@" of primaryKey; the service pks
+// may arrive as numbers/strings — compare both string forms.
+static BOOL max_pkInSet(id pk, NSSet<NSString *> *set) {
+    if (!pk || !set.count) return NO;
+    NSString *s = [NSString stringWithFormat:@"%@", pk];
+    if ([set containsObject:s]) return YES;
+    // numeric normalization (e.g. "123" vs " 123" or NSNumber prints)
+    const char *c = s.UTF8String;
+    if (c) {
+        long long v = strtoll(c, NULL, 10);
+        if (v != 0 || strcmp(c, "0") == 0) {
+            NSString *n = [NSString stringWithFormat:@"%lld", v];
+            if ([set containsObject:n]) return YES;
+        }
+    }
+    return NO;
+}
+
+// Decision for a delete request with mod.del ON:
+//   pk approved by the menu hook (2nd delete) -> let it through, consume
+//   pk marked (path bypassed the menu hook)   -> let it through, unmark
+//   fresh pk                                   -> block + mark (1st phase)
+static BOOL max_deletePksShouldPass(NSArray *pks, BOOL consume) {
+    if (!g_allowedDeletePks) g_allowedDeletePks = [NSMutableSet new];
+    BOOL anyAllowed = NO, anyMarked = NO;
+    for (id pk in (pks ?: @[])) {
+        if (max_pkInSet(pk, g_allowedDeletePks)) { anyAllowed = YES; }
+        else if (max_pkInSet(pk, g_markedDeleted)) { anyMarked = YES; }
+    }
+    if (anyAllowed || anyMarked) {
+        // consume: remove these pks from both sets so state stays clean
+        if (consume) {
+            for (id pk in (pks ?: @[])) {
+                NSString *s = [NSString stringWithFormat:@"%@", pk];
+                [g_allowedDeletePks removeObject:s];
+                [g_markedDeleted removeObject:s];
+            }
+            [[NSUserDefaults standardUserDefaults] setObject:[g_markedDeleted allObjects]
+                                                      forKey:@"mod.markedDeleted"];
+        }
+        return YES;
+    }
+    return NO;
 }
 
 static void hook_deleteWithPks(id self, SEL _cmd, id pks, BOOL deleteForAll) {
-    if (max_modOn(@"mod.del") && !max_pksContainMarked((NSArray *)pks)) {
+    if (max_modOn(@"mod.del") && !max_deletePksShouldPass((NSArray *)pks, YES)) {
         max_deletePksBlocked((NSArray *)pks, _cmd);
         return;   // swallow: nothing leaves the device, nothing is removed
     }
@@ -1162,7 +1208,7 @@ static void hook_deleteWithPks(id self, SEL _cmd, id pks, BOOL deleteForAll) {
 }
 
 static void hook_deleteWithPks2(id self, SEL _cmd, id pks, BOOL deleteForAll, id complaint) {
-    if (max_modOn(@"mod.del") && !max_pksContainMarked((NSArray *)pks)) {
+    if (max_modOn(@"mod.del") && !max_deletePksShouldPass((NSArray *)pks, YES)) {
         max_deletePksBlocked((NSArray *)pks, _cmd);
         return;
     }
@@ -1327,7 +1373,10 @@ static void hook_deleteMessageCtx(id self, SEL _cmd, id message, id context) {
             [ips removeLastObject];
             [[NSUserDefaults standardUserDefaults] setObject:(ips ?: @[])
                                                       forKey:@"mod.markedIndexPaths"];
-            maxlog(@"keep-deleted: message %@ really deleted (2nd delete)", pk);
+            // approve the pk so the chat-service hook lets the REAL deletion through
+            if (!g_allowedDeletePks) g_allowedDeletePks = [NSMutableSet new];
+            [g_allowedDeletePks addObject:pk];
+            maxlog(@"keep-deleted: message %@ really deleted (2nd delete, approved)", pk);
         }
     }
     if (orig_deleteMessageCtx)
@@ -1737,7 +1786,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v7.8 loading (delete-for-all two-phase at chat service)...");
+    maxlog(@"v7.9 loading (approved-pk pass-through fix)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -1855,5 +1904,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v7.8 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v7.9 loaded OK — log file: %@", max_logPath());
 }
