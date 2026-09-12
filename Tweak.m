@@ -1,5 +1,5 @@
 /**
- * MAXMods v8.0 — «Потужно Мессенджер»: 30s approval window (public->private delete chain),
+ * MAXMods v8.1 — «Потужно Мессенджер»: own-delete confirmations pass the ghost hook,
  * indexPath-based dim, settings view pruning
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
@@ -1047,10 +1047,26 @@ static id max_hook_read2(id self, SEL _cmd, id a, id b) {
 
 static void max_hook_void2(id self, SEL _cmd, id a, id b) {
     NSString *n = NSStringFromSelector(_cmd);
-    // Only the EVENT-level hook is suppressed. The db-level
-    // deleteLocallyMessagesWithIds: also fires during normal history sync
-    // and broke the whole chat when blocked (everything dimmed).
     if ([n hasPrefix:@"_handleDeletedMessages"] && max_modOn(@"mod.del")) {
+        // The event fans out to every device/account. When it carries a pk
+        // we JUST approved (own delete-for-all confirmation), let it apply —
+        // otherwise our other logged-in accounts keep the "deleted" message.
+        NSArray *items = [a isKindOfClass:[NSArray class]] ? a : (a ? @[a] : @[]);
+        for (id item in items) {
+            NSString *pk = nil;
+            if ([item respondsToSelector:@selector(primaryKey)]) {
+                pk = [NSString stringWithFormat:@"%@",
+                       ((id(*)(id,SEL))objc_msgSend)(item, @selector(primaryKey))];
+            } else if (item) {
+                pk = [NSString stringWithFormat:@"%@", item];
+            }
+            if (pk && max_pkIsApproved(pk)) {
+                maxlog(@"ghost: own-delete confirmation passed through (pk %@)", pk);
+                IMP o = max_modOrig(object_getClass(self), _cmd);
+                if (o) ((void(*)(id,SEL,id,id))o)(self, _cmd, a, b);
+                return;
+            }
+        }
         maxlog(@"ghost: remote deletion event suppressed");
         return;
     }
@@ -1807,7 +1823,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v8.0 loading (30s approval window)...");
+    maxlog(@"v8.1 loading (own-delete confirmations pass)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -1925,5 +1941,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v8.0 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v8.1 loaded OK — log file: %@", max_logPath());
 }
