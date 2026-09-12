@@ -1252,11 +1252,68 @@ static void hook_deleteWithPks2(id self, SEL _cmd, id pks, BOOL deleteForAll, id
 // fact of sending so the next log shows whether deletions reach the wire.
 static IMP orig_sendDeleteCommand = NULL;
 
+// pks whose delete command was already SENT to the server (persisted). A
+// stuck DB task re-runs on every launch and re-sends the command for
+// already-deleted messages; the server error response then crashes the app
+// (crash loop). Re-sends are skipped entirely.
+static NSString *const kSentPksKey = @"mod.serverSentPks";
+
+static NSString *max_pkOfMessage(id m) {
+    if (!m) return nil;
+    SEL sel = sel_registerName("primaryKey");
+    if ([m respondsToSelector:sel])
+        return [NSString stringWithFormat:@"%@", ((id(*)(id,SEL))objc_msgSend)(m, sel)];
+    return [NSString stringWithFormat:@"%@", m];
+}
+
 static void hook_sendDeleteCommand(id self, SEL _cmd, id messages) {
-    maxlog(@"server-delete: _sendDeleteCommandForMessages: fired (%@ messages)",
-           [messages isKindOfClass:[NSArray class]]
-               ? @([messages count]) : @"?");
-    ((void(*)(id,SEL,id))orig_sendDeleteCommand)(self, _cmd, messages);
+    NSArray *items = [messages isKindOfClass:[NSArray class]]
+        ? messages : (messages ? @[messages] : @[]);
+
+    NSMutableArray<NSString *> *pks = [NSMutableArray array];
+    for (id m in items) {
+        NSString *pk = max_pkOfMessage(m);
+        if (pk) [pks addObject:pk];
+    }
+    maxlog(@"server-delete: _sendDeleteCommandForMessages: fired (%lu messages, pks=%@)",
+           (unsigned long)items.count, [pks componentsJoinedByString:@","]);
+
+    if (pks.count > 0 && max_modOn(@"mod.del")) {
+        // hmm: idempotency only makes sense while keep-deleted logic is on;
+        // check which pks were already sent
+        NSSet *sent = [NSSet setWithArray:
+            [[NSUserDefaults standardUserDefaults] stringArrayForKey:kSentPksKey] ?: @[]];
+        BOOL allSent = YES;
+        for (NSString *pk in pks)
+            if (![sent containsObject:pk]) { allSent = NO; break; }
+        if (allSent && sent.count > 0) {
+            // The server has nothing left to delete; re-sending gets an error
+            // response whose handling crashes the app (stuck-task crash loop).
+            maxlog(@"server-delete: SKIP - all pks already sent before (stuck task)");
+            return;
+        }
+    }
+
+    @try {
+        ((void(*)(id,SEL,id))orig_sendDeleteCommand)(self, _cmd, messages);
+    } @catch (NSException *e) {
+        maxlog(@"server-delete: EXCEPTION in send: %@ - swallowed", e);
+    }
+
+    // record what we just sent (best effort; only while mod.del is on)
+    if (pks.count > 0 && max_modOn(@"mod.del")) {
+        NSMutableArray *sent = [[[NSUserDefaults standardUserDefaults]
+            stringArrayForKey:kSentPksKey] mutableCopy] ?: [NSMutableArray array];
+        for (NSString *pk in pks)
+            if (![sent containsObject:pk]) [sent addObject:pk];
+        // keep the list bounded
+        if (sent.count > 200) {
+            NSIndexSet *keep = [NSIndexSet indexSetWithIndexesInRange:
+                NSMakeRange(sent.count - 200, 200)];
+            sent = [[sent objectsAtIndexes:keep] mutableCopy];
+        }
+        [[NSUserDefaults standardUserDefaults] setObject:sent forKey:kSentPksKey];
+    }
 }
 
 static IMP orig_enqueueTasks = NULL;
@@ -2004,7 +2061,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v9.0 loading (crash fix: native delete handlers, no ghost-pause)...");
+    maxlog(@"v9.1 loading (idempotent server-delete: stuck-task loop break)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -2123,5 +2180,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v9.0 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v9.1 loaded OK — log file: %@", max_logPath());
 }
