@@ -1,5 +1,5 @@
 /**
- * MAXMods v8.2 — «Потужно Мессенджер»: delete-svc/server-delete diagnostics,
+ * MAXMods v8.3 — «Потужно Мессенджер»: delete task queue trace (enqueue/perform/send),
  * indexPath-based dim, settings view pruning
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
@@ -1270,7 +1270,34 @@ static void hook_sendDeleteCommand(id self, SEL _cmd, id messages) {
     ((void(*)(id,SEL,id))orig_sendDeleteCommand)(self, _cmd, messages);
 }
 
+static IMP orig_enqueueTasks = NULL;
+static IMP orig_taskPerformWork = NULL;
+
+static void hook_enqueueTasks(id self, SEL _cmd, id pks, BOOL deleteForAll, BOOL enqueue) {
+    maxlog(@"task-trace: enqueueTasks fired, enqueue=%d", (int)enqueue);
+    ((void(*)(id,SEL,id,BOOL,BOOL))orig_enqueueTasks)(self, _cmd, pks, deleteForAll, enqueue);
+}
+
+static void hook_taskPerformWork(id self, SEL _cmd) {
+    maxlog(@"task-trace: OKMDeleteMessagesTask performWorkSignal fired");
+    ((void(*)(id,SEL))orig_taskPerformWork)(self, _cmd);
+}
+
 static void max_installDeleteForAllHook(void) {
+    {
+        Class svc = objc_getClass("OKMChatService");
+        if (svc) {
+            Method m = class_getInstanceMethod(svc,
+                @selector(_deleteMessagesWithPks:deleteForAll:enqueueTasks:));
+            if (m) {
+                orig_enqueueTasks = method_getImplementation(m);
+                method_setImplementation(m, (IMP)hook_enqueueTasks);
+                maxlog(@"keep-deleted: enqueueTasks trace hook installed");
+            } else {
+                maxlog(@"keep-deleted: enqueueTasks method NOT found");
+            }
+        }
+    }
     {
         Class task = objc_getClass("OKMDeleteMessagesTask");
         if (task) {
@@ -1280,6 +1307,12 @@ static void max_installDeleteForAllHook(void) {
                 orig_sendDeleteCommand = method_getImplementation(m);
                 method_setImplementation(m, (IMP)hook_sendDeleteCommand);
                 maxlog(@"keep-deleted: server-delete command hook installed");
+            }
+            Method pw = class_getInstanceMethod(task, @selector(performWorkSignal));
+            if (pw) {
+                orig_taskPerformWork = method_getImplementation(pw);
+                method_setImplementation(pw, (IMP)hook_taskPerformWork);
+                maxlog(@"keep-deleted: task performWork trace hook installed");
             }
         }
     }
@@ -1859,7 +1892,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v8.2 loading (delete-svc + server-delete diagnostics)...");
+    maxlog(@"v8.3 loading (task queue trace)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -1977,5 +2010,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v8.2 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v8.3 loaded OK — log file: %@", max_logPath());
 }
