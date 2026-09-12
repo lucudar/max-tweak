@@ -1112,7 +1112,7 @@ static NSMutableSet<NSString *> *g_markedDeleted = nil;
 // ============================================================================
 
 static IMP orig_deleteWithPks = NULL;
-static IMP orig_deleteWithPksComplaint = NULL;
+static IMP orig_deleteWithPks2 = NULL;
 static IMP orig_deleteWithPksEnqueue = NULL;
 
 static BOOL max_pksContainMarked(NSArray *pks) {
