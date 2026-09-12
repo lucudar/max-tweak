@@ -1,5 +1,5 @@
 /**
- * MAXMods v7.6 — «Потужно Мессенджер»: dim-fix (event-level remote delete only),
+ * MAXMods v7.7 — «Потужно Мессенджер»: server deleted-flag neutralized (OKMMessage.deleted),
  * indexPath-based dim, settings view pruning
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
@@ -1079,6 +1079,41 @@ static void max_hook_void0(id self, SEL _cmd) {
     if (o) ((void(*)(id,SEL))o)(self, _cmd);
 }
 
+// ============================================================================
+#pragma mark - Keep remote-deleted: neutralize the server "deleted" flag
+//
+// Final link in the chain. When the contact deletes a message, the server
+// marks it deleted and the client receives an UPDATED message object with
+// deleted=YES; the history then renders/removes it as deleted. The event
+// hook (_handleDeletedMessages:inChatWithId:) covers one path, but the
+// message-update path bypasses it. Hook the OKMMessage.deleted getter:
+// with mod.del ON it always reports NO, so the UI keeps treating the
+// message as alive no matter what the server says.
+// ============================================================================
+
+static IMP orig_messageDeletedGetter = NULL;
+
+static BOOL hook_messageDeleted(id self, SEL _cmd) {
+    if (max_modOn(@"mod.del")) return NO;   // "never deleted" for the UI
+    return ((BOOL(*)(id,SEL))orig_messageDeletedGetter)(self, _cmd);
+}
+
+static void max_installDeletedFlagHook(void) {
+    Class cls = objc_getClass("OKMMessage");
+    if (!cls) {
+        maxlog(@"keep-deleted: OKMMessage class not found");
+        return;
+    }
+    Method m = class_getInstanceMethod(cls, @selector(deleted));
+    if (!m) {
+        maxlog(@"keep-deleted: OKMMessage.deleted not found");
+        return;
+    }
+    orig_messageDeletedGetter = method_getImplementation(m);
+    method_setImplementation(m, (IMP)hook_messageDeleted);
+    maxlog(@"keep-deleted: OKMMessage.deleted getter hooked");
+}
+
 static void max_installGhostHooks(void) {
     struct { const char *sel; int args; } targets[] = {
         {"markAsReadTo:messageId:",          2},
@@ -1605,7 +1640,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v7.6 loading (dim fix: event-level remote delete only)...");
+    maxlog(@"v7.7 loading (server deleted-flag neutralized)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -1651,6 +1686,7 @@ static void maxmods_init(void) {
 
     // 5) Ghost mode + keep-deleted hooks (switch-controlled, Моды tab).
     max_installGhostHooks();
+    max_installDeletedFlagHook();
     max_installKeepDeletedHook();
 
     // v7.6: reset the marked indexPath list once — the v7.5 db-hook bug
@@ -1721,5 +1757,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v7.6 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v7.7 loaded OK — log file: %@", max_logPath());
 }
