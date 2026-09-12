@@ -1098,6 +1098,8 @@ static BOOL hook_messageDeleted(id self, SEL _cmd) {
     return ((BOOL(*)(id,SEL))orig_messageDeletedGetter)(self, _cmd);
 }
 
+static NSMutableSet<NSString *> *g_markedDeleted = nil;
+
 // ============================================================================
 #pragma mark - Keep-deleted: block "delete for everyone" at the chat service
 //
@@ -1264,8 +1266,6 @@ static IMP orig_deleteMessageCtx = NULL;
 // Marking: the message's primaryKey is remembered in a set; a swizzle on
 // the message cell's layout dims the cell when its message is marked.
 // ============================================================================
-
-static NSMutableSet<NSString *> *g_markedDeleted = nil;
 
 static NSString *max_primaryKeyOfMessage(id message) {
     if (!message) return nil;
