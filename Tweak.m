@@ -47,7 +47,6 @@
 #import <objc/message.h>
 
 static BOOL max_pkIsApproved(NSString *s);   // defined in the keep-deleted section
-static BOOL max_ghostPaused(void);           // defined in the keep-deleted section
 
 // ============================================================================
 #pragma mark - Swizzle helpers
@@ -1043,34 +1042,23 @@ static IMP max_modOrig(Class cls, SEL sel) {
 }
 
 static id max_hook_read2(id self, SEL _cmd, id a, id b) {
-    if (max_modOn(@"mod.read") && !max_ghostPaused()) return nil;   // don't send the receipt
+    if (max_modOn(@"mod.read")) return nil;   // don't send the receipt
     IMP o = max_modOrig(object_getClass(self), _cmd);
     return o ? ((id(*)(id,SEL,id,id))o)(self, _cmd, a, b) : nil;
 }
 
 static void max_hook_void2(id self, SEL _cmd, id a, id b) {
     NSString *n = NSStringFromSelector(_cmd);
-    if ([n hasPrefix:@"_handleDeletedMessages"] && max_modOn(@"mod.del") && !max_ghostPaused()) {
-        // The event fans out to every device/account. When it carries a pk
-        // we JUST approved (own delete-for-all confirmation), let it apply —
-        // otherwise our other logged-in accounts keep the "deleted" message.
-        NSArray *items = [a isKindOfClass:[NSArray class]] ? a : (a ? @[a] : @[]);
-        for (id item in items) {
-            NSString *pk = nil;
-            if ([item respondsToSelector:@selector(primaryKey)]) {
-                pk = [NSString stringWithFormat:@"%@",
-                       ((id(*)(id,SEL))objc_msgSend)(item, @selector(primaryKey))];
-            } else if (item) {
-                pk = [NSString stringWithFormat:@"%@", item];
-            }
-            if (pk && max_pkIsApproved(pk)) {
-                maxlog(@"ghost: own-delete confirmation passed through (pk %@)", pk);
-                IMP o = max_modOrig(object_getClass(self), _cmd);
-                if (o) ((void(*)(id,SEL,id,id))o)(self, _cmd, a, b);
-                return;
-            }
-        }
-        maxlog(@"ghost: remote deletion event suppressed");
+    if ([n hasPrefix:@"_handleDeletedMessages"] && max_modOn(@"mod.del")) {
+        // v9.0: the mass-ghost suppression here breaks the SECOND account on
+        // the same device (its own confirmation events get eaten -> the task
+        // queue never completes -> crash loop). The 2-arg delete handler
+        // now runs NATIVE always; keeping remote-deleted messages is handled
+        // by the OKMMessage.deleted flag hook + the marked-set dim instead.
+        // (This hook stays installed only for logging.)
+        maxlog(@"ghost: 2-arg delete handler NATIVE (v9.0)");
+        IMP o = max_modOrig(object_getClass(self), _cmd);
+        if (o) ((void(*)(id,SEL,id,id))o)(self, _cmd, a, b);
         return;
     }
     IMP o = max_modOrig(object_getClass(self), _cmd);
@@ -1078,32 +1066,21 @@ static void max_hook_void2(id self, SEL _cmd, id a, id b) {
 }
 
 static void max_hook_void1(id self, SEL _cmd, id a) {
-    if (!max_ghostPaused()) {
-        NSString *n = NSStringFromSelector(_cmd);
-        if ([n hasPrefix:@"sendTyping"] && max_modOn(@"mod.typing")) return;
-        if (([n hasPrefix:@"updateOnline"] || [n isEqualToString:@"userOnlineStatus:"])
-            && max_modOn(@"mod.online")) return;
-    }
+    NSString *n = NSStringFromSelector(_cmd);
+    if ([n hasPrefix:@"sendTyping"] && max_modOn(@"mod.typing")) return;
+    if (([n hasPrefix:@"updateOnline"] || [n isEqualToString:@"userOnlineStatus:"])
+        && max_modOn(@"mod.online")) return;
     IMP o = max_modOrig(object_getClass(self), _cmd);
     if (o) ((void(*)(id,SEL,id))o)(self, _cmd, a);
 }
 
 static void max_hook_void0(id self, SEL _cmd) {
     NSString *n = NSStringFromSelector(_cmd);
-    if (max_ghostPaused()) {
-        // during the pause every 0-arg hook runs native
-    } else if ([n hasPrefix:@"sendTyping"] && max_modOn(@"mod.typing")) return;
-    else if ([n hasPrefix:@"updateOnline"] && max_modOn(@"mod.online")) return;
-    if ([n isEqualToString:@"_handleDeletedMessages"] && max_modOn(@"mod.del")) {
-        // v8.5 HYPOTHESIS TEST: this 0-arg variant is part of the service
-        // registry's signal chain — blindly suppressing it may freeze the
-        // task queue (delete tasks register but never run). Pass it through
-        // WITH logging; the 2-arg variant (the real remote-delete handler)
-        // still suppresses foreign deletions.
-        maxlog(@"ghost: 0-arg _handleDeletedMessages PASSED (%@)",
-               NSStringFromClass([self class]));
-        // fall through to the original below
-    }
+    if ([n hasPrefix:@"sendTyping"] && max_modOn(@"mod.typing")) return;
+    if ([n hasPrefix:@"updateOnline"] && max_modOn(@"mod.online")) return;
+    // v9.0: _handleDeletedMessages (0-arg) runs native — it is never called
+    // in this build anyway (v8.5 log), and suppression experiments only
+    // caused crashes.
     IMP o = max_modOrig(object_getClass(self), _cmd);
     if (o) ((void(*)(id,SEL))o)(self, _cmd);
 }
@@ -1141,27 +1118,6 @@ static BOOL max_pkIsApproved(NSString *s) {
     }
     return YES;
 }
-
-// v8.6 "ghost pause": right after a delete is approved, ALL ghost hooks run
-// native for a short window — if the task queue needs one of the events we
-// suppress (online-status/typing/read/deleted-events) to fire the task, the
-// server command goes out during this window.
-static NSDate *g_ghostPauseUntil = nil;
-
-static void max_beginGhostPause(void) {
-    g_ghostPauseUntil = [NSDate dateWithTimeIntervalSinceNow:15.0];
-    maxlog(@"ghost: PAUSED for 15s (delete approved — native flow)");
-}
-
-static BOOL max_ghostPaused(void) {
-    if (!g_ghostPauseUntil) return NO;
-    if (-[g_ghostPauseUntil timeIntervalSinceNow] <= 0) {
-        g_ghostPauseUntil = nil;
-        return NO;
-    }
-    return YES;
-}
-
 
 // ============================================================================
 #pragma mark - Keep-deleted: block "delete for everyone" at the chat service
@@ -1251,7 +1207,6 @@ static BOOL max_deletePksShouldPass(NSArray *pks, BOOL consume) {
         if (max_pkInSet(pk, g_markedDeleted)) { anyMarked = YES; }
     }
     if (anyApproved) {
-        max_beginGhostPause();                      // v8.6: native window for the queue
         return YES;                                // let the whole chain through
     }
     if (anyMarked) {
@@ -1639,7 +1594,6 @@ static void hook_deleteMessageCtx(id self, SEL _cmd, id message, id context) {
             // alive across several invocations)
             if (!g_approvedDeletePks) g_approvedDeletePks = [NSMutableDictionary new];
             g_approvedDeletePks[pk] = [NSDate date];
-            max_beginGhostPause();
             maxlog(@"keep-deleted: message %@ really deleted (2nd delete, approved 30s)", pk);
         }
     }
@@ -2050,7 +2004,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v8.9 loading (precond/performWork return-value fix)...");
+    maxlog(@"v9.0 loading (crash fix: native delete handlers, no ghost-pause)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -2169,5 +2123,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v8.9 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v9.0 loaded OK — log file: %@", max_logPath());
 }
