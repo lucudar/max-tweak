@@ -1,5 +1,5 @@
 /**
- * MAXMods v8.4 — «Потужно Мессенджер»: delete task registration/precondition trace,
+ * MAXMods v8.5 — «Потужно Мессенджер»: 0-arg _handleDeletedMessages passes through (queue-freeze hypothesis),
  * indexPath-based dim, settings view pruning
  * (menu above the bubble, reliable tap-outside dismissal)
  * + file logging (Documents/maxmods_log.txt, visible in the Files app)
@@ -1090,8 +1090,14 @@ static void max_hook_void0(id self, SEL _cmd) {
     if ([n hasPrefix:@"sendTyping"] && max_modOn(@"mod.typing")) return;
     if ([n hasPrefix:@"updateOnline"] && max_modOn(@"mod.online")) return;
     if ([n isEqualToString:@"_handleDeletedMessages"] && max_modOn(@"mod.del")) {
-        maxlog(@"ghost: suppressed incoming deletion event");
-        return;
+        // v8.5 HYPOTHESIS TEST: this 0-arg variant is part of the service
+        // registry's signal chain — blindly suppressing it may freeze the
+        // task queue (delete tasks register but never run). Pass it through
+        // WITH logging; the 2-arg variant (the real remote-delete handler)
+        // still suppresses foreign deletions.
+        maxlog(@"ghost: 0-arg _handleDeletedMessages PASSED (%@)",
+               NSStringFromClass([self class]));
+        // fall through to the original below
     }
     IMP o = max_modOrig(object_getClass(self), _cmd);
     if (o) ((void(*)(id,SEL))o)(self, _cmd);
@@ -1924,7 +1930,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v8.4 loading (task registration/precondition trace)...");
+    maxlog(@"v8.5 loading (0-arg delete handler pass-through test)...");
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -2042,5 +2048,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v8.4 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v8.5 loaded OK — log file: %@", max_logPath());
 }
