@@ -1124,6 +1124,7 @@ static BOOL max_pksContainMarked(NSArray *pks) {
     return NO;
 }
 
+__attribute__((unused))
 static NSArray *max_unmarkPks(NSArray *pks) {
     NSMutableArray *out = [NSMutableArray array];
     for (id pk in pks) {
