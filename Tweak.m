@@ -1057,11 +1057,37 @@ static void max_settingsPruneViews(UIView *view, int depth) {
 }
 
 static void max_installSettingsViewPruner(void) {
-    // hook viewDidAppear: on every SettingsUI view controller class we can find
+    // v10.1: prune any SettingsUI screen that becomes visible — not just
+    // window roots (settings open as pushed/ presenting controllers, so the
+    // old root-only check never fired on them).
     maxlog(@"settings-view-pruner: window observer installed");
 
-    // simpler + universal: observe the key window's VC changes via a
-    // repeating light check — the screens re-prune on every appearance
+    static void (^pruneAll)(void);
+    pruneAll = ^{
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            UIViewController *top = w.rootViewController;
+            // climb to the topmost presented controller
+            while (top.presentedViewController) top = top.presentedViewController;
+            // walk the whole presented stack + all children
+            NSMutableArray *stack = [NSMutableArray arrayWithObject:top];
+            while (stack.count) {
+                UIViewController *vc = stack.lastObject;
+                [stack removeLastObject];
+                NSString *cls = NSStringFromClass(vc.class);
+                if ([cls rangeOfString:@"Settings"
+                        options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                    maxlog(@"settings-screen: %@ visible — pruning", cls);
+                    max_settingsPruneViews(vc.view, 0);
+                    dispatch_after(
+                        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                        dispatch_get_main_queue(),
+                        ^{ max_settingsPruneViews(vc.view, 0); });
+                }
+                [stack addObjectsFromArray:vc.childViewControllers];
+            }
+        }
+    };
+
     [[NSNotificationCenter defaultCenter]
         addObserverForName:UIWindowDidBecomeVisibleNotification
                     object:nil
@@ -1069,33 +1095,29 @@ static void max_installSettingsViewPruner(void) {
                 usingBlock:^(NSNotification *note) {
         UIWindow *w = note.object;
         if (![w isKindOfClass:[UIWindow class]]) return;
-        UIViewController *root = w.rootViewController;
-        if (!root) return;
-        NSString *cls = NSStringFromClass(root.class);
-        if ([cls rangeOfString:@"SettingsUI" options:NSCaseInsensitiveSearch].location != NSNotFound) {
-            maxlog(@"settings-screen(root): %@ visible", cls);
-            max_settingsPruneViews(root.view, 0);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ max_settingsPruneViews(root.view, 0); });
-        }
+        pruneAll();
     }];
+
+    // screens are usually pushed without a new window: re-prune every 5s
+    // for the first 2 minutes (cheap tree walk; catches settings opened
+    // after launch without a window event)
+    __block int ticks = 24;
+    dispatch_block_t tick = ^{
+        if (ticks-- <= 0) return;
+        pruneAll();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), tick);
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), tick);
 }
 
 // ============================================================================
-#pragma mark - Ghost mode / keep-deleted hooks (switch-controlled)
+#pragma mark - Ghost mode hook (switch-controlled)
 //
-// Ported from the old Mods.dylib v6 (mods_v6.c), but WITHOUT its two fatal
-// mistakes: no mass-swizzle of _deleteMessage:context: (that broke message
-// deletion), and no default-on blocking of the app's own delete flow.
-// Only privacy selectors are hooked, discovered per-class at startup.
-//
-// Switches live in NSUserDefaults and are toggled from the Моды tab:
+// v10.0: the ONLY privacy switch left. Switches live in NSUserDefaults and
+// are toggled from the Моды tab:
 //   mod.read    — don't send read receipts      (block markAsReadTo:messageId:)
-//   mod.typing  — don't send typing indicators  (block sendTyping*)
-//   mod.online  — always appear offline         (block updateOnline*)
-//   mod.del     — keep remotely deleted messages visible (block
-//                 _handleDeletedMessages, the INCOMING-deletion handler —
-//                 the user's own deletes are untouched)
 // ============================================================================
 
 static BOOL max_modOn(NSString *key) {
@@ -2321,7 +2343,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v10.0 loading (native deletes, read-receipt blocker only, menu overlay)...");
+    maxlog(@"v10.1 loading (settings pruner v2: all screens, deeper stack walk)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2437,5 +2459,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v10.0 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v10.1 loaded OK — log file: %@", max_logPath());
 }
