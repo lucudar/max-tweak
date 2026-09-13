@@ -1054,11 +1054,25 @@ static void max_settingsPruneViews(UIView *view, int depth) {
                     while (p && ![p isKindOfClass:[UICollectionView class]]
                               && ![p isKindOfClass:[UITableView class]])
                         p = p.superview;
-                    if (p) maxlog(@"settings-host: %@", NSStringFromClass(p.class));
+                    if (p) {
+                        maxlog(@"settings-host: %@ layout=%@",
+                               NSStringFromClass(p.class),
+                               NSStringFromClass([p valueForKeyPath:
+                                   @"collectionViewLayout.class"] ?: nil));
+                    }
                     break;
                 }
                 cursor = cursor.superview;
             }
+        }
+    }
+    // v10.6 diagnostics: the Gosuslugi block never shows up as a UILabel —
+    // dump any CATextLayer strings too, so we can see its real text source
+    if (g_settingsDumpBudget > 0 && [view isKindOfClass:objc_getClass("CATextLayer")]) {
+        id s = [view valueForKeyPath:@"string"];
+        if ([s isKindOfClass:[NSString class]] && ((NSString *)s).length > 1) {
+            g_settingsDumpBudget--;
+            maxlog(@"labels-dump[CATextLayer]: '%@'", s);
         }
     }
     for (UIView *sub in view.subviews)
@@ -1159,37 +1173,46 @@ static BOOL max_layoutOnSettingsScreen(UICollectionViewLayout *layout) {
     }
 }
 
-static IMP orig_layoutAttrsForElements = NULL;
+static NSMutableDictionary *g_layoutOrigMap = nil;   // Class -> NSValue(IMP)
 
 static id hook_layoutAttrsForElements(id self, SEL _cmd, CGRect rect) {
-    NSArray *result = ((id(*)(id,SEL,CGRect))orig_layoutAttrsForElements)
-        (self, _cmd, rect);
+    NSArray *result = nil;
+    @synchronized (g_layoutOrigMap) {
+        NSValue *v = g_layoutOrigMap[object_getClass(self)];
+        if (!v) {
+            // unknown class: call through the base implementation pointer
+            // stored under the base-class key
+            v = g_layoutOrigMap[[UICollectionViewLayout class]];
+        }
+        IMP orig = v ? (IMP)v.pointerValue : NULL;
+        if (orig) result = ((id(*)(id,SEL,CGRect))orig)(self, _cmd, rect);
+    }
     if (![result isKindOfClass:[NSArray class]] || result.count == 0)
         return result;
     if (!max_layoutOnSettingsScreen((UICollectionViewLayout *)self))
         return result;
     @try {
+        // v10.6: match junk by visible-cell FRAMES — cellForItemAtIndexPath
+        // returns nil mid-layout, which is why v10.5 never dropped anything
+        UICollectionView *cv = ((UICollectionView *(*)(id,SEL))objc_msgSend)
+            (self, sel_registerName("collectionView"));
+        if (!cv) return result;
+        NSMutableSet<NSValue *> *junkFrames = [NSMutableSet set];
+        for (UICollectionViewCell *cell in cv.visibleCells)
+            if (max_viewContainsJunkLabel(cell, 0))
+                [junkFrames addObject:[NSValue valueWithCGRect:cell.frame]];
+        if (junkFrames.count == 0) return result;
         NSMutableArray *kept = [NSMutableArray arrayWithCapacity:result.count];
         NSUInteger dropped = 0;
         for (UICollectionViewLayoutAttributes *attr in result) {
-            // map attributes -> cell (visible cells only; offscreen cells
-            // have no view yet and can't be text-matched — fine, they get
-            // filtered once scrolled in)
-            UIView *cell = nil;
-            if (attr.representedElementCategory == UICollectionElementCategoryCell) {
-                NSIndexPath *ip = attr.indexPath;
-                UICollectionView *cv = ((UICollectionView *(*)(id,SEL))objc_msgSend)
-                    (self, sel_registerName("collectionView"));
-                if (cv) cell = [cv cellForItemAtIndexPath:ip];
-            }
-            if (cell && max_viewContainsJunkLabel(cell, 0)) {
-                dropped++;
-                continue;
-            }
-            [kept addObject:attr];
+            BOOL isJunk = NO;
+            for (NSValue *v in junkFrames)
+                if (CGRectEqualToRect(v.CGRectValue, attr.frame)) { isJunk = YES; break; }
+            if (isJunk) dropped++; else [kept addObject:attr];
         }
         if (dropped > 0) {
-            maxlog(@"settings-collapse: layout dropped %lu junk cell(s)", (unsigned long)dropped);
+            maxlog(@"settings-collapse: layout dropped %lu junk cell(s)",
+                   (unsigned long)dropped);
             return kept;
         }
     } @catch (NSException *e) {
@@ -1198,16 +1221,52 @@ static id hook_layoutAttrsForElements(id self, SEL _cmd, CGRect rect) {
     return result;
 }
 
-static void max_installLayoutFilterHook(void) {
-    Method m = class_getInstanceMethod([UICollectionViewLayout class],
+static void max_layoutHookClass(Class c) {
+    Method m = class_getInstanceMethod(c,
         @selector(layoutAttributesForElementsInRect:));
-    if (m) {
-        orig_layoutAttrsForElements = method_getImplementation(m);
-        method_setImplementation(m, (IMP)hook_layoutAttrsForElements);
-        maxlog(@"settings-collapse: layoutAttributesForElementsInRect hooked");
-    } else {
-        maxlog(@"settings-collapse: layout method not found");
+    if (!m) return;
+    IMP cur = method_getImplementation(m);
+    if (cur == (IMP)hook_layoutAttrsForElements) return;   // already hooked
+    if (!g_layoutOrigMap) g_layoutOrigMap = [NSMutableDictionary new];
+    @synchronized (g_layoutOrigMap) {
+        g_layoutOrigMap[c] = [NSValue valueWithPointer:cur];
     }
+    method_setImplementation(m, (IMP)hook_layoutAttrsForElements);
+    maxlog(@"settings-collapse: hooked %@", NSStringFromClass(c));
+}
+
+static void max_installLayoutFilterHook(void) {
+    // hook the base class, then every UICollectionViewLayout subclass that
+    // has its OWN override (a subclass override would otherwise bypass us —
+    // compositional layouts do override this method)
+    max_layoutHookClass([UICollectionViewLayout class]);
+    unsigned int n = 0;
+    Class *classes = objc_copyClassList(&n);
+    int hooked = 0;
+    for (unsigned i = 0; i < n; i++) {
+        Class c = classes[i];
+        if (c == [UICollectionViewLayout class]) continue;
+        Class s = class_getSuperclass(c);
+        BOOL isDirectLayoutSubclass = NO;
+        for (int d = 0; d < 8 && s; d++) {
+            if (s == [UICollectionViewLayout class]) { isDirectLayoutSubclass = (d == 0); break; }
+            s = class_getSuperclass(s);
+        }
+        if (!isDirectLayoutSubclass) continue;
+        // only classes that DECLARE their own implementation
+        unsigned int mc = 0;
+        Method *ml = class_copyMethodList(c, &mc);
+        BOOL declares = NO;
+        for (unsigned j = 0; j < mc; j++)
+            if (method_getName(ml[j]) == @selector(layoutAttributesForElementsInRect:))
+                { declares = YES; break; }
+        free(ml);
+        if (!declares) continue;
+        max_layoutHookClass(c);
+        hooked++;
+    }
+    free(classes);
+    maxlog(@"settings-collapse: %d layout subclass(es) hooked", hooked);
 }
 
 static void max_installSettingsViewPruner(void) {
@@ -1226,16 +1285,24 @@ static void max_installSettingsViewPruner(void) {
                 // climb to the topmost presented controller
                 while (top.presentedViewController) top = top.presentedViewController;
                 // walk the whole presented stack + all children
+                // v10.6: walk with a "descendant of Settings" flag — prune the
+                // Settings VC itself AND everything below it in the child tree
+                // (the Gosuslugi block may live in a child VC whose class name
+                // does not contain "Settings"), but never anything outside it
                 NSMutableArray *stack = [NSMutableArray array];
-                if (top) [stack addObject:top];
+                if (top) [stack addObject:@[top, @NO]];
                 while (stack.count) {
-                    UIViewController *vc = stack.lastObject;
+                    NSArray *entry = stack.lastObject;
                     [stack removeLastObject];
+                    UIViewController *vc = entry[0];
+                    BOOL underSettings = [entry[1] boolValue];
                     if (!vc) continue;
                     NSString *cls = NSStringFromClass(vc.class);
-                    if ([cls rangeOfString:@"Settings"
-                            options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                        maxlog(@"settings-screen: %@ visible — pruning", cls);
+                    BOOL isSettings = [cls rangeOfString:@"Settings"
+                            options:NSCaseInsensitiveSearch].location != NSNotFound;
+                    if (isSettings || underSettings) {
+                        if (isSettings)
+                            maxlog(@"settings-screen: %@ visible — pruning", cls);
                         max_settingsPruneViews(vc.view, 0);
                         dispatch_after(
                             dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
@@ -1243,7 +1310,8 @@ static void max_installSettingsViewPruner(void) {
                             ^{ max_settingsPruneViews(vc.view, 0); });
                     }
                     for (UIViewController *child in vc.childViewControllers)
-                        if (child) [stack addObject:child];
+                        if (child) [stack addObject:@[child,
+                            @(isSettings || underSettings)]];
                 }
             }
         } @catch (NSException *e) {
@@ -2507,7 +2575,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v10.5 loading (layout-level junk filter + attributedText in junk check)...");
+    maxlog(@"v10.6 loading (layout subclass hooks + frame matching + deep dump)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2625,5 +2693,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v10.5 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v10.6 loaded OK — log file: %@", max_logPath());
 }
