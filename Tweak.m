@@ -1007,6 +1007,7 @@ static BOOL max_settingsTitleIsJunk(NSString *title) {
     dispatch_once(&once, ^{
         junk = @[
             @"Госуслуг", @"Gosuslugi", @"Единый вход",
+            @"Цифровой ID", @"Digital ID",   // settings row (router/tab already blocked)
             @"Вернуть уведомления",
             @"Пригласить друзей", @"Invite Friends",
             @"Устройства", @"Devices",
@@ -2353,7 +2354,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v10.2 loading (pruner nil-root crash fix)...");
+    maxlog(@"v10.3 loading (hide Цифровой ID settings row)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2469,5 +2470,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v10.2 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v10.3 loaded OK — log file: %@", max_logPath());
 }
