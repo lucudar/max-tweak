@@ -1175,6 +1175,8 @@ static BOOL max_layoutOnSettingsScreen(UICollectionViewLayout *layout) {
 
 static NSMutableDictionary *g_layoutOrigMap = nil;   // Class -> NSValue(IMP)
 
+static CGSize hook_collectionViewContentSize(id self, SEL _cmd);   // below
+
 static id hook_layoutAttrsForElements(id self, SEL _cmd, CGRect rect) {
     NSArray *result = nil;
     @synchronized (g_layoutOrigMap) {
