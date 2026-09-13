@@ -1178,11 +1178,11 @@ static NSMutableDictionary *g_layoutOrigMap = nil;   // Class -> NSValue(IMP)
 static id hook_layoutAttrsForElements(id self, SEL _cmd, CGRect rect) {
     NSArray *result = nil;
     @synchronized (g_layoutOrigMap) {
-        NSValue *v = g_layoutOrigMap[object_getClass(self)];
+        NSValue *v = g_layoutOrigMap[NSStringFromClass(object_getClass(self))];
         if (!v) {
             // unknown class: call through the base implementation pointer
             // stored under the base-class key
-            v = g_layoutOrigMap[[UICollectionViewLayout class]];
+            v = g_layoutOrigMap[NSStringFromClass([UICollectionViewLayout class])];
         }
         IMP orig = v ? (IMP)v.pointerValue : NULL;
         if (orig) result = ((id(*)(id,SEL,CGRect))orig)(self, _cmd, rect);
@@ -1229,7 +1229,7 @@ static void max_layoutHookClass(Class c) {
     if (cur == (IMP)hook_layoutAttrsForElements) return;   // already hooked
     if (!g_layoutOrigMap) g_layoutOrigMap = [NSMutableDictionary new];
     @synchronized (g_layoutOrigMap) {
-        g_layoutOrigMap[c] = [NSValue valueWithPointer:cur];
+        g_layoutOrigMap[NSStringFromClass(c)] = [NSValue valueWithPointer:cur];
     }
     method_setImplementation(m, (IMP)hook_layoutAttrsForElements);
     maxlog(@"settings-collapse: hooked %@", NSStringFromClass(c));
