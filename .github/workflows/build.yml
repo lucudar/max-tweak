@@ -53,8 +53,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION="1.1.$(git rev-list --count HEAD)"
-          gh release delete "v${VERSION}" --yes 2>/dev/null || true
-          gh release create "v${VERSION}" MAXMods.dylib \
-            --title "MAXMods v${VERSION}" \
-            --notes "Auto-build from $(git log -1 --format='%h %s')"
+          # unique per-run tag (actions/checkout is shallow, rev-list is
+          # unreliable — old "v1.1.$(rev-list --count)" always collided)
+          VERSION="v1.1.${{ github.run_number }}-$(git rev-parse --short HEAD)"
+          gh release create "${VERSION}" MAXMods.dylib \
+            --title "MAXMods ${VERSION}" \
+            --notes "Auto-build from $(git log -1 --format='%h %s')" \
+            --latest
