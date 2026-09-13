@@ -278,6 +278,8 @@ static void flattenMenu(UIMenuElement *element, NSMutableArray<UIAction *> *out)
 // If the app freezes, the LAST "before" marker names the method that hung.
 // ============================================================================
 
+static BOOL max_modOn(NSString *key);   // defined in the mods section below
+
 static IMP orig_willDisplayMenu = NULL;
 static IMP orig_willEndMenu = NULL;
 static IMP orig_previewHighlight = NULL;
