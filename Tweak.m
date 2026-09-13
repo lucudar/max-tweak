@@ -819,6 +819,60 @@ static id max_hookEmptyArrayRet(id self, SEL _cmd) {
     return @[];
 }
 
+// ============================================================================
+#pragma mark - Brand icons: runtime substitution of every MAX logo (v12.0)
+//
+// The in-app MAX logos (chat header, auth screens, about page) live inside
+// binary Assets.car archives that can't be rebuilt off-macOS. Instead we
+// hook +[UIImage imageNamed:] and swap every MAX-brand asset for our own
+// Potuzhno icon, loaded once from the app bundle (Files/ dir of the .app).
+// ============================================================================
+
+static IMP orig_imageNamed = NULL;
+static NSMutableDictionary<NSString *, UIImage *> *g_brandIcons = nil;
+
+static UIImage *max_brandIconFor(NSString *name) {
+    if (!g_brandIcons) return nil;
+    for (NSString *key in g_brandIcons)
+        if ([name rangeOfString:key options:NSCaseInsensitiveSearch].location != NSNotFound)
+            return g_brandIcons[key];
+    return nil;
+}
+
+static id hook_imageNamed(id self, SEL _cmd, NSString *name) {
+    if (name.length > 0) {
+        @try {
+            UIImage *sub = max_brandIconFor(name);
+            if (sub) return sub;
+        } @catch (NSException *e) {}
+    }
+    return ((id(*)(id,SEL,id))orig_imageNamed)(self, _cmd, name);
+}
+
+static void max_installBrandIcons(void) {
+    // source image: our icon shipped in the app bundle root
+    NSString *path = [[[NSBundle mainBundle] bundlePath]
+        stringByAppendingPathComponent:@"AppIcon60x60@2x.png"];
+    UIImage *icon = [UIImage imageWithContentsOfFile:path];
+    if (!icon) {
+        maxlog(@"brand-icons: source AppIcon60x60@2x.png not found in bundle");
+        return;
+    }
+    g_brandIcons = [NSMutableDictionary new];
+    // every MAX-brand asset name found in the Resources Assets.car dump
+    NSArray *names = @[
+        @"max_logo_title", @"max_solid_themed", @"logo_54px",
+        @"app_icon", @"max.svg",
+    ];
+    for (NSString *n in names) g_brandIcons[n] = icon;
+    Method m = class_getClassMethod([UIImage class], @selector(imageNamed:));
+    if (!m) { maxlog(@"brand-icons: imageNamed: not found"); return; }
+    orig_imageNamed = method_getImplementation(m);
+    method_setImplementation(m, (IMP)hook_imageNamed);
+    maxlog(@"brand-icons: substituted %lu MAX asset name(s)",
+           (unsigned long)g_brandIcons.count);
+}
+
 static void max_installAdBlocker(void) {
     // direct class hooks — each of these exists in the app binary
     struct {
@@ -2824,7 +2878,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v11.4 loading (mic & camera off: plist keys removed + record/capture hooks killed)...");
+    maxlog(@"v12.0 loading (new icon + in-app MAX logos substituted at runtime)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2864,6 +2918,7 @@ static void maxmods_init(void) {
 
     // 3) Ads & junk blocker: promo banners, informer banners, suggested
     //    chats, myTarget ad id — all neutralized.
+    max_installBrandIcons();
     max_installAdBlocker();
 
     // 4) Feature pruning: stories / Digital ID / mini-apps / channels,
@@ -2945,5 +3000,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v11.4 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v12.0 loaded OK — log file: %@", max_logPath());
 }
