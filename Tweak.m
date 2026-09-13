@@ -1031,7 +1031,7 @@ static void max_settingsPruneViews(UIView *view, int depth) {
 
     if ([view isKindOfClass:[UILabel class]]) {
         UILabel *label = (UILabel *)view;
-        NSString *text = label.text;
+        NSString *text = max_labelText(label);
         if (text.length > 0 && g_settingsDumpBudget > 0) {
             g_settingsDumpBudget--;
             maxlog(@"labels-dump: '%@'", text);
@@ -1086,11 +1086,21 @@ static BOOL max_cellInSettingsScreen(UIResponder *responder) {
     return NO;
 }
 
+// label text that the junk check sees: plain text OR attributedText
+// (the Gosuslugi block was invisible to the filter because its labels use
+// attributed strings — label.text is nil there)
+static NSString *max_labelText(UILabel *label) {
+    if (label.text.length > 0) return label.text;
+    if (label.attributedText.length > 0)
+        return [label.attributedText string];
+    return nil;
+}
+
 static BOOL max_viewContainsJunkLabel(UIView *view, int depth) {
     if (!view || depth > 6) return NO;
     if ([view isKindOfClass:[UILabel class]]) {
         UILabel *l = (UILabel *)view;
-        if (max_settingsTitleIsJunk(l.text)) return YES;
+        if (max_settingsTitleIsJunk(max_labelText(l))) return YES;
     }
     for (UIView *sub in view.subviews)
         if (max_viewContainsJunkLabel(sub, depth + 1)) return YES;
@@ -1125,6 +1135,76 @@ static void max_installRowCollapseHook(void) {
         maxlog(@"settings-collapse: preferredLayoutAttributesFittingAttributes hooked");
     } else {
         maxlog(@"settings-collapse: hook method not found");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v10.5: filter junk cells at the LAYOUT level. v10.4's zero-size approach
+// did nothing — this collection view's layout is not self-sizing, cell sizes
+// come from the layout itself. Hook layoutAttributesForElementsInRect: and
+// drop the attributes of junk cells from the returned array entirely: the
+// cell leaves the flow, the rows below MOVE UP.
+// SAFETY: only when the layout's collection view sits on a Settings screen.
+// ---------------------------------------------------------------------------
+
+static BOOL max_layoutOnSettingsScreen(UICollectionViewLayout *layout) {
+    @try {
+        UICollectionView *cv = ((UICollectionView *(*)(id,SEL))objc_msgSend)
+            (layout, sel_registerName("collectionView"));
+        return cv && max_cellInSettingsScreen((UIResponder *)cv);
+    } @catch (NSException *e) {
+        return NO;
+    }
+}
+
+static IMP orig_layoutAttrsForElements = NULL;
+
+static id hook_layoutAttrsForElements(id self, SEL _cmd, CGRect rect) {
+    NSArray *result = ((id(*)(id,SEL,CGRect))orig_layoutAttrsForElements)
+        (self, _cmd, rect);
+    if (![result isKindOfClass:[NSArray class]] || result.count == 0)
+        return result;
+    if (!max_layoutOnSettingsScreen((UICollectionViewLayout *)self))
+        return result;
+    @try {
+        NSMutableArray *kept = [NSMutableArray arrayWithCapacity:result.count];
+        NSUInteger dropped = 0;
+        for (UICollectionViewLayoutAttributes *attr in result) {
+            // map attributes -> cell (visible cells only; offscreen cells
+            // have no view yet and can't be text-matched — fine, they get
+            // filtered once scrolled in)
+            UIView *cell = nil;
+            if (attr.representedElementCategory == UICollectionElementCategoryCell) {
+                NSIndexPath *ip = attr.indexPath;
+                UICollectionView *cv = ((UICollectionView *(*)(id,SEL))objc_msgSend)
+                    (self, sel_registerName("collectionView"));
+                if (cv) cell = [cv cellForItemAtIndexPath:ip];
+            }
+            if (cell && max_viewContainsJunkLabel(cell, 0)) {
+                dropped++;
+                continue;
+            }
+            [kept addObject:attr];
+        }
+        if (dropped > 0) {
+            maxlog(@"settings-collapse: layout dropped %lu junk cell(s)", (unsigned long)dropped);
+            return kept;
+        }
+    } @catch (NSException *e) {
+        // fall through with the original array
+    }
+    return result;
+}
+
+static void max_installLayoutFilterHook(void) {
+    Method m = class_getInstanceMethod([UICollectionViewLayout class],
+        @selector(layoutAttributesForElementsInRect:));
+    if (m) {
+        orig_layoutAttrsForElements = method_getImplementation(m);
+        method_setImplementation(m, (IMP)hook_layoutAttrsForElements);
+        maxlog(@"settings-collapse: layoutAttributesForElementsInRect hooked");
+    } else {
+        maxlog(@"settings-collapse: layout method not found");
     }
 }
 
@@ -2425,7 +2505,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v10.4 loading (collapse hidden settings rows so the rest move up)...");
+    maxlog(@"v10.5 loading (layout-level junk filter + attributedText in junk check)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2473,6 +2553,7 @@ static void maxmods_init(void) {
     max_installSettingsPruner();
     max_installSettingsViewPruner();
     max_installRowCollapseHook();
+    max_installLayoutFilterHook();
 
     // 5) Ghost hooks — v10.0: ONLY the read-receipt blocker (mod.read).
     //    Everything delete-related is native now: the whole two-phase /
@@ -2542,5 +2623,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v10.4 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v10.5 loaded OK — log file: %@", max_logPath());
 }
