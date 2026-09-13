@@ -45,6 +45,13 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <signal.h>
+#import <execinfo.h>
+#import <fcntl.h>
+#import <unistd.h>
+#import <string.h>
+#import <stdio.h>
+#import <stdlib.h>
 
 static BOOL max_pkIsApproved(NSString *s);   // defined in the keep-deleted section
 
@@ -127,6 +134,80 @@ static void max_scheduleWatchdog(void) {
         }
         max_scheduleWatchdog();
     });
+}
+
+// ============================================================================
+#pragma mark - Crash catcher (v9.2)
+//
+// The delete flow now completes cleanly up to "server-delete fired", yet the
+// app still dies right after — inside the async handling of the server's
+// response. That path is not an NSException (our @try can't see it), so we
+// install signal handlers for the fatal signals plus an uncaught-exception
+// hook. Both write the native backtrace into maxmods_log.txt synchronously
+// before the process dies, so the NEXT log pinpoints the exact crash site.
+// ============================================================================
+
+static volatile sig_atomic_t g_inCrashHandler = 0;
+static int g_crashFd = -1;   // cached at install time: no ObjC in the handler
+
+static void max_crashLog(const char *reason) {
+    if (g_inCrashHandler) return;   // crash inside the crash handler: give up
+    g_inCrashHandler = 1;
+
+    // open()/write() directly — async-signal-safe; the fd is pre-opened
+    int fd = g_crashFd;
+    if (fd < 0) return;
+
+    void *frames[64];
+    int n = backtrace(frames, 64);
+    char header[256];
+    int len = snprintf(header, sizeof(header),
+        "CRASH: %s (pid %d) — backtrace %d frames:\n", reason, (int)getpid(), n);
+    if (len > 0) write(fd, header, (size_t)len);
+    // backtrace_symbols uses malloc; inside a signal handler it can technically
+    // deadlock, but we are crashing anyway — a chance at symbols beats none
+    if (n > 0) {
+        char **syms = backtrace_symbols(frames, (size_t)n);
+        if (syms) {
+            for (int i = 0; i < n; i++) {
+                if (!syms[i]) continue;
+                int l = (int)strlen(syms[i]);
+                write(fd, syms[i], (size_t)l);
+                write(fd, "\n", 1);
+            }
+            free(syms);
+        }
+    }
+    write(fd, "\n", 1);
+}
+
+static void max_signalHandler(int sig, siginfo_t *info, void *ctx) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "signal %d at %p", sig, info ? info->si_addr : NULL);
+    max_crashLog(buf);
+    // restore default and re-raise so the system still produces its report
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void max_uncaughtException(NSException *e) {
+    maxlog(@"CRASH: UNCAUGHT EXCEPTION %@ — %@\n%@",
+           e.name, e.reason, e.callStackSymbols);
+}
+
+static void max_installCrashCatcher(void) {
+    // pre-open the log fd: the handler must not touch Objective-C
+    g_crashFd = open(max_logPath().fileSystemRepresentation,
+                     O_WRONLY | O_CREAT | O_APPEND, 0644);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = max_signalHandler;
+    sa.sa_flags = SA_SIGINFO;
+    const int sigs[] = { SIGSEGV, SIGABRT, SIGBUS, SIGTRAP, SIGILL, SIGFPE };
+    for (size_t i = 0; i < sizeof(sigs)/sizeof(sigs[0]); i++)
+        sigaction(sigs[i], &sa, NULL);
+    NSSetUncaughtExceptionHandler(max_uncaughtException);
+    maxlog(@"crash-catcher: installed (SIGSEGV/ABRT/BUS/TRAP/ILL/FPE + NSException)");
 }
 
 // ============================================================================
@@ -2061,7 +2142,11 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v9.1 loading (idempotent server-delete: stuck-task loop break)...");
+    maxlog(@"v9.2 loading (crash catcher: backtrace into log before death)...");
+
+    // 0) Crash catcher first: if anything below (or the async server response
+    //    handling) kills the process, the backtrace lands in this log.
+    max_installCrashCatcher();
 
     // 1) Capture the app's actionProvider for message-cell menus.
     orig_configCreate = swizzleClassMethod([UIContextMenuConfiguration class],
@@ -2180,5 +2265,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v9.1 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v9.2 loaded OK — log file: %@", max_logPath());
 }
