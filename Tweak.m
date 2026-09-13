@@ -1010,7 +1010,7 @@ static BOOL max_settingsTitleIsJunk(NSString *title) {
             @"Цифровой ID", @"Digital ID",   // settings row (router/tab already blocked)
             @"Вернуть уведомления",
             @"Пригласить друзей", @"Invite Friends",
-            @"Устройства", @"Devices",
+            @"Устройства", @"Devices", @"Devices With", @"Sign in on new devices",
             @"Папк",                       // Папки/Папка
             @"Экономия батареи", @"Power and Data",
             @"Память", @"Storage",
@@ -2575,7 +2575,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v10.6 loading (layout subclass hooks + frame matching + deep dump)...");
+    maxlog(@"v10.7 loading (English junk titles: Devices With MAX, Sign in on new devices)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2693,5 +2693,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v10.6 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v10.7 loaded OK — log file: %@", max_logPath());
 }
