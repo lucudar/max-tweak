@@ -1101,15 +1101,16 @@ static void max_installSettingsViewPruner(void) {
     // screens are usually pushed without a new window: re-prune every 5s
     // for the first 2 minutes (cheap tree walk; catches settings opened
     // after launch without a window event)
-    __block int ticks = 24;
-    dispatch_block_t tick = ^{
-        if (ticks-- <= 0) return;
+    static __weak void (^g_pruneTick)(int);
+    void (^tick)(int) = ^(int remaining) {
+        if (remaining <= 0) return;
         pruneAll();
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), tick);
+                       dispatch_get_main_queue(), ^{ g_pruneTick(remaining - 1); });
     };
+    g_pruneTick = tick;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), tick);
+                   dispatch_get_main_queue(), ^{ tick(24); });
 }
 
 // ============================================================================
