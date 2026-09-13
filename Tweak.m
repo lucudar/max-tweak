@@ -947,6 +947,46 @@ static void max_installFeaturePruner(void) {
         { "MRMainTracker", "trackDeeplinkURL:", (IMP)max_hookVoid1 },
         { "MRMainTracker", "flushWithCompletionBlock:", (IMP)max_hookVoid1 },
         { "MRMainTracker", "setupWithTrackerId:", (IMP)max_hookVoid1 },
+        // v11.3 audit: MREventTracker is a SECOND tracker implementation
+        // (launch/install/update events) that bypassed MRMainTracker entirely
+        { "MREventTracker", "trackLaunchEvent", (IMP)max_hookVoid0 },
+        { "MREventTracker", "trackInstallEvent:", (IMP)max_hookVoid1 },
+        { "MREventTracker", "trackUpdateEvent:oldBuild:newVersion:newBuild:", (IMP)max_hookIdRetNil },
+        { "MREventTracker", "trackCustomEvent:params:", (IMP)max_hookIdRetNil },
+        { "MREventTracker", "trackDeeplinkEvent:clickId:", (IMP)max_hookIdRetNil },
+        { "MREventTracker", "trackInviteEvent", (IMP)max_hookVoid0 },
+        { "MREventTracker", "flushIfNeeded:", (IMP)max_hookVoid1 },
+        // the actual network send of tracker events
+        { "MRMyTrackerService", "sendEventData:completion:", (IMP)max_hookVoid2 },
+        // v11.3 audit: OKMStatisticsService aggregates EVERYTHING (screens,
+        // settings, stickers, video, search, webapps, qr, permissions...) and
+        // ships it to the server — silence every didLog* entry point
+        { "OKMStatisticsService", "webAppStatService:didLogEvent:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "webAppStatService:didLogBridgeEvent:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "videoRateStatService:didLogEvent:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "videoMessagesStatService:didLogEvent:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "stickerStatService:didLogEvent:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "shareToMaxStatService:didLogEvent:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "settingsStatService:didLogEvent:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "qrAuthStatService:didLogEvent:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "messageActionsStatService:didLogEvent:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "mediaMessageTranscriptStatService:didLogEvent:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "permissionsStatService:didLogPermissionChange:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "permissionsStatService:didLogStatus:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "screensStatsService:didLogScreenWith:time:sessionId:didUpdateSessionId:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "logCallReviewEventWithCallReviewData:rating:reasons:", (IMP)max_hookVoid3 },
+        { "OKMStatisticsService", "logFPSStat", (IMP)max_hookVoid0 },
+        { "OKMStatisticsService", "logMainThreadHangs", (IMP)max_hookVoid0 },
+        { "OKMStatisticsService", "logPlayerStatsEvent", (IMP)max_hookVoid0 },
+        { "OKMStatisticsService", "sendAudioStats", (IMP)max_hookVoid0 },
+        { "OKMStatisticsService", "sendInfo", (IMP)max_hookVoid0 },
+        { "OKMStatisticsService", "logNetworkEntryWithType:command:responseTime:bytesSent:bytesReceived:error:retry:value:contents:", (IMP)max_hookIdRetNil },
+        // v11.3 audit: push notification stats (replies, opens by push, VoIP)
+        { "OKMPushStatsService", "trackPushReply:", (IMP)max_hookVoid1 },
+        { "OKMPushStatsService", "trackPushDoNotDisturb:", (IMP)max_hookVoid1 },
+        { "OKMPushStatsService", "trackChatOpenByPush", (IMP)max_hookVoid0 },
+        { "OKMPushStatsService", "trackChatURLByPush", (IMP)max_hookVoid0 },
+        { "OKMPushStatsService", "trackReceiveVoIPPush:receiveTime:", (IMP)max_hookIdRetNil },
         // message-view stats the server doesn't need
         { "OKMChatHandler", "sendStatsForMessageIds:", (IMP)max_hookIdRetNil },
         { "OKMChatHandler", "sendStatsForMessageIds:chatId:", (IMP)max_hookVoid2 },
@@ -2759,7 +2799,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v11.2 loading (system-menu hang diagnostics: mod.sysmenu toggle + phase tracing)...");
+    maxlog(@"v11.3 loading (full tracker purge: MREventTracker, OKMStatisticsService, push stats)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2880,5 +2920,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v11.2 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v11.3 loaded OK — log file: %@", max_logPath());
 }
