@@ -1026,6 +1026,8 @@ static BOOL max_settingsTitleIsJunk(NSString *title) {
 
 static int g_settingsDumpBudget = 40;   // log the first N labels once
 
+static NSString *max_labelText(UILabel *label);   // defined in the v10.5 section below
+
 static void max_settingsPruneViews(UIView *view, int depth) {
     if (!view || depth > 10) return;
 
