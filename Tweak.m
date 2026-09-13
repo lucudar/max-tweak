@@ -997,6 +997,31 @@ static void max_installFeaturePruner(void) {
           (IMP)max_hookBoolNo },
         // v11.1: CALLS OFF — chat-only messenger
         { "OKMUserSettings", "showCallsTab", (IMP)max_hookBoolNo },
+        // v11.4: MICROPHONE & CAMERA OFF COMPLETELY. The Info.plist usage
+        // keys are removed at repack time (iOS auto-denies any access), and
+        // these hooks kill the record/capture entry points so nothing even
+        // tries to start. Voice messages are simply unavailable.
+        { "OKMAudioRecorderService",
+          "audioRecorderStartWithMaxDuration:bitrate:sampleRate:callbackKey:",
+          (IMP)max_hookIdRetNil },
+        { "_TtC22OMAudioRecorderService22OMAudioRecorderService",
+          "audioRecorderStartWithMaxDuration:bitrate:sampleRate:callbackKey:",
+          (IMP)max_hookVoid0 },
+        { "OKMAudioService",
+          "audioRecorderStartWithMaxDuration:bitrate:sampleRate:callbackKey:",
+          (IMP)max_hookIdRetNil },
+        { "OKMAudioService",
+          "_startRecordingMaxDuration:callbackKey:completion:error:",
+          (IMP)max_hookIdRetNil },
+        { "_TtC20OMLegacyChatSwiftKit11OMChatInput",
+          "startRecordingWithIsLongTap:", (IMP)max_hookVoid0 },
+        { "OMChatSendoutViewModel", "startRecording", (IMP)max_hookVoid0 },
+        { "OKMAudioRecorderService", "isRecordingAudio", (IMP)max_hookBoolRetNo },
+        { "OKMAudioService", "isRecordingAudio", (IMP)max_hookBoolRetNo },
+        // QR scanner camera (the only direct camera consumer left)
+        { "_TtC8OMCamera15OMCameraFactory",
+          "makeQRCodeScannerCameraWithDescriptionMessage:isTorchEnabled:screenStatsType:screenStatsEventSource:scannerType:delegate:requestPermissionInSettingsAction:openGalleryAction:detectedValueHandler:",
+          (IMP)max_hookIdRetNil },
     };
     for (NSUInteger i = 0; i < sizeof(hooks)/sizeof(hooks[0]); i++) {
         Class cls = objc_getClass(hooks[i].cls);
@@ -2799,7 +2824,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v11.3 loading (full tracker purge: MREventTracker, OKMStatisticsService, push stats)...");
+    maxlog(@"v11.4 loading (mic & camera off: plist keys removed + record/capture hooks killed)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2920,5 +2945,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v11.3 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v11.4 loaded OK — log file: %@", max_logPath());
 }
