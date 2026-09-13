@@ -792,6 +792,9 @@ static BOOL max_hookBoolNo(id self, SEL _cmd) { (void)self; (void)_cmd; return N
 static void max_hookVoid3(id self, SEL _cmd, id a, id b, id c) {
     (void)self; (void)_cmd; (void)a; (void)b; (void)c;
 }
+static void max_hookVoid2(id self, SEL _cmd, id a, id b) {
+    (void)self; (void)_cmd; (void)a; (void)b;
+}
 static void max_hookVoid1(id self, SEL _cmd, id a) { (void)self; (void)_cmd; (void)a; }
 static void max_hookVoid0(id self, SEL _cmd) { (void)self; (void)_cmd; }
 
@@ -848,6 +851,28 @@ static void max_installFeaturePruner(void) {
         { "OKMRouter", "showFolderAddChat:", (IMP)max_hookVoid1 },
         { "OKMRouter", "showInviteFriends", (IMP)max_hookVoid0 },
         { "OKMRouter", "showCacheSettings", (IMP)max_hookVoid0 },
+        // v11.1: KILL THE TRACKERS AT RUNTIME. The static binary patches
+        // (build_mods_v6.py) already neuter setup, but belt-and-suspenders:
+        // even if anything re-initializes MyTracker, it can never send.
+        // (nil-returning hooks are used where the dump suggests an object
+        // return — nil is safe for void callers too)
+        { "MRMainTracker", "trackEventWithName:eventParams:", (IMP)max_hookIdRetNil },
+        { "MRMainTracker", "trackLoginEvent:withVkConnectId:params:", (IMP)max_hookIdRetNil },
+        { "MRMainTracker", "trackRegistrationEvent:withVkConnectId:params:", (IMP)max_hookIdRetNil },
+        { "MRMainTracker", "trackInviteEventWithParams:", (IMP)max_hookVoid0 },
+        { "MRMainTracker", "trackDeeplinkURL:", (IMP)max_hookVoid1 },
+        { "MRMainTracker", "flushWithCompletionBlock:", (IMP)max_hookVoid1 },
+        { "MRMainTracker", "setupWithTrackerId:", (IMP)max_hookVoid1 },
+        // message-view stats the server doesn't need
+        { "OKMChatHandler", "sendStatsForMessageIds:", (IMP)max_hookIdRetNil },
+        { "OKMChatHandler", "sendStatsForMessageIds:chatId:", (IMP)max_hookVoid2 },
+        // tracker location writer: never write any location
+        { "MRLocationInfoWriter", "writeImpl:auxiliaryProtoData:", (IMP)max_hookIdRetNil },
+        // master switch off even if config storage is re-read at runtime
+        { "_TtC23OKMAppMessengerProtocol18OMPMSConfigStorage", "myTrackerEnabled",
+          (IMP)max_hookBoolNo },
+        // v11.1: CALLS OFF — chat-only messenger
+        { "OKMUserSettings", "showCallsTab", (IMP)max_hookBoolNo },
     };
     for (NSUInteger i = 0; i < sizeof(hooks)/sizeof(hooks[0]); i++) {
         Class cls = objc_getClass(hooks[i].cls);
@@ -2648,7 +2673,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v11.0 loading (settings rows stay, features cut: router blocks Devices/Folders/Invite/Cache)...");
+    maxlog(@"v11.1 loading (chat-only: MyTracker runtime kill, message stats off, geo off, calls off)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2763,5 +2788,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v11.0 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v11.1 loaded OK — log file: %@", max_logPath());
 }
