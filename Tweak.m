@@ -1064,27 +1064,36 @@ static void max_installSettingsViewPruner(void) {
 
     static void (^pruneAll)(void);
     pruneAll = ^{
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            UIViewController *top = w.rootViewController;
-            // climb to the topmost presented controller
-            while (top.presentedViewController) top = top.presentedViewController;
-            // walk the whole presented stack + all children
-            NSMutableArray *stack = [NSMutableArray arrayWithObject:top];
-            while (stack.count) {
-                UIViewController *vc = stack.lastObject;
-                [stack removeLastObject];
-                NSString *cls = NSStringFromClass(vc.class);
-                if ([cls rangeOfString:@"Settings"
-                        options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                    maxlog(@"settings-screen: %@ visible — pruning", cls);
-                    max_settingsPruneViews(vc.view, 0);
-                    dispatch_after(
-                        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                        dispatch_get_main_queue(),
-                        ^{ max_settingsPruneViews(vc.view, 0); });
+        @try {
+            for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                if (![w isKindOfClass:[UIWindow class]]) continue;
+                UIViewController *top = w.rootViewController;
+                if (!top) continue;   // status-bar/alert windows: no root yet
+                // climb to the topmost presented controller
+                while (top.presentedViewController) top = top.presentedViewController;
+                // walk the whole presented stack + all children
+                NSMutableArray *stack = [NSMutableArray array];
+                if (top) [stack addObject:top];
+                while (stack.count) {
+                    UIViewController *vc = stack.lastObject;
+                    [stack removeLastObject];
+                    if (!vc) continue;
+                    NSString *cls = NSStringFromClass(vc.class);
+                    if ([cls rangeOfString:@"Settings"
+                            options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                        maxlog(@"settings-screen: %@ visible — pruning", cls);
+                        max_settingsPruneViews(vc.view, 0);
+                        dispatch_after(
+                            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                            dispatch_get_main_queue(),
+                            ^{ max_settingsPruneViews(vc.view, 0); });
+                    }
+                    for (UIViewController *child in vc.childViewControllers)
+                        if (child) [stack addObject:child];
                 }
-                [stack addObjectsFromArray:vc.childViewControllers];
             }
+        } @catch (NSException *e) {
+            maxlog(@"settings-prune: window walk error %@", e);
         }
     };
 
@@ -2344,7 +2353,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v10.1 loading (settings pruner v2: all screens, deeper stack walk)...");
+    maxlog(@"v10.2 loading (pruner nil-root crash fix)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2460,5 +2469,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v10.1 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v10.2 loaded OK — log file: %@", max_logPath());
 }
