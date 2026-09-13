@@ -1047,6 +1047,12 @@ static void max_settingsPruneViews(UIView *view, int depth) {
                     [UIView animateWithDuration:0.15 animations:^{
                         cursor.alpha = 0.0;
                     }];
+                    // v10.4 diagnostics: which list type hosts the cell
+                    UIView *p = cursor.superview;
+                    while (p && ![p isKindOfClass:[UICollectionView class]]
+                              && ![p isKindOfClass:[UITableView class]])
+                        p = p.superview;
+                    if (p) maxlog(@"settings-host: %@", NSStringFromClass(p.class));
                     break;
                 }
                 cursor = cursor.superview;
@@ -1055,6 +1061,71 @@ static void max_settingsPruneViews(UIView *view, int depth) {
     }
     for (UIView *sub in view.subviews)
         max_settingsPruneViews(sub, depth + 1);
+}
+
+// ---------------------------------------------------------------------------
+// v10.4: collapse hidden rows so the remaining ones MOVE UP. Hiding a cell's
+// content still reserves layout space (the user saw empty gaps). For self-
+// sizing collection cells, zeroing the preferred layout attributes makes the
+// row collapse to zero height entirely.
+// SAFETY: only applied to cells whose responder chain contains a view
+// controller with "Settings" in its class name — a chat message containing
+// e.g. "папка" must never collapse a bubble (lesson of the v7.5 mass-dim).
+// ---------------------------------------------------------------------------
+
+static BOOL max_cellInSettingsScreen(UIResponder *responder) {
+    UIResponder *r = responder;
+    for (int i = 0; i < 25 && r; i++) {
+        if ([r isKindOfClass:[UIViewController class]]) {
+            NSString *cls = NSStringFromClass(r.class);
+            if ([cls rangeOfString:@"Settings" options:NSCaseInsensitiveSearch].location != NSNotFound)
+                return YES;
+        }
+        r = r.nextResponder;
+    }
+    return NO;
+}
+
+static BOOL max_viewContainsJunkLabel(UIView *view, int depth) {
+    if (!view || depth > 6) return NO;
+    if ([view isKindOfClass:[UILabel class]]) {
+        UILabel *l = (UILabel *)view;
+        if (max_settingsTitleIsJunk(l.text)) return YES;
+    }
+    for (UIView *sub in view.subviews)
+        if (max_viewContainsJunkLabel(sub, depth + 1)) return YES;
+    return NO;
+}
+
+static IMP orig_preferredLayoutAttrs = NULL;
+
+static id hook_preferredLayoutAttrs(id self, SEL _cmd, id attrs) {
+    id result = ((id(*)(id,SEL,id))orig_preferredLayoutAttrs)(self, _cmd, attrs);
+    if (!result) return result;
+    @try {
+        if (max_cellInSettingsScreen((UIResponder *)self) &&
+            max_viewContainsJunkLabel((UIView *)self, 0)) {
+            ((void(*)(id,SEL,CGRect))objc_msgSend)
+                (result, sel_registerName("setFrame:"), CGRectZero);
+            ((void(*)(id,SEL,BOOL))objc_msgSend)
+                (self, sel_registerName("setHidden:"), YES);
+        }
+    } @catch (NSException *e) {
+        // never let the collapse hook kill layout
+    }
+    return result;
+}
+
+static void max_installRowCollapseHook(void) {
+    Method m = class_getInstanceMethod([UICollectionViewCell class],
+        @selector(preferredLayoutAttributesFittingAttributes:));
+    if (m) {
+        orig_preferredLayoutAttrs = method_getImplementation(m);
+        method_setImplementation(m, (IMP)hook_preferredLayoutAttrs);
+        maxlog(@"settings-collapse: preferredLayoutAttributesFittingAttributes hooked");
+    } else {
+        maxlog(@"settings-collapse: hook method not found");
+    }
 }
 
 static void max_installSettingsViewPruner(void) {
@@ -2354,7 +2425,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v10.3 loading (hide Цифровой ID settings row)...");
+    maxlog(@"v10.4 loading (collapse hidden settings rows so the rest move up)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2401,6 +2472,7 @@ static void maxmods_init(void) {
     max_installFeaturePruner();
     max_installSettingsPruner();
     max_installSettingsViewPruner();
+    max_installRowCollapseHook();
 
     // 5) Ghost hooks — v10.0: ONLY the read-receipt blocker (mod.read).
     //    Everything delete-related is native now: the whole two-phase /
@@ -2470,5 +2542,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v10.3 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v10.4 loaded OK — log file: %@", max_logPath());
 }
