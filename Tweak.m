@@ -1539,6 +1539,108 @@ static void max_installTasksServiceTrace(void) {
     }
 }
 
+// ============================================================================
+#pragma mark - Remote-delete path tracing (v9.4)
+//
+// The user reports remotely deleted messages now DISAPPEAR (v9.0 made the
+// 2-arg _handleDeletedMessages handler native, and that selector turned out
+// to live only on OKMPushCleanupHelper — push cleanup, not history). The
+// real incoming-delete path in this build is:
+//   OKMMessageDeleteListener._messagesDeleted:inChat:
+//   OKMMessageDeleteListener._delayedMessagesDeleted:
+//   OKMChatService.deleteLocallyMessagesWithIds:updateChat:
+// and OKMMessage itself has NO "deleted" property — only "status"
+// (setStatus:), so the server may also flag deletion via a status update.
+// v9.4 = pure tracing (everything runs native, nothing is blocked): the next
+// log tells us exactly which path removes the message, then v9.5 blocks it.
+// ============================================================================
+
+static IMP orig_messagesDeletedInChat = NULL;
+static IMP orig_delayedMessagesDeleted = NULL;
+static IMP orig_deleteLocallyIds = NULL;
+static IMP orig_setMessageStatus = NULL;
+
+static NSString *max_idsDesc(id ids) {
+    if ([ids isKindOfClass:[NSArray class]])
+        return [ids componentsJoinedByString:@","];
+    return [NSString stringWithFormat:@"%@", ids];
+}
+
+static void hook_messagesDeletedInChat(id self, SEL _cmd, id a, id b) {
+    maxlog(@"REMOTE-DEL: OKMMessageDeleteListener._messagesDeleted:inChat: ids=%@ chat=%@",
+           max_idsDesc(a), b);
+    ((void(*)(id,SEL,id,id))orig_messagesDeletedInChat)(self, _cmd, a, b);
+}
+
+static void hook_delayedMessagesDeleted(id self, SEL _cmd, id a) {
+    maxlog(@"REMOTE-DEL: OKMMessageDeleteListener._delayedMessagesDeleted: %@",
+           max_idsDesc(a));
+    ((void(*)(id,SEL,id))orig_delayedMessagesDeleted)(self, _cmd, a);
+}
+
+static void hook_deleteLocallyIds(id self, SEL _cmd, id ids, BOOL updateChat) {
+    maxlog(@"REMOTE-DEL: OKMChatService.deleteLocallyMessagesWithIds:updateChat: ids=%@ updateChat=%d",
+           max_idsDesc(ids), (int)updateChat);
+    ((void(*)(id,SEL,id,BOOL))orig_deleteLocallyIds)(self, _cmd, ids, updateChat);
+}
+
+static void hook_setMessageStatus(id self, SEL _cmd, long long status) {
+    maxlog(@"REMOTE-DEL: OKMMessage.setStatus: %lld (pk=%@)",
+           status, max_pkOfMessage(self));
+    ((void(*)(id,SEL,long long))orig_setMessageStatus)(self, _cmd, status);
+}
+
+static void max_installRemoteDeleteTrace(void) {
+    Class listener = objc_getClass("OKMMessageDeleteListener");
+    if (listener) {
+        struct { SEL sel; IMP *orig; IMP hook; } hooks[] = {
+            { @selector(_messagesDeleted:inChat:),
+              &orig_messagesDeletedInChat, (IMP)hook_messagesDeletedInChat },
+            { @selector(_delayedMessagesDeleted:),
+              &orig_delayedMessagesDeleted, (IMP)hook_delayedMessagesDeleted },
+        };
+        for (NSUInteger i = 0; i < sizeof(hooks)/sizeof(hooks[0]); i++) {
+            Method m = class_getInstanceMethod(listener, hooks[i].sel);
+            if (!m) {
+                maxlog(@"REMOTE-DEL: listener method not found: %@",
+                       NSStringFromSelector(hooks[i].sel));
+                continue;
+            }
+            *hooks[i].orig = method_getImplementation(m);
+            method_setImplementation(m, hooks[i].hook);
+            maxlog(@"REMOTE-DEL: trace hook on OKMMessageDeleteListener -> %@",
+                   NSStringFromSelector(hooks[i].sel));
+        }
+    } else {
+        maxlog(@"REMOTE-DEL: OKMMessageDeleteListener class not found");
+    }
+
+    Class svc = objc_getClass("OKMChatService");
+    if (svc) {
+        Method m = class_getInstanceMethod(svc,
+            @selector(deleteLocallyMessagesWithIds:updateChat:));
+        if (m) {
+            orig_deleteLocallyIds = method_getImplementation(m);
+            method_setImplementation(m, (IMP)hook_deleteLocallyIds);
+            maxlog(@"REMOTE-DEL: trace hook on OKMChatService -> deleteLocallyMessagesWithIds:updateChat:");
+        } else {
+            maxlog(@"REMOTE-DEL: deleteLocallyMessagesWithIds not found");
+        }
+    }
+
+    Class msg = objc_getClass("OKMMessage");
+    if (msg) {
+        Method m = class_getInstanceMethod(msg, @selector(setStatus:));
+        if (m) {
+            orig_setMessageStatus = method_getImplementation(m);
+            method_setImplementation(m, (IMP)hook_setMessageStatus);
+            maxlog(@"REMOTE-DEL: trace hook on OKMMessage -> setStatus:");
+        } else {
+            maxlog(@"REMOTE-DEL: OKMMessage.setStatus: not found");
+        }
+    }
+}
+
 static void max_installDeleteForAllHook(void) {
     {
         Class svc = objc_getClass("OKMChatService");
@@ -2160,7 +2262,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v9.3 loading (sendDeleteCommand returns RACSignal: void-return crash fix)...");
+    maxlog(@"v9.4 loading (remote-delete path tracing)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2211,6 +2313,7 @@ static void maxmods_init(void) {
     // 5) Ghost mode + keep-deleted hooks (switch-controlled, Моды tab).
     max_installGhostHooks();
     max_installDeletedFlagHook();
+    max_installRemoteDeleteTrace();
     max_installDeleteForAllHook();
     max_installTasksServiceTrace();
     max_installKeepDeletedHook();
@@ -2283,5 +2386,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v9.3 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v9.4 loaded OK — log file: %@", max_logPath());
 }
