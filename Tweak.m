@@ -839,6 +839,15 @@ static void max_installFeaturePruner(void) {
           (IMP)max_hookVoid0 },
         { "_TtC13ContactListUI13WeakRefRouter", "openCreateChannel",
           (IMP)max_hookVoid0 },
+        // v11.0: settings rows stay visible, but the FEATURES behind them are
+        // dead — tapping does nothing. (The view-level row hiding / layout
+        // surgery was reverted at the user's request: not worth the gaps.)
+        { "OKMRouter", "showDevicesSettings", (IMP)max_hookVoid0 },
+        { "OKMRouter", "showFolders", (IMP)max_hookVoid0 },
+        { "OKMRouter", "showFoldersSettings", (IMP)max_hookVoid0 },
+        { "OKMRouter", "showFolderAddChat:", (IMP)max_hookVoid1 },
+        { "OKMRouter", "showInviteFriends", (IMP)max_hookVoid0 },
+        { "OKMRouter", "showCacheSettings", (IMP)max_hookVoid0 },
     };
     for (NSUInteger i = 0; i < sizeof(hooks)/sizeof(hooks[0]); i++) {
         Class cls = objc_getClass(hooks[i].cls);
@@ -989,6 +998,7 @@ static void max_installSettingsPruner(void) {
 }
 
 // ============================================================================
+#if 0  // v11.0: view-level settings pruning + layout surgery REMOVED (user decision: cut features, not rows)
 #pragma mark - Settings junk: view-level pruning + title dump
 //
 // The settings screens are pure Swift (SettingsUI SourceModels) — no ObjC
@@ -1407,6 +1417,7 @@ static void max_installSettingsViewPruner(void) {
 }
 
 // ============================================================================
+#endif  // end removed settings-view machinery
 #pragma mark - Ghost mode hook (switch-controlled)
 //
 // v10.0: the ONLY privacy switch left. Switches live in NSUserDefaults and
@@ -2637,7 +2648,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v10.8 loading (shift rows UP instead of dropping: squash junk, move the rest)...");
+    maxlog(@"v11.0 loading (settings rows stay, features cut: router blocks Devices/Folders/Invite/Cache)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2683,9 +2694,6 @@ static void maxmods_init(void) {
     //    plus junk rows on the settings screens.
     max_installFeaturePruner();
     max_installSettingsPruner();
-    max_installSettingsViewPruner();
-    max_installRowCollapseHook();
-    max_installLayoutFilterHook();
 
     // 5) Ghost hooks — v10.0: ONLY the read-receipt blocker (mod.read).
     //    Everything delete-related is native now: the whole two-phase /
@@ -2755,5 +2763,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v10.8 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v11.0 loaded OK — log file: %@", max_logPath());
 }
