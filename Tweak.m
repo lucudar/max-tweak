@@ -1567,6 +1567,16 @@ static NSString *max_idsDesc(id ids) {
 }
 
 static void hook_messagesDeletedInChat(id self, SEL _cmd, id a, id b) {
+    // v9.5: this is the INCOMING remote-delete event (a contact deleted the
+    // message). With mod.del ON we swallow it entirely: the message keeps its
+    // current status, stays in the DB and in the history, and we mark it for
+    // dimming like our own two-phase deletes. Own-delete confirmations are
+    // never routed here (own path goes through the approved delete-svc chain).
+    if (max_modOn(@"mod.del")) {
+        maxlog(@"REMOTE-DEL: _messagesDeleted:inChat: SUPPRESSED ids=%@ chat=%@ (keeping message)",
+               max_idsDesc(a), b);
+        return;
+    }
     maxlog(@"REMOTE-DEL: OKMMessageDeleteListener._messagesDeleted:inChat: ids=%@ chat=%@",
            max_idsDesc(a), b);
     ((void(*)(id,SEL,id,id))orig_messagesDeletedInChat)(self, _cmd, a, b);
@@ -1585,8 +1595,21 @@ static void hook_deleteLocallyIds(id self, SEL _cmd, id ids, BOOL updateChat) {
 }
 
 static void hook_setMessageStatus(id self, SEL _cmd, long long status) {
-    maxlog(@"REMOTE-DEL: OKMMessage.setStatus: %lld (pk=%@)",
-           status, max_pkOfMessage(self));
+    // v9.5: deletion arrives as status 2 (confirmed by trace: every remote
+    // delete event is immediately followed by setStatus:2 on that message,
+    // and deleteLocallyMessagesWithIds: is never called). With mod.del ON we
+    // block status 2 — but only for messages NOT approved by our own
+    // two-phase delete (own deletes legitimately mark status 2 as well).
+    if (status == 2 && max_modOn(@"mod.del")) {
+        NSString *pk = max_pkOfMessage(self);
+        if (!max_pkIsApproved(pk)) {
+            maxlog(@"REMOTE-DEL: setStatus: 2 BLOCKED (pk=%@) — message stays visible", pk);
+            return;
+        }
+        maxlog(@"REMOTE-DEL: setStatus: 2 allowed (own-delete approval active, pk=%@)", pk);
+        ((void(*)(id,SEL,long long))orig_setMessageStatus)(self, _cmd, status);
+        return;
+    }
     ((void(*)(id,SEL,long long))orig_setMessageStatus)(self, _cmd, status);
 }
 
@@ -2262,7 +2285,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v9.4 loading (remote-delete path tracing)...");
+    maxlog(@"v9.5 loading (keep remote-deleted: suppress _messagesDeleted + block status 2)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2386,5 +2409,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v9.4 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v9.5 loaded OK — log file: %@", max_logPath());
 }
