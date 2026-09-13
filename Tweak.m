@@ -980,15 +980,9 @@ static void max_installFeaturePruner(void) {
           (IMP)max_hookVoid0 },
         { "_TtC13ContactListUI13WeakRefRouter", "openCreateChannel",
           (IMP)max_hookVoid0 },
-        // v11.0: settings rows stay visible, but the FEATURES behind them are
-        // dead — tapping does nothing. (The view-level row hiding / layout
-        // surgery was reverted at the user's request: not worth the gaps.)
-        { "OKMRouter", "showDevicesSettings", (IMP)max_hookVoid0 },
-        { "OKMRouter", "showFolders", (IMP)max_hookVoid0 },
-        { "OKMRouter", "showFoldersSettings", (IMP)max_hookVoid0 },
-        { "OKMRouter", "showFolderAddChat:", (IMP)max_hookVoid1 },
-        { "OKMRouter", "showInviteFriends", (IMP)max_hookVoid0 },
-        { "OKMRouter", "showCacheSettings", (IMP)max_hookVoid0 },
+        // v12.1: settings router blocks (Devices/Folders/Invite/Cache) were
+        // REMOVED at the user's request — those tabs work normally again.
+        // Only the super-app junk stays dead: Digital ID, mini-apps, channels.
         // v11.1: KILL THE TRACKERS AT RUNTIME. The static binary patches
         // (build_mods_v6.py) already neuter setup, but belt-and-suspenders:
         // even if anything re-initializes MyTracker, it can never send.
@@ -1008,8 +1002,7 @@ static void max_installFeaturePruner(void) {
         { "MREventTracker", "trackUpdateEvent:oldBuild:newVersion:newBuild:", (IMP)max_hookIdRetNil },
         { "MREventTracker", "trackCustomEvent:params:", (IMP)max_hookIdRetNil },
         { "MREventTracker", "trackDeeplinkEvent:clickId:", (IMP)max_hookIdRetNil },
-        { "MREventTracker", "trackInviteEvent", (IMP)max_hookVoid0 },
-        { "MREventTracker", "flushIfNeeded:", (IMP)max_hookVoid1 },
+                { "MREventTracker", "flushIfNeeded:", (IMP)max_hookVoid1 },
         // the actual network send of tracker events
         { "MRMyTrackerService", "sendEventData:completion:", (IMP)max_hookVoid2 },
         // v11.3 audit: OKMStatisticsService aggregates EVERYTHING (screens,
@@ -1029,17 +1022,28 @@ static void max_installFeaturePruner(void) {
         { "OKMStatisticsService", "permissionsStatService:didLogStatus:params:", (IMP)max_hookIdRetNil },
         { "OKMStatisticsService", "screensStatsService:didLogScreenWith:time:sessionId:didUpdateSessionId:params:", (IMP)max_hookIdRetNil },
         { "OKMStatisticsService", "logCallReviewEventWithCallReviewData:rating:reasons:", (IMP)max_hookVoid3 },
-        { "OKMStatisticsService", "logFPSStat", (IMP)max_hookVoid0 },
-        { "OKMStatisticsService", "logMainThreadHangs", (IMP)max_hookVoid0 },
-        { "OKMStatisticsService", "logPlayerStatsEvent", (IMP)max_hookVoid0 },
-        { "OKMStatisticsService", "sendAudioStats", (IMP)max_hookVoid0 },
-        { "OKMStatisticsService", "sendInfo", (IMP)max_hookVoid0 },
+        { "OKMStatisticsService", "logFPSStat:", (IMP)max_hookVoid1 },
+        { "OKMStatisticsService", "logMainThreadHangs:", (IMP)max_hookVoid1 },
+        { "OKMStatisticsService", "logPlayerStatsEvent:", (IMP)max_hookVoid1 },
+        { "OKMStatisticsService", "sendAudioStats:", (IMP)max_hookVoid1 },
+        { "OKMStatisticsService", "sendInfo:", (IMP)max_hookVoid1 },
         { "OKMStatisticsService", "logNetworkEntryWithType:command:responseTime:bytesSent:bytesReceived:error:retry:value:contents:", (IMP)max_hookIdRetNil },
+        // v12.1 audit: the remaining didLog* entry points
+        { "OKMStatisticsService", "inviteFriendsStatService:didLogEvent:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "inlineButtonClickStatService:didLogEvent:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "informerBannerStatService:didLogEvent:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "messagePresenceStatService:didLogEvent:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "chatProfileActionsStatsService:didLogEvent:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "channelRecSysFolderStatService:didLogEvent:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "callsStatService:didLogEvent:params:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "bannerTrackService:didLogBannerEvent:params:screenType:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "service:didLogAppStartSpans:source:", (IMP)max_hookIdRetNil },
+        { "OKMStatisticsService", "didLogTwiceSend", (IMP)max_hookVoid0 },
         // v11.3 audit: push notification stats (replies, opens by push, VoIP)
         { "OKMPushStatsService", "trackPushReply:", (IMP)max_hookVoid1 },
         { "OKMPushStatsService", "trackPushDoNotDisturb:", (IMP)max_hookVoid1 },
-        { "OKMPushStatsService", "trackChatOpenByPush", (IMP)max_hookVoid0 },
-        { "OKMPushStatsService", "trackChatURLByPush", (IMP)max_hookVoid0 },
+        { "OKMPushStatsService", "trackChatOpenByPush:", (IMP)max_hookVoid1 },
+        { "OKMPushStatsService", "trackChatURLByPush:", (IMP)max_hookVoid1 },
         { "OKMPushStatsService", "trackReceiveVoIPPush:receiveTime:", (IMP)max_hookIdRetNil },
         // message-view stats the server doesn't need
         { "OKMChatHandler", "sendStatsForMessageIds:", (IMP)max_hookIdRetNil },
@@ -2553,8 +2557,6 @@ typedef struct {
 static ModEntry max_modEntries[] = {
     { .title = @"Не отправлять «прочитано»", .key = @"mod.read",
       .subtitle = @"Собеседник не увидит, что вы прочитали сообщение" },
-    { .title = @"Системное меню (диагностика)", .key = @"mod.sysmenu",
-      .subtitle = @"Включить стоковое меню iOS для поимки зависания" },
 };
 static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntries[0]);
 
@@ -2878,7 +2880,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.0 loading (new icon + in-app MAX logos substituted at runtime)...");
+    maxlog(@"v12.1 FINAL loading (settings tabs restored, last 10 stat hooks, clean Mods tab)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -3000,5 +3002,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v12.0 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v12.1 loaded OK — log file: %@", max_logPath());
 }
