@@ -1347,7 +1347,13 @@ static NSString *max_pkOfMessage(id m) {
     return [NSString stringWithFormat:@"%@", m];
 }
 
-static void hook_sendDeleteCommand(id self, SEL _cmd, id messages) {
+// v9.3: this method RETURNS a RACSignal the caller subscribes to
+// (subscribeNext:error:completed:). The hook used to be void, so the caller
+// subscribed to the garbage left in x0 (the task itself) and crashed with
+// "unrecognized selector" on EVERY delete after the send — the send itself
+// was fine. On SKIP we return an immediately-completing RACSignal so the
+// stuck task finally finishes and is cleared from the persistent queue.
+static id hook_sendDeleteCommand(id self, SEL _cmd, id messages) {
     NSArray *items = [messages isKindOfClass:[NSArray class]]
         ? messages : (messages ? @[messages] : @[]);
 
@@ -1360,8 +1366,7 @@ static void hook_sendDeleteCommand(id self, SEL _cmd, id messages) {
            (unsigned long)items.count, [pks componentsJoinedByString:@","]);
 
     if (pks.count > 0 && max_modOn(@"mod.del")) {
-        // hmm: idempotency only makes sense while keep-deleted logic is on;
-        // check which pks were already sent
+        // idempotency: check which pks were already sent
         NSSet *sent = [NSSet setWithArray:
             [[NSUserDefaults standardUserDefaults] stringArrayForKey:kSentPksKey] ?: @[]];
         BOOL allSent = YES;
@@ -1371,14 +1376,26 @@ static void hook_sendDeleteCommand(id self, SEL _cmd, id messages) {
             // The server has nothing left to delete; re-sending gets an error
             // response whose handling crashes the app (stuck-task crash loop).
             maxlog(@"server-delete: SKIP - all pks already sent before (stuck task)");
-            return;
+            Class rac = objc_getClass("RACSignal");
+            if (rac) {
+                id empty = ((id(*)(id,SEL))objc_msgSend)(rac, sel_registerName("empty"));
+                if (empty) return empty;   // completes instantly -> task finishes
+            }
+            return nil;
         }
     }
 
+    id result = nil;
     @try {
-        ((void(*)(id,SEL,id))orig_sendDeleteCommand)(self, _cmd, messages);
+        result = ((id(*)(id,SEL,id))orig_sendDeleteCommand)(self, _cmd, messages);
     } @catch (NSException *e) {
         maxlog(@"server-delete: EXCEPTION in send: %@ - swallowed", e);
+        Class rac = objc_getClass("RACSignal");
+        if (rac) {
+            id empty = ((id(*)(id,SEL))objc_msgSend)(rac, sel_registerName("empty"));
+            if (empty) return empty;
+        }
+        return nil;
     }
 
     // record what we just sent (best effort; only while mod.del is on)
@@ -1395,6 +1412,7 @@ static void hook_sendDeleteCommand(id self, SEL _cmd, id messages) {
         }
         [[NSUserDefaults standardUserDefaults] setObject:sent forKey:kSentPksKey];
     }
+    return result;
 }
 
 static IMP orig_enqueueTasks = NULL;
@@ -2142,7 +2160,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v9.2 loading (crash catcher: backtrace into log before death)...");
+    maxlog(@"v9.3 loading (sendDeleteCommand returns RACSignal: void-return crash fix)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2265,5 +2283,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v9.2 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v9.3 loaded OK — log file: %@", max_logPath());
 }
