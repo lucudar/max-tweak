@@ -1197,24 +1197,45 @@ static id hook_layoutAttrsForElements(id self, SEL _cmd, CGRect rect) {
         UICollectionView *cv = ((UICollectionView *(*)(id,SEL))objc_msgSend)
             (self, sel_registerName("collectionView"));
         if (!cv) return result;
-        NSMutableSet<NSValue *> *junkFrames = [NSMutableSet set];
+        // v10.8: dropping attributes left GAPS — in a compositional layout
+        // each cell's position is computed independently, so removing one
+        // attr doesn't move the others. Instead: SHIFT every attribute that
+        // sits below a junk cell up by the junk height, and squash the junk
+        // attribute itself to zero height. Rows physically move up.
+        NSMutableArray *junkRects = [NSMutableArray array];
         for (UICollectionViewCell *cell in cv.visibleCells)
             if (max_viewContainsJunkLabel(cell, 0))
-                [junkFrames addObject:[NSValue valueWithCGRect:cell.frame]];
-        if (junkFrames.count == 0) return result;
-        NSMutableArray *kept = [NSMutableArray arrayWithCapacity:result.count];
-        NSUInteger dropped = 0;
+                [junkRects addObject:[NSValue valueWithCGRect:cell.frame]];
+        if (junkRects.count == 0) return result;
+        // sort junk rects top-to-bottom for deterministic shifting
+        [junkRects sortUsingComparator:^NSComparisonResult(NSValue *a, NSValue *b) {
+            CGFloat ay = a.CGRectValue.origin.y, by = b.CGRectValue.origin.y;
+            return ay < by ? NSOrderedAscending : (ay > by ? NSOrderedDescending : NSOrderedSame);
+        }];
+        NSUInteger squashed = 0;
         for (UICollectionViewLayoutAttributes *attr in result) {
+            CGRect f = attr.frame;
             BOOL isJunk = NO;
-            for (NSValue *v in junkFrames)
-                if (CGRectEqualToRect(v.CGRectValue, attr.frame)) { isJunk = YES; break; }
-            if (isJunk) dropped++; else [kept addObject:attr];
+            CGFloat shift = 0.0;
+            for (NSValue *v in junkRects) {
+                CGRect j = v.CGRectValue;
+                if (CGRectEqualToRect(j, f)) { isJunk = YES; continue; }
+                // attribute sits fully BELOW this junk row -> shift it up
+                if (f.origin.y >= j.origin.y + j.size.height - 1.0)
+                    shift += j.size.height;
+            }
+            if (isJunk) {
+                squashed++;
+                attr.frame = CGRectMake(f.origin.x, f.origin.y - shift,
+                                        f.size.width, 0.0);
+            } else if (shift > 0.0) {
+                attr.frame = CGRectMake(f.origin.x, f.origin.y - shift,
+                                        f.size.width, f.size.height);
+            }
         }
-        if (dropped > 0) {
-            maxlog(@"settings-collapse: layout dropped %lu junk cell(s)",
-                   (unsigned long)dropped);
-            return kept;
-        }
+        if (squashed > 0)
+            maxlog(@"settings-collapse: squashed %lu junk row(s), shifted the rest up",
+                   (unsigned long)squashed);
     } @catch (NSException *e) {
         // fall through with the original array
     }
@@ -1227,12 +1248,51 @@ static void max_layoutHookClass(Class c) {
     if (!m) return;
     IMP cur = method_getImplementation(m);
     if (cur == (IMP)hook_layoutAttrsForElements) return;   // already hooked
+    maxlog(@"settings-collapse: hooked %@", NSStringFromClass(c));
     if (!g_layoutOrigMap) g_layoutOrigMap = [NSMutableDictionary new];
     @synchronized (g_layoutOrigMap) {
         g_layoutOrigMap[NSStringFromClass(c)] = [NSValue valueWithPointer:cur];
     }
     method_setImplementation(m, (IMP)hook_layoutAttrsForElements);
-    maxlog(@"settings-collapse: hooked %@", NSStringFromClass(c));
+
+    // v10.8: also shrink the scrollable content size by the total junk
+    // height, otherwise the shifted-up rows leave dead space at the bottom
+    Method sz = class_getInstanceMethod(c, @selector(collectionViewContentSize));
+    if (sz && method_getImplementation(sz) != (IMP)hook_collectionViewContentSize) {
+        IMP curSz = method_getImplementation(sz);
+        @synchronized (g_layoutOrigMap) {
+            NSString *key = [@"size:" stringByAppendingString:NSStringFromClass(c)];
+            g_layoutOrigMap[key] = [NSValue valueWithPointer:curSz];
+        }
+        method_setImplementation(sz, (IMP)hook_collectionViewContentSize);
+    }
+}
+
+static CGSize hook_collectionViewContentSize(id self, SEL _cmd) {
+    CGSize size = CGSizeZero;
+    @synchronized (g_layoutOrigMap) {
+        NSValue *v = g_layoutOrigMap[[@"size:" stringByAppendingString:
+                                       NSStringFromClass(object_getClass(self))]];
+        if (!v) v = g_layoutOrigMap[[@"size:" stringByAppendingString:
+                                     NSStringFromClass([UICollectionViewLayout class])]];
+        IMP orig = v ? (IMP)v.pointerValue : NULL;
+        if (orig) size = ((CGSize(*)(id,SEL))orig)(self, _cmd);
+    }
+    if (!max_layoutOnSettingsScreen((UICollectionViewLayout *)self))
+        return size;
+    @try {
+        UICollectionView *cv = ((UICollectionView *(*)(id,SEL))objc_msgSend)
+            (self, sel_registerName("collectionView"));
+        if (!cv) return size;
+        CGFloat junkH = 0.0;
+        for (UICollectionViewCell *cell in cv.visibleCells)
+            if (max_viewContainsJunkLabel(cell, 0))
+                junkH += cell.frame.size.height;
+        if (junkH > 0.0 && size.height > junkH)
+            size.height -= junkH;
+    } @catch (NSException *e) {
+    }
+    return size;
 }
 
 static void max_installLayoutFilterHook(void) {
@@ -2575,7 +2635,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v10.7 loading (English junk titles: Devices With MAX, Sign in on new devices)...");
+    maxlog(@"v10.8 loading (shift rows UP instead of dropping: squash junk, move the rest)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2693,5 +2753,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v10.7 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v10.8 loaded OK — log file: %@", max_logPath());
 }
