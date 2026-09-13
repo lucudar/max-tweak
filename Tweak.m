@@ -1631,7 +1631,8 @@ static void hook_messagesDeletedInChat(id self, SEL _cmd, id a, id b) {
         if (b && [b respondsToSelector:pkSel])
             chatPk = [NSString stringWithFormat:@"%@",
                 ((id(*)(id,SEL))objc_msgSend)(b, pkSel)];
-        for (id mid in (a isKindOfClass:[NSArray class]] ? a : (a ? @[a] : @[]))) {
+        NSArray *msgIds = [a isKindOfClass:[NSArray class]] ? (NSArray *)a : (a ? @[a] : @[]);
+        for (id mid in msgIds) {
             NSString *pk = [NSString stringWithFormat:@"%@-%@", chatPk ?: @"", mid];
             if (g_markedDeleted && ![g_markedDeleted containsObject:pk]) {
                 [g_markedDeleted addObject:pk];
