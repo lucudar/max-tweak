@@ -1566,6 +1566,54 @@ static NSString *max_idsDesc(id ids) {
     return [NSString stringWithFormat:@"%@", ids];
 }
 
+// v9.6: dim the newest visible message cell. Remote-deleted messages can't be
+// matched to a cell by pk (MessageCell holds no model), but a live incoming
+// delete virtually always targets the last message on screen — so we mark the
+// highest indexPath among visible ChatHistoryUI message cells for the dim
+// module (same mod.markedIndexPaths list the two-phase delete uses).
+static void max_dimNewestVisibleCell(void) {
+    @try {
+        UIWindow *key = nil;
+        for (UIWindow *w in [UIApplication sharedApplication].windows)
+            if (w.isKeyWindow) { key = w; break; }
+        if (!key) return;
+
+        NSIndexPath *best = nil;
+        // simple recursive scan without blocks-capturing-themselves
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:key];
+        while (stack.count) {
+            UIView *v = stack.lastObject;
+            [stack removeLastObject];
+            if ([v isKindOfClass:[UICollectionView class]]) {
+                UICollectionView *cv = (UICollectionView *)v;
+                for (UICollectionViewCell *cell in cv.visibleCells) {
+                    NSString *cn = NSStringFromClass(cell.class);
+                    if (![cn containsString:@"MessageCell"]) continue;
+                    NSIndexPath *ip = [cv indexPathForCell:cell];
+                    if (!ip) continue;
+                    if (!best || ip.item > best.item) best = ip;
+                }
+            }
+            [stack addObjectsFromArray:v.subviews];
+        }
+        if (!best) return;
+
+        NSString *ipKey = [NSString stringWithFormat:@"%ld-%ld",
+                           (long)best.section, (long)best.item];
+        NSMutableArray *ips = [[[NSUserDefaults standardUserDefaults]
+            stringArrayForKey:@"mod.markedIndexPaths"] mutableCopy]
+            ?: [NSMutableArray array];
+        if (![ips containsObject:ipKey]) {
+            [ips addObject:ipKey];
+            [[NSUserDefaults standardUserDefaults] setObject:ips
+                                                      forKey:@"mod.markedIndexPaths"];
+        }
+        maxlog(@"REMOTE-DEL: dim newest visible message cell at %@", ipKey);
+    } @catch (NSException *e) {
+        maxlog(@"REMOTE-DEL: dim helper exception: %@", e);
+    }
+}
+
 static void hook_messagesDeletedInChat(id self, SEL _cmd, id a, id b) {
     // v9.5: this is the INCOMING remote-delete event (a contact deleted the
     // message). With mod.del ON we swallow it entirely: the message keeps its
@@ -1575,6 +1623,24 @@ static void hook_messagesDeletedInChat(id self, SEL _cmd, id a, id b) {
     if (max_modOn(@"mod.del")) {
         maxlog(@"REMOTE-DEL: _messagesDeleted:inChat: SUPPRESSED ids=%@ chat=%@ (keeping message)",
                max_idsDesc(a), b);
+        // v9.6: remember each kept message by pk (chatPk-msgId) and dim the
+        // newest visible cell in the open chat — a live remote delete almost
+        // always hits the last message(s) on screen.
+        NSString *chatPk = nil;
+        SEL pkSel = sel_registerName("primaryKey");
+        if (b && [b respondsToSelector:pkSel])
+            chatPk = [NSString stringWithFormat:@"%@",
+                ((id(*)(id,SEL))objc_msgSend)(b, pkSel)];
+        for (id mid in (a isKindOfClass:[NSArray class]] ? a : (a ? @[a] : @[]))) {
+            NSString *pk = [NSString stringWithFormat:@"%@-%@", chatPk ?: @"", mid];
+            if (g_markedDeleted && ![g_markedDeleted containsObject:pk]) {
+                [g_markedDeleted addObject:pk];
+                [[NSUserDefaults standardUserDefaults]
+                    setObject:[g_markedDeleted allObjects] forKey:@"mod.markedDeleted"];
+            }
+            maxlog(@"REMOTE-DEL: kept message pk=%@ — dimming", pk);
+        }
+        max_dimNewestVisibleCell();
         return;
     }
     maxlog(@"REMOTE-DEL: OKMMessageDeleteListener._messagesDeleted:inChat: ids=%@ chat=%@",
@@ -1597,16 +1663,34 @@ static void hook_deleteLocallyIds(id self, SEL _cmd, id ids, BOOL updateChat) {
 static void hook_setMessageStatus(id self, SEL _cmd, long long status) {
     // v9.5: deletion arrives as status 2 (confirmed by trace: every remote
     // delete event is immediately followed by setStatus:2 on that message,
-    // and deleteLocallyMessagesWithIds: is never called). With mod.del ON we
-    // block status 2 — but only for messages NOT approved by our own
-    // two-phase delete (own deletes legitimately mark status 2 as well).
+    // and deleteLocallyMessagesWithIds: is never called).
+    // v9.6 rules for status 2 with mod.del ON:
+    //   pk approved (own two-phase delete in flight) -> allow
+    //   pk in mod.serverSentPks (own PREVIOUSLY deleted-for-all) -> allow:
+    //     the server resends status 2 on every history sync, and blocking it
+    //     resurrected the user's own long-deleted messages
+    //   anything else (incoming remote delete) -> block + dim
     if (status == 2 && max_modOn(@"mod.del")) {
         NSString *pk = max_pkOfMessage(self);
-        if (!max_pkIsApproved(pk)) {
-            maxlog(@"REMOTE-DEL: setStatus: 2 BLOCKED (pk=%@) — message stays visible", pk);
-            return;
+        if (max_pkIsApproved(pk)) {
+            maxlog(@"REMOTE-DEL: setStatus: 2 allowed (own-delete approval active, pk=%@)", pk);
+        } else if (pk) {
+            NSArray *sent = [[NSUserDefaults standardUserDefaults]
+                stringArrayForKey:kSentPksKey] ?: @[];
+            if ([sent containsObject:pk]) {
+                maxlog(@"REMOTE-DEL: setStatus: 2 allowed (own message deleted before, pk=%@)", pk);
+            } else {
+                if (g_markedDeleted && ![g_markedDeleted containsObject:pk]) {
+                    [g_markedDeleted addObject:pk];
+                    [[NSUserDefaults standardUserDefaults]
+                        setObject:[g_markedDeleted allObjects] forKey:@"mod.markedDeleted"];
+                }
+                maxlog(@"REMOTE-DEL: setStatus: 2 BLOCKED (pk=%@) — message stays visible", pk);
+                max_dimNewestVisibleCell();
+                ((void(*)(id,SEL,long long))orig_setMessageStatus)(self, _cmd, 0);
+                return;
+            }
         }
-        maxlog(@"REMOTE-DEL: setStatus: 2 allowed (own-delete approval active, pk=%@)", pk);
         ((void(*)(id,SEL,long long))orig_setMessageStatus)(self, _cmd, status);
         return;
     }
@@ -2285,7 +2369,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v9.5 loading (keep remote-deleted: suppress _messagesDeleted + block status 2)...");
+    maxlog(@"v9.6 loading (remote-delete: dim kept messages; own previously-deleted pass through)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2409,5 +2493,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v9.5 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v9.6 loaded OK — log file: %@", max_logPath());
 }
