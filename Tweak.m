@@ -266,6 +266,75 @@ static void flattenMenu(UIMenuElement *element, NSMutableArray<UIAction *> *out)
 }
 
 // ============================================================================
+#pragma mark - System-menu hang diagnostics (v11.2)
+//
+// The original bug that started this project: the SYSTEM context menu froze
+// the whole app on long-press. We replaced it with our overlay; now let's
+// find out WHY the system one hangs. When mod.sysmenu is ON (Моды tab):
+//   - our overlay is bypassed, the stock system menu is shown
+//   - every phase of the interaction is logged BEFORE/AFTER the original
+//     call: configuration -> willDisplay -> previewForHighlighting ->
+//     previewForDismissing -> willEnd
+// If the app freezes, the LAST "before" marker names the method that hung.
+// ============================================================================
+
+static IMP orig_willDisplayMenu = NULL;
+static IMP orig_willEndMenu = NULL;
+static IMP orig_previewHighlight = NULL;
+static IMP orig_previewDismiss = NULL;
+
+static void hook_willDisplayMenu(id self, SEL _cmd, id interaction, id config, id animator) {
+    if (max_modOn(@"mod.sysmenu")) maxlog(@"SYSMENU: willDisplay BEFORE");
+    ((void(*)(id,SEL,id,id,id))orig_willDisplayMenu)(self, _cmd, interaction, config, animator);
+    if (max_modOn(@"mod.sysmenu")) maxlog(@"SYSMENU: willDisplay AFTER");
+}
+
+static void hook_willEndMenu(id self, SEL _cmd, id interaction, id config, id animator) {
+    if (max_modOn(@"mod.sysmenu")) maxlog(@"SYSMENU: willEnd BEFORE");
+    ((void(*)(id,SEL,id,id,id))orig_willEndMenu)(self, _cmd, interaction, config, animator);
+    if (max_modOn(@"mod.sysmenu")) maxlog(@"SYSMENU: willEnd AFTER");
+}
+
+static id hook_previewHighlight(id self, SEL _cmd, id interaction, id config) {
+    if (max_modOn(@"mod.sysmenu")) maxlog(@"SYSMENU: previewHighlight BEFORE");
+    id r = ((id(*)(id,SEL,id,id))orig_previewHighlight)(self, _cmd, interaction, config);
+    if (max_modOn(@"mod.sysmenu")) maxlog(@"SYSMENU: previewHighlight AFTER");
+    return r;
+}
+
+static id hook_previewDismiss(id self, SEL _cmd, id interaction, id config) {
+    if (max_modOn(@"mod.sysmenu")) maxlog(@"SYSMENU: previewDismiss BEFORE");
+    id r = ((id(*)(id,SEL,id,id))orig_previewDismiss)(self, _cmd, interaction, config);
+    if (max_modOn(@"mod.sysmenu")) maxlog(@"SYSMENU: previewDismiss AFTER");
+    return r;
+}
+
+static void max_installSysmenuDiagnostics(void) {
+    Class cell = objc_getClass("_TtC13ChatHistoryUI11MessageCell");
+    if (!cell) { maxlog(@"SYSMENU: MessageCell not found"); return; }
+    struct { SEL sel; IMP *orig; IMP hook; const char *name; } hooks[] = {
+        { @selector(contextMenuInteraction:willDisplayMenuForConfiguration:animator:),
+          &orig_willDisplayMenu, (IMP)hook_willDisplayMenu, "willDisplay" },
+        { @selector(contextMenuInteraction:willEndForConfiguration:animator:),
+          &orig_willEndMenu, (IMP)hook_willEndMenu, "willEnd" },
+        { @selector(contextMenuInteraction:previewForHighlightingMenuWithConfiguration:),
+          &orig_previewHighlight, (IMP)hook_previewHighlight, "previewHighlight" },
+        { @selector(contextMenuInteraction:previewForDismissingMenuWithConfiguration:),
+          &orig_previewDismiss, (IMP)hook_previewDismiss, "previewDismiss" },
+    };
+    for (NSUInteger i = 0; i < sizeof(hooks)/sizeof(hooks[0]); i++) {
+        Method m = class_getInstanceMethod(cell, hooks[i].sel);
+        if (!m) {
+            maxlog(@"SYSMENU: %@ not found — skipping", @(hooks[i].name));
+            continue;
+        }
+        *hooks[i].orig = method_getImplementation(m);
+        method_setImplementation(m, hooks[i].hook);
+        maxlog(@"SYSMENU: trace hook on %@", @(hooks[i].name));
+    }
+}
+
+// ============================================================================
 #pragma mark - Hook: -[MessageCell contextMenuInteraction:configurationForMenuAtLocation:]
 // ============================================================================
 
@@ -293,6 +362,13 @@ static UIContextMenuConfiguration *hook_cellConfig(
         ((UIContextMenuConfiguration *(*)(id,SEL,id,CGPoint))orig_cellConfig)(
             self, _cmd, interaction, point);
     g_inMessageCellMenu = NO;
+
+    // v11.2 diagnostics: user-toggled system menu — pass the stock config
+    // through untouched, no overlay, full phase logging
+    if (max_modOn(@"mod.sysmenu")) {
+        maxlog(@"SYSMENU: config returned (system menu will show)");
+        return config;
+    }
 
     if (!g_capturedProvider) {
         maxlog(@"menu: no provider captured — system fallback");
@@ -348,6 +424,12 @@ static UIContextMenuConfiguration *hook_cvConfig(
         ((UIContextMenuConfiguration *(*)(id,SEL,id,id,CGPoint))orig_cvConfig)(
             self, _cmd, collectionView, indexPath, point);
     g_inMessageCellMenu = NO;
+
+    // v11.2 diagnostics: system menu passthrough
+    if (max_modOn(@"mod.sysmenu")) {
+        maxlog(@"SYSMENU: cv config returned (system menu will show)");
+        return config;
+    }
 
     if (!g_capturedProvider) {
         maxlog(@"menu: cv path — no provider captured — system fallback");
@@ -2350,6 +2432,8 @@ typedef struct {
 static ModEntry max_modEntries[] = {
     { .title = @"Не отправлять «прочитано»", .key = @"mod.read",
       .subtitle = @"Собеседник не увидит, что вы прочитали сообщение" },
+    { .title = @"Системное меню (диагностика)", .key = @"mod.sysmenu",
+      .subtitle = @"Включить стоковое меню iOS для поимки зависания" },
 };
 static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntries[0]);
 
@@ -2673,7 +2757,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v11.1 loading (chat-only: MyTracker runtime kill, message stats off, geo off, calls off)...");
+    maxlog(@"v11.2 loading (system-menu hang diagnostics: mod.sysmenu toggle + phase tracing)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2726,15 +2810,21 @@ static void maxmods_init(void) {
     //    (server sync of status-2 made kept messages flicker and resurrect
     //    unpredictably — not worth fighting MAX's server behavior).
     max_installGhostHooks();
+    max_installSysmenuDiagnostics();
 
     // v10.0: the marked-list reset below is gone with the dim module —
     // stale mod.markedDeleted / mod.markedIndexPaths values are now inert
     // (nothing reads them), but wipe them once so they don't linger.
 
     // defaults: mods ON until the user turns them off (mod.read only, v10.0)
+    // mod.sysmenu defaults OFF — it deliberately re-enables the HANGING menu
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     for (NSUInteger i = 0; i < kModCount; i++) {
         ModEntry e = max_modEntries[i];
+        if ([e.key isEqualToString:@"mod.sysmenu"]) {
+            if ([d objectForKey:e.key] == nil) [d setBool:NO forKey:e.key];
+            continue;
+        }
         if ([d objectForKey:e.key] == nil) [d setBool:YES forKey:e.key];
     }
 
@@ -2788,5 +2878,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v11.1 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v11.2 loaded OK — log file: %@", max_logPath());
 }
