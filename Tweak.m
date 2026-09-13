@@ -53,7 +53,6 @@
 #import <stdio.h>
 #import <stdlib.h>
 
-static BOOL max_pkIsApproved(NSString *s);   // defined in the keep-deleted section
 
 // ============================================================================
 #pragma mark - Swizzle helpers
@@ -1128,45 +1127,8 @@ static id max_hook_read2(id self, SEL _cmd, id a, id b) {
     return o ? ((id(*)(id,SEL,id,id))o)(self, _cmd, a, b) : nil;
 }
 
-static void max_hook_void2(id self, SEL _cmd, id a, id b) {
-    NSString *n = NSStringFromSelector(_cmd);
-    if ([n hasPrefix:@"_handleDeletedMessages"] && max_modOn(@"mod.del")) {
-        // v9.0: the mass-ghost suppression here breaks the SECOND account on
-        // the same device (its own confirmation events get eaten -> the task
-        // queue never completes -> crash loop). The 2-arg delete handler
-        // now runs NATIVE always; keeping remote-deleted messages is handled
-        // by the OKMMessage.deleted flag hook + the marked-set dim instead.
-        // (This hook stays installed only for logging.)
-        maxlog(@"ghost: 2-arg delete handler NATIVE (v9.0)");
-        IMP o = max_modOrig(object_getClass(self), _cmd);
-        if (o) ((void(*)(id,SEL,id,id))o)(self, _cmd, a, b);
-        return;
-    }
-    IMP o = max_modOrig(object_getClass(self), _cmd);
-    if (o) ((void(*)(id,SEL,id,id))o)(self, _cmd, a, b);
-}
-
-static void max_hook_void1(id self, SEL _cmd, id a) {
-    NSString *n = NSStringFromSelector(_cmd);
-    if ([n hasPrefix:@"sendTyping"] && max_modOn(@"mod.typing")) return;
-    if (([n hasPrefix:@"updateOnline"] || [n isEqualToString:@"userOnlineStatus:"])
-        && max_modOn(@"mod.online")) return;
-    IMP o = max_modOrig(object_getClass(self), _cmd);
-    if (o) ((void(*)(id,SEL,id))o)(self, _cmd, a);
-}
-
-static void max_hook_void0(id self, SEL _cmd) {
-    NSString *n = NSStringFromSelector(_cmd);
-    if ([n hasPrefix:@"sendTyping"] && max_modOn(@"mod.typing")) return;
-    if ([n hasPrefix:@"updateOnline"] && max_modOn(@"mod.online")) return;
-    // v9.0: _handleDeletedMessages (0-arg) runs native — it is never called
-    // in this build anyway (v8.5 log), and suppression experiments only
-    // caused crashes.
-    IMP o = max_modOrig(object_getClass(self), _cmd);
-    if (o) ((void(*)(id,SEL))o)(self, _cmd);
-}
-
 // ============================================================================
+#if 0  // v10.0: keep-deleted / remote-delete machinery REMOVED (native deletes)
 #pragma mark - Keep remote-deleted: neutralize the server "deleted" flag
 //
 // Final link in the chain. When the contact deletes a message, the server
@@ -1838,27 +1800,20 @@ static void max_installDeletedFlagHook(void) {
     maxlog(@"keep-deleted: OKMMessage.deleted getter hooked");
 }
 
+#endif  // end removed block 1 (flag/forAll hooks)
 static void max_installGhostHooks(void) {
+    // v10.0: privacy-ghost features (typing/online/deleted) were removed at
+    // the user's request — deletion is fully native now, and "invisible"
+    // status is pointless (MAX shows "recently" anyway). The ONLY privacy
+    // switch left is mod.read: block the read receipt.
     struct { const char *sel; int args; } targets[] = {
         {"markAsReadTo:messageId:",          2},
-        {"sendTypingNotificationIfNeeded:",  1},
-        {"updateOnlineIfNeeded:",            1},
-        {"userOnlineStatus:",                1},
-        {"sendTypingNotification",           0},
-        {"sendStickerTypingNotification",    0},
-        {"updateOnlineStatus",               0},
-        {"_handleDeletedMessages",           0},
-        {"_handleDeletedMessages:inChatWithId:", 2},   // real remote-delete path
     };
     unsigned int classCount = 0;
     Class *classes = objc_copyClassList(&classCount);
     for (unsigned t = 0; t < sizeof(targets)/sizeof(targets[0]); t++) {
         SEL sel = sel_registerName(targets[t].sel);
-        BOOL isRead = strcmp(targets[t].sel, "markAsReadTo:messageId:") == 0;
-        IMP hook = isRead ? (IMP)max_hook_read2
-                 : (targets[t].args == 2) ? (IMP)max_hook_void2
-                 : (targets[t].args == 1) ? (IMP)max_hook_void1
-                 : (IMP)max_hook_void0;
+        IMP hook = (IMP)max_hook_read2;   // v10.0: the only ghost hook left
         int hits = 0;
         for (unsigned i = 0; i < classCount; i++) {
             Method m = class_getInstanceMethod(classes[i], sel);
@@ -1880,6 +1835,7 @@ static void max_installGhostHooks(void) {
 static IMP orig_deleteMessageCtx = NULL;
 
 // ============================================================================
+#if 0  // v10.0: two-phase delete + tasks tracing REMOVED
 #pragma mark - Keep-deleted: TWO-PHASE delete (switch-controlled)
 //
 // With mod.del ON:
@@ -2027,6 +1983,7 @@ static void max_installKeepDeletedHook(void) {
 #pragma mark - «Моды» settings tab (ported from Mods.dylib v6, in ObjC)
 // ============================================================================
 
+#endif  // end removed block 2 (two-phase + traces)
 @interface MAXModsViewController : UITableViewController
 @end
 
@@ -2041,12 +1998,6 @@ typedef struct {
 static ModEntry max_modEntries[] = {
     { .title = @"Не отправлять «прочитано»", .key = @"mod.read",
       .subtitle = @"Собеседник не увидит, что вы прочитали сообщение" },
-    { .title = @"Скрывать «печатает…»", .key = @"mod.typing",
-      .subtitle = @"Статус набора текста не отправляется" },
-    { .title = @"Всегда офлайн", .key = @"mod.online",
-      .subtitle = @"Ваш онлайн-статус не обновляется" },
-    { .title = @"Сохранять удалённые", .key = @"mod.del",
-      .subtitle = @"Удалённые у собеседника сообщения остаются у вас" },
 };
 static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntries[0]);
 
@@ -2370,7 +2321,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v9.6 loading (remote-delete: dim kept messages; own previously-deleted pass through)...");
+    maxlog(@"v10.0 loading (native deletes, read-receipt blocker only, menu overlay)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2418,26 +2369,18 @@ static void maxmods_init(void) {
     max_installSettingsPruner();
     max_installSettingsViewPruner();
 
-    // 5) Ghost mode + keep-deleted hooks (switch-controlled, Моды tab).
+    // 5) Ghost hooks — v10.0: ONLY the read-receipt blocker (mod.read).
+    //    Everything delete-related is native now: the whole two-phase /
+    //    keep-deleted / dim machinery was removed at the user's request
+    //    (server sync of status-2 made kept messages flicker and resurrect
+    //    unpredictably — not worth fighting MAX's server behavior).
     max_installGhostHooks();
-    max_installDeletedFlagHook();
-    max_installRemoteDeleteTrace();
-    max_installDeleteForAllHook();
-    max_installTasksServiceTrace();
-    max_installKeepDeletedHook();
 
-    // v7.6: reset the marked indexPath list once — the v7.5 db-hook bug
-    // poisoned it / made cells dim that should not. Keys (message ids)
-    // are kept; the dim list rebuilds from real 1st-deletes.
-    NSString *resetKey = @"mod.dimListReset.v7.6";
-    if (![[NSUserDefaults standardUserDefaults] boolForKey:resetKey]) {
-        [[NSUserDefaults standardUserDefaults] setObject:@[]
-                                                  forKey:@"mod.markedIndexPaths"];
-        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:resetKey];
-        maxlog(@"keep-deleted: dim list reset (one-time v7.6)");
-    }
+    // v10.0: the marked-list reset below is gone with the dim module —
+    // stale mod.markedDeleted / mod.markedIndexPaths values are now inert
+    // (nothing reads them), but wipe them once so they don't linger.
 
-    // defaults: all mods ON until the user turns them off
+    // defaults: mods ON until the user turns them off (mod.read only, v10.0)
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     for (NSUInteger i = 0; i < kModCount; i++) {
         ModEntry e = max_modEntries[i];
@@ -2494,5 +2437,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v9.6 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v10.0 loaded OK — log file: %@", max_logPath());
 }
