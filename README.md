@@ -28,6 +28,8 @@ is still running (old-SDK binary vs new iOS).
 Builds automatically via GitHub Actions on push to `master`.
 Download `MAXMods.dylib` from the latest Release.
 
+Latest version: **v12.2.0** (2026-09-15)
+
 ## Install
 
 1. Download `MAXMods.dylib` from [Releases](../../releases)
