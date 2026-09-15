@@ -1,9 +1,10 @@
 /**
- * MAXMods v8.7 — «Потужно Мессенджер»: full OKMTasksService queue trace,
- * indexPath-based dim, settings view pruning
- * (menu above the bubble, reliable tap-outside dismissal)
- * + file logging (Documents/maxmods_log.txt, visible in the Files app)
- * + main-thread watchdog that records freezes into the same log
+ * MAXMods v12.2 — «Потужно Мессенджер»
+ * v12.2: menu action actually fires after dismiss; ghost-hook no longer
+ * recurses through subclasses; tab-bar long-press attaches to the bar
+ * (not the whole VC view); swizzle never mutates superclass Methods.
+ * Custom overlay menu, ads/tracker prune, session persistence after re-sign,
+ * file logging (Documents/maxmods_log.txt) + main-thread watchdog.
  *
  * Final diagnosis (v4.3/v4.4/v4.5 baseline tests): the STOCK system menu
  * deadlocks during its own PRESENTATION (before any action tap, watchdog
@@ -59,19 +60,54 @@
 // ============================================================================
 
 static IMP swizzle(Class cls, SEL sel, IMP newImp) {
+    if (!cls || !sel || !newImp) return NULL;
     Method method = class_getInstanceMethod(cls, sel);
     if (!method) return NULL;
     IMP orig = method_getImplementation(method);
-    method_setImplementation(method, newImp);
-    return orig;
+    const char *types = method_getTypeEncoding(method);
+    // class_addMethod first: if `sel` is only inherited, this installs an
+    // override on `cls` and leaves the superclass IMP untouched.
+    if (class_addMethod(cls, sel, newImp, types)) return orig;
+    return method_setImplementation(method, newImp);
 }
 
 static IMP swizzleClassMethod(Class cls, SEL sel, IMP newImp) {
+    if (!cls || !sel || !newImp) return NULL;
     Method method = class_getClassMethod(cls, sel);
     if (!method) return NULL;
     IMP orig = method_getImplementation(method);
-    method_setImplementation(method, newImp);
-    return orig;
+    const char *types = method_getTypeEncoding(method);
+    Class meta = object_getClass((id)cls);
+    if (class_addMethod(meta, sel, newImp, types)) return orig;
+    return method_setImplementation(method, newImp);
+}
+
+// Method implemented on `cls` itself (not inherited). method_setImplementation
+// on class_getInstanceMethod() would otherwise mutate the superclass Method
+// and every subsequent subclass lookup would capture the hook as "orig".
+static Method max_ownInstanceMethod(Class cls, SEL sel) {
+    unsigned int n = 0;
+    Method *list = class_copyMethodList(cls, &n);
+    if (!list) return NULL;
+    Method found = NULL;
+    for (unsigned i = 0; i < n; i++) {
+        if (method_getName(list[i]) == sel) { found = list[i]; break; }
+    }
+    free(list);
+    return found;
+}
+
+// Replace an own method, or add a per-class override of an inherited one.
+// Never writes the superclass Method.
+static BOOL max_replaceMethod(Class cls, SEL sel, IMP hook) {
+    Method own = max_ownInstanceMethod(cls, sel);
+    if (own) {
+        method_setImplementation(own, hook);
+        return YES;
+    }
+    Method inherited = class_getInstanceMethod(cls, sel);
+    if (!inherited) return NO;
+    return class_addMethod(cls, sel, hook, method_getTypeEncoding(inherited));
 }
 
 // ============================================================================
@@ -94,6 +130,15 @@ static NSString *max_logPath(void) {
     return path;
 }
 
+static dispatch_queue_t max_logQueue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        q = dispatch_queue_create("ru.oneme.maxmods.log", DISPATCH_QUEUE_SERIAL);
+    });
+    return q;
+}
+
 static void maxlog(NSString *fmt, ...) {
     va_list args;
     va_start(args, fmt);
@@ -103,20 +148,21 @@ static void maxlog(NSString *fmt, ...) {
     NSLog(@"[MAXMods] %@", msg);
 
     NSString *path = max_logPath();
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:path])
-        [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    // cap the file so a stuck logging loop can't grow it unbounded
-    NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
-    if ([attrs fileSize] > 2 * 1024 * 1024)
-        [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
     NSString *line = [NSString stringWithFormat:@"%@ | %@\n", [NSDate date], msg];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (!fh) return;
-    [fh seekToEndOfFile];
-    [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-    [fh closeFile];
+    dispatch_async(max_logQueue(), ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:path])
+            [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
+        if ([attrs fileSize] > 2 * 1024 * 1024)
+            [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!fh) return;
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    });
 }
 
 // Every 5s check that the main thread services its queue within 2s.
@@ -195,8 +241,13 @@ static void max_uncaughtException(NSException *e) {
 }
 
 static void max_installCrashCatcher(void) {
-    // pre-open the log fd: the handler must not touch Objective-C
-    g_crashFd = open(max_logPath().fileSystemRepresentation,
+    // pre-open the log fd: the handler must not touch Objective-C.
+    // Create the file first — open() on a missing path still works with O_CREAT,
+    // but max_logPath() must run here (not inside the signal handler).
+    NSString *path = max_logPath();
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path])
+        [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    g_crashFd = open(path.fileSystemRepresentation,
                      O_WRONLY | O_CREAT | O_APPEND, 0644);
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -240,6 +291,7 @@ static id hook_configCreate(id self, SEL _cmd,
         g_capturedProvider = [actionProvider copy];
         maxlog(@"menu: actionProvider captured");
     }
+    if (!orig_configCreate) return nil;
     return ((id(*)(id,SEL,id,id,id))orig_configCreate)(
         self, _cmd, identifier, previewProvider, actionProvider);
 }
@@ -287,26 +339,32 @@ static IMP orig_previewDismiss = NULL;
 
 static void hook_willDisplayMenu(id self, SEL _cmd, id interaction, id config, id animator) {
     if (max_modOn(@"mod.sysmenu")) maxlog(@"SYSMENU: willDisplay BEFORE");
-    ((void(*)(id,SEL,id,id,id))orig_willDisplayMenu)(self, _cmd, interaction, config, animator);
+    if (orig_willDisplayMenu)
+        ((void(*)(id,SEL,id,id,id))orig_willDisplayMenu)(self, _cmd, interaction, config, animator);
     if (max_modOn(@"mod.sysmenu")) maxlog(@"SYSMENU: willDisplay AFTER");
 }
 
 static void hook_willEndMenu(id self, SEL _cmd, id interaction, id config, id animator) {
     if (max_modOn(@"mod.sysmenu")) maxlog(@"SYSMENU: willEnd BEFORE");
-    ((void(*)(id,SEL,id,id,id))orig_willEndMenu)(self, _cmd, interaction, config, animator);
+    if (orig_willEndMenu)
+        ((void(*)(id,SEL,id,id,id))orig_willEndMenu)(self, _cmd, interaction, config, animator);
     if (max_modOn(@"mod.sysmenu")) maxlog(@"SYSMENU: willEnd AFTER");
 }
 
 static id hook_previewHighlight(id self, SEL _cmd, id interaction, id config) {
     if (max_modOn(@"mod.sysmenu")) maxlog(@"SYSMENU: previewHighlight BEFORE");
-    id r = ((id(*)(id,SEL,id,id))orig_previewHighlight)(self, _cmd, interaction, config);
+    id r = orig_previewHighlight
+        ? ((id(*)(id,SEL,id,id))orig_previewHighlight)(self, _cmd, interaction, config)
+        : nil;
     if (max_modOn(@"mod.sysmenu")) maxlog(@"SYSMENU: previewHighlight AFTER");
     return r;
 }
 
 static id hook_previewDismiss(id self, SEL _cmd, id interaction, id config) {
     if (max_modOn(@"mod.sysmenu")) maxlog(@"SYSMENU: previewDismiss BEFORE");
-    id r = ((id(*)(id,SEL,id,id))orig_previewDismiss)(self, _cmd, interaction, config);
+    id r = orig_previewDismiss
+        ? ((id(*)(id,SEL,id,id))orig_previewDismiss)(self, _cmd, interaction, config)
+        : nil;
     if (max_modOn(@"mod.sysmenu")) maxlog(@"SYSMENU: previewDismiss AFTER");
     return r;
 }
@@ -325,13 +383,12 @@ static void max_installSysmenuDiagnostics(void) {
           &orig_previewDismiss, (IMP)hook_previewDismiss, "previewDismiss" },
     };
     for (NSUInteger i = 0; i < sizeof(hooks)/sizeof(hooks[0]); i++) {
-        Method m = class_getInstanceMethod(cell, hooks[i].sel);
-        if (!m) {
+        IMP orig = swizzle(cell, hooks[i].sel, hooks[i].hook);
+        if (!orig) {
             maxlog(@"SYSMENU: %@ not found — skipping", @(hooks[i].name));
             continue;
         }
-        *hooks[i].orig = method_getImplementation(m);
-        method_setImplementation(m, hooks[i].hook);
+        *hooks[i].orig = orig;
         maxlog(@"SYSMENU: trace hook on %@", @(hooks[i].name));
     }
 }
@@ -355,15 +412,19 @@ static UIContextMenuConfiguration *hook_cellConfig(
         id self, SEL _cmd, UIContextMenuInteraction *interaction, CGPoint point) {
 
     maxlog(@"menu: entry (MessageCell path)");
+    if (!orig_cellConfig) return nil;
     if (!g_lastMenuCellRef) g_lastMenuCellRef = [MaxMenuCellRef new];
     g_lastMenuCellRef.target = self;
     g_capturedProvider = nil;
     g_foundUnsupportedElement = NO;
     g_inMessageCellMenu = YES;
-    UIContextMenuConfiguration *config =
-        ((UIContextMenuConfiguration *(*)(id,SEL,id,CGPoint))orig_cellConfig)(
+    UIContextMenuConfiguration *config = nil;
+    @try {
+        config = ((UIContextMenuConfiguration *(*)(id,SEL,id,CGPoint))orig_cellConfig)(
             self, _cmd, interaction, point);
-    g_inMessageCellMenu = NO;
+    } @finally {
+        g_inMessageCellMenu = NO;
+    }
 
     // v11.2 diagnostics: user-toggled system menu — pass the stock config
     // through untouched, no overlay, full phase logging
@@ -419,13 +480,17 @@ static UIContextMenuConfiguration *hook_cvConfig(
         NSIndexPath *indexPath, CGPoint point) {
 
     maxlog(@"menu: entry (ChatDetail path)");
+    if (!orig_cvConfig) return nil;
     g_capturedProvider = nil;
     g_foundUnsupportedElement = NO;
     g_inMessageCellMenu = YES;
-    UIContextMenuConfiguration *config =
-        ((UIContextMenuConfiguration *(*)(id,SEL,id,id,CGPoint))orig_cvConfig)(
+    UIContextMenuConfiguration *config = nil;
+    @try {
+        config = ((UIContextMenuConfiguration *(*)(id,SEL,id,id,CGPoint))orig_cvConfig)(
             self, _cmd, collectionView, indexPath, point);
-    g_inMessageCellMenu = NO;
+    } @finally {
+        g_inMessageCellMenu = NO;
+    }
 
     // v11.2 diagnostics: system menu passthrough
     if (max_modOn(@"mod.sysmenu")) {
@@ -491,10 +556,12 @@ static UIWindow *max_currentWindow(void) {
 // "Delete", truncated "Save to Gallery") — manual layout is predictable.
 @interface MAXMenuItemButton : UIControl
 @property (nonatomic, strong, readonly) NSString *actionTitle;
+@property (nonatomic, strong, readonly) UIAction *action;
+- (instancetype)initWithFrame:(CGRect)frame action:(UIAction *)action;
 @end
 
 @interface MAXMenuItemButton ()
-@property (nonatomic, strong) UIAction *action;
+@property (nonatomic, strong, readwrite) UIAction *action;
 @property (nonatomic, strong) UILabel *titleLabel2;
 @property (nonatomic, strong) UIImageView *iconView;
 @property (nonatomic, strong) UIView *highlightView;
@@ -546,10 +613,8 @@ static UIWindow *max_currentWindow(void) {
         _titleLabel2.textColor = tint;
         _titleLabel2.lineBreakMode = NSLineBreakByTruncatingTail;
         [self addSubview:_titleLabel2];
-
-        // fire the app's own handler on tap
-        [self addTarget:self action:@selector(fire)
-              forControlEvents:UIControlEventTouchUpInside];
+        // The overlay owns the tap: it dismisses first, then calls -fire.
+        // Adding a TouchUpInside target here would fire the app handler twice.
     }
     return self;
 }
@@ -566,8 +631,17 @@ static UIWindow *max_currentWindow(void) {
 }
 
 - (void)fire {
+    UIAction *action = _action;
+    if (!action) return;
+    // UIAction.performWithSender:target: is the documented way to invoke the
+    // handler. A throwaway UIControl + sendActions was racy: the overlay was
+    // already tearing down, and the ghost control never stayed in a window.
+    if ([action respondsToSelector:@selector(performWithSender:target:)]) {
+        [action performWithSender:self target:nil];
+        return;
+    }
     UIControl *ghost = [[UIControl alloc] initWithFrame:CGRectZero];
-    [ghost addAction:_action forControlEvents:UIControlEventPrimaryActionTriggered];
+    [ghost addAction:action forControlEvents:UIControlEventPrimaryActionTriggered];
     [ghost sendActionsForControlEvents:UIControlEventPrimaryActionTriggered];
 }
 
@@ -590,10 +664,15 @@ static MAXMenuOverlay *g_overlay = nil;
 + (BOOL)isShowing { return g_overlay != nil; }
 
 - (void)dismissAnimated:(BOOL)animated {
+    [self dismissAnimated:animated then:nil];
+}
+
+- (void)dismissAnimated:(BOOL)animated then:(void (^)(void))then {
     UIView *snapshot = _snapshotView;
     void (^finish)(void) = ^void(void) {
         [g_overlay removeFromSuperview];
         g_overlay = nil;
+        if (then) then();
     };
     if (!animated) { finish(); return; }
     [UIView animateWithDuration:0.14 delay:0
@@ -607,9 +686,7 @@ static MAXMenuOverlay *g_overlay = nil;
     } completion:^(BOOL f) { finish(); }];
 }
 
-// Dismiss on any tap outside the panel. Wired via BOTH a tap gesture and
-// UIControlEventTouchUpInside — a bare UIControl does not reliably deliver
-// UIControlEventPrimaryActionTriggered, which left the overlay stuck.
+// Dismiss on tap outside the panel (TouchUpInside on the full-screen bg).
 - (void)tapOutside {
     if (_itemFired) return;
     maxlog(@"overlay: tap outside — dismiss");
@@ -622,7 +699,15 @@ static MAXMenuOverlay *g_overlay = nil;
     NSString *title = sender.actionTitle ?: @"?";
     maxlog(@"overlay: tapped '%@' — dismissing, firing app handler", title);
     _itemFired = YES;
-    [self dismissAnimated:YES];
+    // Capture the UIAction (not the button): dismiss deallocates the overlay
+    // tree. Fire only after the covering view is gone — some app handlers
+    // present alerts / mutate the collection and deadlock under our overlay.
+    UIAction *action = sender.action;
+    [self dismissAnimated:YES then:^{
+        if (!action) return;
+        if ([action respondsToSelector:@selector(performWithSender:target:)])
+            [action performWithSender:nil target:nil];
+    }];
 }
 
 + (BOOL)presentWithActions:(NSArray<UIAction *> *)actions cell:(UIView *)cell {
@@ -641,13 +726,11 @@ static MAXMenuOverlay *g_overlay = nil;
     UIControl *bg = [[UIControl alloc] initWithFrame:window.bounds];
     bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     bg.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0];
+    // TouchUpInside only. TouchDown would fire before the panel's button
+    // receives the same event (hit-testing walks siblings, but a simultaneous
+    // TouchDown on the full-screen bg raced the row tap and ate the action).
     [bg addTarget:ov action:@selector(tapOutside)
                  forControlEvents:UIControlEventTouchUpInside];
-    [bg addTarget:ov action:@selector(tapOutside)
-                 forControlEvents:UIControlEventTouchDown];
-    UITapGestureRecognizer *bgTap = [[UITapGestureRecognizer alloc]
-        initWithTarget:ov action:@selector(tapOutside)];
-    [bg addGestureRecognizer:bgTap];
     [ov addSubview:bg];
     ov->_background = bg;
 
@@ -832,10 +915,19 @@ static IMP orig_imageNamed = NULL;
 static NSMutableDictionary<NSString *, UIImage *> *g_brandIcons = nil;
 
 static UIImage *max_brandIconFor(NSString *name) {
-    if (!g_brandIcons) return nil;
-    for (NSString *key in g_brandIcons)
+    if (!g_brandIcons || name.length == 0) return nil;
+    UIImage *exact = g_brandIcons[name];
+    if (exact) return exact;
+    // substring match only for the explicit MAX-brand keys — never for a
+    // generic name like "app_icon", which would hijack every UIImage.imageNamed:
+    static NSArray<NSString *> *fuzzy = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fuzzy = @[ @"max_logo_title", @"max_solid_themed", @"logo_54px", @"max.svg" ];
+    });
+    for (NSString *key in fuzzy)
         if ([name rangeOfString:key options:NSCaseInsensitiveSearch].location != NSNotFound)
-            return g_brandIcons[key];
+            return g_brandIcons[key] ?: g_brandIcons.allValues.firstObject;
     return nil;
 }
 
@@ -846,7 +938,9 @@ static id hook_imageNamed(id self, SEL _cmd, NSString *name) {
             if (sub) return sub;
         } @catch (NSException *e) {}
     }
-    return ((id(*)(id,SEL,id))orig_imageNamed)(self, _cmd, name);
+    if (orig_imageNamed)
+        return ((id(*)(id,SEL,id))orig_imageNamed)(self, _cmd, name);
+    return nil;
 }
 
 static void max_installBrandIcons(void) {
@@ -865,10 +959,9 @@ static void max_installBrandIcons(void) {
         @"app_icon", @"max.svg",
     ];
     for (NSString *n in names) g_brandIcons[n] = icon;
-    Method m = class_getClassMethod([UIImage class], @selector(imageNamed:));
-    if (!m) { maxlog(@"brand-icons: imageNamed: not found"); return; }
-    orig_imageNamed = method_getImplementation(m);
-    method_setImplementation(m, (IMP)hook_imageNamed);
+    orig_imageNamed = swizzleClassMethod([UIImage class], @selector(imageNamed:),
+                                         (IMP)hook_imageNamed);
+    if (!orig_imageNamed) { maxlog(@"brand-icons: imageNamed: not found"); return; }
     maxlog(@"brand-icons: substituted %lu MAX asset name(s)",
            (unsigned long)g_brandIcons.count);
 }
@@ -905,12 +998,10 @@ static void max_installAdBlocker(void) {
             continue;
         }
         SEL sel = sel_registerName(hooks[i].sel);
-        Method m = class_getInstanceMethod(cls, sel);
-        if (!m) {
+        if (!max_replaceMethod(cls, sel, hooks[i].hook)) {
             maxlog(@"ads: method not found: %s -> %s", hooks[i].cls, hooks[i].sel);
             continue;
         }
-        method_setImplementation(m, hooks[i].hook);
         maxlog(@"ads: blocked %s -> %s", hooks[i].cls, hooks[i].sel);
     }
 }
@@ -937,6 +1028,7 @@ static void max_hookVoid1(id self, SEL _cmd, id a) { (void)self; (void)_cmd; (vo
 static void max_hookVoid0(id self, SEL _cmd) { (void)self; (void)_cmd; }
 
 static IMP orig_setViewControllers = NULL;
+static IMP orig_setViewControllersAnimated = NULL;
 
 static BOOL max_isPrunedTab(UIViewController *vc) {
     if (!vc) return NO;
@@ -950,17 +1042,29 @@ static BOOL max_isPrunedTab(UIViewController *vc) {
     return NO;
 }
 
+static NSArray *max_filterTabVCs(NSArray *vcs) {
+    if (![vcs isKindOfClass:[NSArray class]]) return vcs;
+    NSMutableArray *kept = [NSMutableArray array];
+    for (UIViewController *vc in vcs)
+        if (!max_isPrunedTab(vc)) [kept addObject:vc];
+    if (kept.count != vcs.count)
+        maxlog(@"prune: dropped %lu tab(s) from the tab bar",
+               (unsigned long)(vcs.count - kept.count));
+    return kept;
+}
+
 static void hook_setViewControllers(id self, SEL _cmd, NSArray *vcs) {
-    if ([vcs isKindOfClass:[NSArray class]]) {
-        NSMutableArray *kept = [NSMutableArray array];
-        for (UIViewController *vc in vcs)
-            if (!max_isPrunedTab(vc)) [kept addObject:vc];
-        if (kept.count != vcs.count)
-            maxlog(@"prune: dropped %lu tab(s) from the tab bar",
-                   (unsigned long)(vcs.count - kept.count));
-        vcs = kept;
-    }
-    ((void(*)(id,SEL,id))orig_setViewControllers)(self, _cmd, vcs);
+    vcs = max_filterTabVCs(vcs);
+    if (orig_setViewControllers)
+        ((void(*)(id,SEL,id))orig_setViewControllers)(self, _cmd, vcs);
+}
+
+static void hook_setViewControllersAnimated(id self, SEL _cmd, NSArray *vcs, BOOL animated) {
+    vcs = max_filterTabVCs(vcs);
+    if (orig_setViewControllersAnimated)
+        ((void(*)(id,SEL,id,BOOL))orig_setViewControllersAnimated)(self, _cmd, vcs, animated);
+    else if (orig_setViewControllers)
+        ((void(*)(id,SEL,id))orig_setViewControllers)(self, _cmd, vcs);
 }
 
 static void max_installFeaturePruner(void) {
@@ -1088,24 +1192,26 @@ static void max_installFeaturePruner(void) {
             continue;
         }
         SEL sel = sel_registerName(hooks[i].sel);
-        Method m = class_getInstanceMethod(cls, sel);
-        if (!m) {
+        if (!max_replaceMethod(cls, sel, hooks[i].hook)) {
             maxlog(@"prune: method not found: %s -> %s", hooks[i].cls, hooks[i].sel);
             continue;
         }
-        method_setImplementation(m, hooks[i].hook);
         maxlog(@"prune: blocked %s -> %s", hooks[i].cls, hooks[i].sel);
     }
 
-    // Digital ID tab: filter it out whenever the app rebuilds the tab bar
+    // Digital ID tab: filter it out whenever the app rebuilds the tab bar.
+    // Hook both 1-arg and 2-arg setters — UIKit's animated path is the one
+    // MAX actually uses after login / feature flags.
     Class tbc = objc_getClass("_TtC7OMUIKit16TabBarController");
     if (tbc) {
-        Method m = class_getInstanceMethod(tbc, @selector(setViewControllers:));
-        if (m) {
-            orig_setViewControllers = method_getImplementation(m);
-            method_setImplementation(m, (IMP)hook_setViewControllers);
-            maxlog(@"prune: tab-bar filter installed");
-        }
+        orig_setViewControllers = swizzle(tbc, @selector(setViewControllers:),
+                                          (IMP)hook_setViewControllers);
+        orig_setViewControllersAnimated = swizzle(tbc,
+            @selector(setViewControllers:animated:),
+            (IMP)hook_setViewControllersAnimated);
+        maxlog(@"prune: tab-bar filter 1-arg %@, 2-arg %@",
+               orig_setViewControllers ? @"OK" : @"MISS",
+               orig_setViewControllersAnimated ? @"OK" : @"MISS");
     }
 }
 
@@ -1210,7 +1316,8 @@ static void hook_setSections(id self, SEL _cmd, NSArray *sections) {
     } @catch (NSException *e) {
         maxlog(@"settings-prune: filter error %@", e);
     }
-    ((void(*)(id,SEL,id))orig_setSections)(self, _cmd, sections);
+    if (orig_setSections)
+        ((void(*)(id,SEL,id))orig_setSections)(self, _cmd, sections);
 }
 
 static void max_installSettingsPruner(void) {
@@ -1219,14 +1326,8 @@ static void max_installSettingsPruner(void) {
         maxlog(@"settings-prune: OKMActionsViewModel not found");
         return;
     }
-    Method m = class_getInstanceMethod(cls, @selector(setSections:));
-    if (!m) {
-        maxlog(@"settings-prune: setSections: not found");
-        return;
-    }
-    orig_setSections = method_getImplementation(m);
-    method_setImplementation(m, (IMP)hook_setSections);
-    maxlog(@"settings-prune: installed");
+    orig_setSections = swizzle(cls, @selector(setSections:), (IMP)hook_setSections);
+    maxlog(@"settings-prune: %@", orig_setSections ? @"installed" : @"swizzle failed");
 }
 
 // ============================================================================
@@ -2365,30 +2466,32 @@ static void max_installGhostHooks(void) {
     // the user's request — deletion is fully native now, and "invisible"
     // status is pointless (MAX shows "recently" anyway). The ONLY privacy
     // switch left is mod.read: block the read receipt.
-    struct { const char *sel; int args; } targets[] = {
-        {"markAsReadTo:messageId:",          2},
-    };
+    SEL sel = sel_registerName("markAsReadTo:messageId:");
+    IMP hook = (IMP)max_hook_read2;
     unsigned int classCount = 0;
     Class *classes = objc_copyClassList(&classCount);
-    for (unsigned t = 0; t < sizeof(targets)/sizeof(targets[0]); t++) {
-        SEL sel = sel_registerName(targets[t].sel);
-        IMP hook = (IMP)max_hook_read2;   // v10.0: the only ghost hook left
-        int hits = 0;
-        for (unsigned i = 0; i < classCount; i++) {
-            Method m = class_getInstanceMethod(classes[i], sel);
-            if (!m) continue;
-            if (g_nModHooks < 128) {
-                g_modHooks[g_nModHooks].cls = classes[i];
-                g_modHooks[g_nModHooks].sel = sel;
-                g_modHooks[g_nModHooks].orig = method_getImplementation(m);
-                g_nModHooks++;
-            }
-            method_setImplementation(m, hook);
-            hits++;
+    int hits = 0;
+    for (unsigned i = 0; i < classCount; i++) {
+        Class cls = classes[i];
+        // Only classes that IMPLEMENT the selector. class_getInstanceMethod
+        // walks superclasses, so the old loop hooked every subclass of the
+        // real owner, then method_setImplementation mutated the SUPERCLASS
+        // Method — every later subclass stored the hook itself as "orig".
+        Method own = max_ownInstanceMethod(cls, sel);
+        if (!own) continue;
+        IMP orig = method_getImplementation(own);
+        if (orig == hook) continue;
+        if (g_nModHooks < 128) {
+            g_modHooks[g_nModHooks].cls = cls;
+            g_modHooks[g_nModHooks].sel = sel;
+            g_modHooks[g_nModHooks].orig = orig;
+            g_nModHooks++;
         }
-        maxlog(@"ghost: hook %s -> %d class(es)", targets[t].sel, hits);
+        method_setImplementation(own, hook);
+        hits++;
     }
     free(classes);
+    maxlog(@"ghost: hook markAsReadTo:messageId: -> %d class(es)", hits);
 }
 
 static IMP orig_deleteMessageCtx = NULL;
@@ -2567,6 +2670,10 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
     self.title = @"Моды";
 }
 
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
+    return (s == 0) ? @"Приватность" : @"Отладка";
+}
+
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 2; }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
@@ -2631,11 +2738,12 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
         tv2.text = [[NSString alloc] initWithFormat:@"...\n%@",
                      [lines componentsJoinedByString:@"\n"]];
         UIViewController *vc = [[UIViewController alloc] init];
-        vc.view = tv2;
         vc.title = @"Логи";
+        [vc loadViewIfNeeded];
         tv2.frame = vc.view.bounds;
         tv2.autoresizingMask = UIViewAutoresizingFlexibleWidth
                                | UIViewAutoresizingFlexibleHeight;
+        [vc.view addSubview:tv2];
         [self.navigationController pushViewController:vc animated:YES];
     } else if (ip.row == 1) {
         // share sheet with the log file
@@ -2678,7 +2786,8 @@ static BOOL max_tabHasMods(UITabBarController *tbc) {
 }
 
 static UINavigationController *max_makeModsNav(void) {
-    MAXModsViewController *vc = [MAXModsViewController new];
+    MAXModsViewController *vc = [[MAXModsViewController alloc]
+        initWithStyle:UITableViewStyleGrouped];
     UINavigationController *nav = [[UINavigationController alloc]
         initWithRootViewController:vc];
     UITabBarItem *item = [[UITabBarItem alloc]
@@ -2763,18 +2872,24 @@ static void maxmods_tabBarLongPressImp(id self, SEL _cmd,
 
     UIView *tabBarView = gesture.view;
     CGPoint point = [gesture locationInView:tabBarView];
+    CGFloat w = tabBarView.bounds.size.width;
+    if (w < 1) return;
 
-    // custom tab bar: items laid out evenly across the width.
-    // 4 slots: chats / people / calls(hidden) / settings — but derive from
-    // the bar's direct subviews count when available.
+    // Prefer UITabBar.items — counting every subview (badges, blur, hit-slop
+    // views) made the "last item" slot tiny and the long-press almost never
+    // opened Моды. Fall back to the rightmost ~28% of a custom bar.
     NSInteger itemCount = 0;
-    for (UIView *sub in tabBarView.subviews) itemCount++;
-    if (itemCount < 2) itemCount = 4;
-    NSInteger tappedIndex =
-        (NSInteger)(point.x / (tabBarView.bounds.size.width / MAX(itemCount, 1)));
+    if ([tabBarView isKindOfClass:[UITabBar class]])
+        itemCount = (NSInteger)((UITabBar *)tabBarView).items.count;
+    BOOL onLastItem = NO;
+    if (itemCount >= 2) {
+        NSInteger tappedIndex = (NSInteger)(point.x / (w / itemCount));
+        onLastItem = (tappedIndex >= itemCount - 1);
+    } else {
+        onLastItem = (point.x >= w * 0.72);
+    }
 
-    // any long-press on the last third of the bar = Settings/Profile area
-    if (tappedIndex >= itemCount - 1) {
+    if (onLastItem) {
         UIViewController *host = nil;
         // walk up from the tab bar view to a ViewController able to present
         UIResponder *responder = tabBarView;
@@ -2806,17 +2921,39 @@ static void maxmods_dismissImp(id self, SEL _cmd) {
 static IMP orig_tabBarViewDidLoad = NULL;
 
 static void hook_tabBarViewDidLoad(id self, SEL _cmd) {
-    ((void(*)(id,SEL))orig_tabBarViewDidLoad)(self, _cmd);
+    if (orig_tabBarViewDidLoad)
+        ((void(*)(id,SEL))orig_tabBarViewDidLoad)(self, _cmd);
 
-    // attach the long-press recognizer to the tab bar's main view
-    UIView *barView = ((UIViewController *)self).view;
-    if (!barView) return;
+    // Attach to the TAB BAR, not the whole VC view — a recognizer on the
+    // controller's view sits over the chat list and steals long-presses.
+    // OMUIKit.TabBarController may or may not subclass UITabBarController.
+    UIView *barView = nil;
+    if ([self isKindOfClass:[UITabBarController class]])
+        barView = ((UITabBarController *)self).tabBar;
+    if (!barView) {
+        UIView *root = ((UIViewController *)self).view;
+        for (UIView *sub in root.subviews) {
+            NSString *cls = NSStringFromClass(sub.class);
+            if ([sub isKindOfClass:[UITabBar class]] ||
+                [cls rangeOfString:@"TabBar"].location != NSNotFound)
+                barView = sub;
+        }
+    }
+    if (!barView) {
+        maxlog(@"mods: no tab-bar view to attach long-press");
+        return;
+    }
+    for (UIGestureRecognizer *g in barView.gestureRecognizers) {
+        if ([g isKindOfClass:[UILongPressGestureRecognizer class]] &&
+            g.minimumPressDuration == 0.5) return;   // already attached
+    }
     UILongPressGestureRecognizer *lp =
         [[UILongPressGestureRecognizer alloc]
             initWithTarget:self action:@selector(maxmods_tabBarLongPress:)];
     lp.minimumPressDuration = 0.5;
+    lp.cancelsTouchesInView = NO;
     [barView addGestureRecognizer:lp];
-    maxlog(@"mods: long-press gesture attached to tab bar");
+    maxlog(@"mods: long-press gesture attached to %@", NSStringFromClass(barView.class));
 }
 
 // ============================================================================
@@ -2828,6 +2965,7 @@ static IMP orig_kcClass = NULL;
 static IMP orig_kcInit = NULL;
 
 static id hook_kcClass(id self, SEL _cmd, id service, NSString *group) {
+    if (!orig_kcClass) return nil;
     if (group && [group containsString:kOrigTeam]) {
         return ((id(*)(id,SEL,id,id))orig_kcClass)(self, _cmd, service, nil);
     }
@@ -2835,6 +2973,7 @@ static id hook_kcClass(id self, SEL _cmd, id service, NSString *group) {
 }
 
 static id hook_kcInit(id self, SEL _cmd, id service, NSString *group) {
+    if (!orig_kcInit) return nil;
     if (group && [group containsString:kOrigTeam]) {
         return ((id(*)(id,SEL,id,id))orig_kcInit)(self, _cmd, service, nil);
     }
@@ -2858,6 +2997,7 @@ static NSURL *hook_containerURL(id self, SEL _cmd, NSString *groupId) {
             withIntermediateDirectories:YES attributes:nil error:nil];
         return [NSURL fileURLWithPath:fake];
     }
+    if (!orig_containerURL) return nil;
     return ((NSURL*(*)(id,SEL,NSString*))orig_containerURL)(self, _cmd, groupId);
 }
 
@@ -2868,6 +3008,7 @@ static NSURL *hook_containerURL(id self, SEL _cmd, NSString *groupId) {
 static IMP orig_initSuite = NULL;
 
 static id hook_initSuite(id self, SEL _cmd, NSString *name) {
+    if (!orig_initSuite) return nil;
     if (name && [name isEqualToString:@"group.ru.oneme.app"]) {
         return ((id(*)(id,SEL,NSString*))orig_initSuite)(self, _cmd, @"ru.oneme.app.local");
     }
@@ -2880,7 +3021,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.1 FINAL loading (settings tabs restored, last 10 stat hooks, clean Mods tab)...");
+    maxlog(@"v12.2 loading (menu fire, ghost-hook recursion, tab-bar long-press, swizzle safety)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -2980,17 +3121,12 @@ static void maxmods_init(void) {
     // 7) Session persistence fixes (unchanged from v3.0).
     Class kc = objc_getClass("UICKeyChainStore");
     if (kc) {
-        Method cm = class_getClassMethod(kc, @selector(keyChainStoreWithService:accessGroup:));
-        if (cm) {
-            orig_kcClass = method_getImplementation(cm);
-            method_setImplementation(cm, (IMP)hook_kcClass);
-        }
-        Method im = class_getInstanceMethod(kc, @selector(initWithService:accessGroup:));
-        if (im) {
-            orig_kcInit = method_getImplementation(im);
-            method_setImplementation(im, (IMP)hook_kcInit);
-        }
-        maxlog(@"Keychain fix: OK");
+        orig_kcClass = swizzleClassMethod(kc,
+            @selector(keyChainStoreWithService:accessGroup:), (IMP)hook_kcClass);
+        orig_kcInit = swizzle(kc,
+            @selector(initWithService:accessGroup:), (IMP)hook_kcInit);
+        maxlog(@"Keychain fix: class %@, init %@",
+               orig_kcClass ? @"OK" : @"MISS", orig_kcInit ? @"OK" : @"MISS");
     }
 
     orig_containerURL = swizzle([NSFileManager class],
@@ -3002,5 +3138,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v12.1 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v12.2 loaded OK — log file: %@", max_logPath());
 }
