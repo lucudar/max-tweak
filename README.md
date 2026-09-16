@@ -28,7 +28,14 @@ is still running (old-SDK binary vs new iOS).
 Builds automatically via GitHub Actions on push to `master`.
 Download `MAXMods.dylib` from the latest Release.
 
-Latest version: **v12.2.1** (2026-09-15)
+Latest version: **v12.3** (2026-09-17)
+
+v12.3:
+- `mod.read` OFF actually sends read receipts (dedicated orig IMP on
+  `OKMChatHandler`, plus `markReactionAsReadTo:messageId:`).
+- Custom Telegram overlay: material blur, Потужно blue/yellow strip, hit-testing
+  that no longer swallows row taps.
+- Runtime rebrand of in-app MAX strings → «Потужно».
 
 ## Install
 

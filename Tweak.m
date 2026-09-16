@@ -1,5 +1,8 @@
 /**
- * MAXMods v12.2 — «Потужно Мессенджер»
+ * MAXMods v12.3 — «Потужно Мессенджер»
+ * v12.3: mod.read OFF actually sends receipts (dedicated orig IMP, no nil
+ * fallback); reaction-read hooked too; Telegram overlay gets blur +
+ * Потужно blue/yellow; in-app MAX strings swapped at runtime.
  * v12.2: menu action actually fires after dismiss; ghost-hook no longer
  * recurses through subclasses; tab-bar long-press attaches to the bar
  * (not the whole VC view); swizzle never mutates superclass Methods.
@@ -551,6 +554,13 @@ static UIWindow *max_currentWindow(void) {
     return UIApplication.sharedApplication.keyWindow;
 }
 
+static UIColor *max_potuzhnoBlue(void) {
+    return [UIColor colorWithRed:0.0 green:87.0/255.0 blue:183.0/255.0 alpha:1.0];
+}
+static UIColor *max_potuzhnoYellow(void) {
+    return [UIColor colorWithRed:1.0 green:215.0/255.0 blue:0.0 alpha:1.0];
+}
+
 // A menu row: fixed-size leading icon + left-aligned title, laid out by hand.
 // UIButtonConfiguration misaligned icons over long titles (icon overlapping
 // "Delete", truncated "Save to Gallery") — manual layout is predictable.
@@ -571,7 +581,7 @@ static UIWindow *max_currentWindow(void) {
 
 - (instancetype)initWithFrame:(CGRect)frame action:(UIAction *)action {
     if ((self = [super initWithFrame:frame])) {
-        UIColor *tint = UIColor.labelColor;
+        UIColor *tint = max_potuzhnoBlue();
         if (action.attributes & UIMenuElementAttributesDestructive)
             tint = [UIColor systemRedColor];
         _action = action;
@@ -657,8 +667,23 @@ static MAXMenuOverlay *g_overlay = nil;
 @implementation MAXMenuOverlay {
     UIControl *_background;        // tap-outside to dismiss
     UIImageView *_snapshotView;    // Telegram-style "lifted" message
-    UIView *_panel;
+    UIView *_panel;                // shadow wrapper around the blur card
     BOOL _itemFired;
+}
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (self.hidden || !self.userInteractionEnabled || self.alpha < 0.01)
+        return nil;
+    // Snapshot of the bubble is decorative — never steal taps from the panel
+    // or from the dimmed background (tap-outside dismiss).
+    if (_panel) {
+        CGPoint inPanel = [self convertPoint:point toView:_panel];
+        if ([_panel pointInside:inPanel withEvent:event]) {
+            UIView *hit = [_panel hitTest:inPanel withEvent:event];
+            return hit ?: _panel;
+        }
+    }
+    return _background ?: [super hitTest:point withEvent:event];
 }
 
 + (BOOL)isShowing { return g_overlay != nil; }
@@ -749,6 +774,7 @@ static MAXMenuOverlay *g_overlay = nil;
     if (snapshot) {
         UIImageView *snapView = [[UIImageView alloc] initWithFrame:cellFrame];
         snapView.image = snapshot;
+        snapView.userInteractionEnabled = NO;
         snapView.layer.shadowColor = [UIColor blackColor].CGColor;
         snapView.layer.shadowOpacity = 0.30;
         snapView.layer.shadowRadius = 16;
@@ -757,31 +783,36 @@ static MAXMenuOverlay *g_overlay = nil;
         ov->_snapshotView = snapView;
     }
 
-    // panel: uniform semi-transparent background. Blur looked patchy over
-    // mixed content (transparent in places, solid in others); a translucent
-    // solid color gives the consistent Telegram-menu look.
+    // Card: shadow wrapper + material blur. Solid fill previously looked
+    // cheap against chat wallpaper; blur + Потужно flag strip is the
+    // replacement chrome for MAX's system menu.
+    BOOL dark = window.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark;
     UIView *panel = [[UIView alloc] initWithFrame:CGRectZero];
-    panel.layer.cornerRadius = 14;
-    panel.layer.masksToBounds = YES;
-    panel.layer.cornerCurve = kCACornerCurveContinuous;
-    panel.backgroundColor =
-        [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
-            return tc.userInterfaceStyle == UIUserInterfaceStyleDark
-                ? [UIColor colorWithWhite:0.10 alpha:0.97]
-                : [UIColor colorWithWhite:1.0 alpha:0.98];
-        }];
-    panel.layer.borderWidth = 0.5;
-    panel.layer.borderColor =
-        [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
-            return tc.userInterfaceStyle == UIUserInterfaceStyleDark
-                ? [UIColor colorWithWhite:1 alpha:0.14]
-                : [UIColor colorWithWhite:0 alpha:0.10];
-        }].CGColor;
+    panel.layer.cornerRadius = 16;
+    panel.layer.shadowColor = max_potuzhnoBlue().CGColor;
+    panel.layer.shadowOpacity = dark ? 0.45 : 0.22;
+    panel.layer.shadowRadius = 18;
+    panel.layer.shadowOffset = CGSizeMake(0, 8);
     [ov addSubview:panel];
     ov->_panel = panel;
 
+    UIBlurEffectStyle style = dark
+        ? UIBlurEffectStyleSystemMaterialDark
+        : UIBlurEffectStyleSystemMaterialLight;
+    UIVisualEffectView *blur =
+        [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:style]];
+    blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    blur.layer.cornerRadius = 16;
+    blur.layer.cornerCurve = kCACornerCurveContinuous;
+    blur.layer.masksToBounds = YES;
+    blur.layer.borderWidth = 0.5;
+    blur.layer.borderColor = [max_potuzhnoBlue() colorWithAlphaComponent:dark ? 0.45 : 0.28].CGColor;
+    [panel addSubview:blur];
+
+    UIView *rowsHost = blur.contentView;
+
     // ---- rows + separators
-    CGFloat const rowH = 46.0;
+    CGFloat const rowH = 48.0;
     CGFloat const maxPanelWidth = 300.0;
     CGFloat textWidth = 0;
     for (UIAction *a in actions) {
@@ -800,24 +831,29 @@ static MAXMenuOverlay *g_overlay = nil;
                                               action:action];
         [btn addTarget:ov action:@selector(itemTapped:)
               forControlEvents:UIControlEventTouchUpInside];
-        [panel addSubview:btn];
+        [rowsHost addSubview:btn];
         y += rowH;
         if (i + 1 < actions.count) {
             UIView *sep = [[UIView alloc]
                 initWithFrame:CGRectMake(16, y, panelWidth - 32, 0.5)];
-            sep.backgroundColor =
-                [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
-                    return tc.userInterfaceStyle == UIUserInterfaceStyleDark
-                        ? [UIColor colorWithWhite:1 alpha:0.12]
-                        : [UIColor colorWithWhite:0 alpha:0.10];
-                }];
-            [panel addSubview:sep];
+            sep.backgroundColor = [max_potuzhnoBlue() colorWithAlphaComponent:dark ? 0.28 : 0.16];
+            [rowsHost addSubview:sep];
             y += 0.5;
         }
     }
     y += 5;
 
     panel.frame = CGRectMake(0, 0, panelWidth, y);
+    blur.frame = panel.bounds;
+
+    // Flag strip on the leading edge (blue over yellow).
+    CGFloat const stripW = 3.0;
+    UIView *blueStrip = [[UIView alloc] initWithFrame:CGRectMake(0, 0, stripW, y / 2.0)];
+    blueStrip.backgroundColor = max_potuzhnoBlue();
+    UIView *yellowStrip = [[UIView alloc] initWithFrame:CGRectMake(0, y / 2.0, stripW, y / 2.0)];
+    yellowStrip.backgroundColor = max_potuzhnoYellow();
+    [rowsHost addSubview:blueStrip];
+    [rowsHost addSubview:yellowStrip];
 
     // ---- position (Telegram-like): menu ABOVE the message bubble,
     // below if there's no room above; horizontally centered on the bubble,
@@ -862,12 +898,13 @@ static MAXMenuOverlay *g_overlay = nil;
         snapView.alpha = 0;
         snapView.transform = CGAffineTransformMakeTranslation(0, 6);
     }
-    [UIView animateWithDuration:0.18 delay:0
+    [UIView animateWithDuration:0.32 delay:0
+         usingSpringWithDamping:0.82 initialSpringVelocity:0.45
                         options:UIViewAnimationOptionCurveEaseOut
                      animations:^{
         panel.transform = CGAffineTransformIdentity;
         panel.alpha = 1;
-        bg.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.10];
+        bg.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.28];
         if (snapView) {
             snapView.alpha = 1;
             snapView.transform = CGAffineTransformIdentity;
@@ -964,6 +1001,126 @@ static void max_installBrandIcons(void) {
     if (!orig_imageNamed) { maxlog(@"brand-icons: imageNamed: not found"); return; }
     maxlog(@"brand-icons: substituted %lu MAX asset name(s)",
            (unsigned long)g_brandIcons.count);
+}
+
+// ============================================================================
+#pragma mark - Brand strings: MAX → Потужно (runtime)
+// ============================================================================
+
+static IMP orig_localized = NULL;
+static IMP orig_infoDict = NULL;
+static IMP orig_objectForInfo = NULL;
+
+static NSString *max_rebrandString(NSString *s) {
+    if (![s isKindOfClass:[NSString class]] || s.length < 3) return s;
+    if ([s rangeOfString:@"MAX" options:NSCaseInsensitiveSearch].location == NSNotFound &&
+        [s rangeOfString:@"макс" options:NSCaseInsensitiveSearch].location == NSNotFound)
+        return s;
+    // Whole-token only: "MAX" / "макс" / "Макс", not "maximum" / "max_logo".
+    static NSRegularExpression *re = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        re = [NSRegularExpression regularExpressionWithPattern:
+              @"(?<![\\p{L}\\p{N}_])(MAX|Max|макс|Макс|МАКС)(?![\\p{L}\\p{N}_])"
+              options:0 error:nil];
+    });
+    if (!re) return s;
+    return [re stringByReplacingMatchesInString:s options:0
+                                          range:NSMakeRange(0, s.length)
+                                   withTemplate:@"Потужно"];
+}
+
+static BOOL max_isAppBundle(NSBundle *b) {
+    if (!b) return NO;
+    NSBundle *main = [NSBundle mainBundle];
+    if (b == main) return YES;
+    NSString *ident = b.bundleIdentifier ?: @"";
+    if ([ident hasPrefix:@"ru.oneme"] || [ident containsString:@"MAX"]) return YES;
+    NSString *path = b.bundlePath ?: @"";
+    return [path containsString:@".app/"];
+}
+
+static id hook_localized(id self, SEL _cmd, NSString *key, NSString *value, NSString *table) {
+    id r = orig_localized
+        ? ((id(*)(id,SEL,id,id,id))orig_localized)(self, _cmd, key, value, table)
+        : value;
+    if (!max_isAppBundle((NSBundle *)self)) return r;
+    id branded = max_rebrandString(r);
+    return branded ?: r;
+}
+
+static NSMutableDictionary *g_brandedInfoCache = nil;
+
+static id hook_infoDict(id self, SEL _cmd) {
+    NSDictionary *d = orig_infoDict
+        ? ((id(*)(id,SEL))orig_infoDict)(self, _cmd)
+        : nil;
+    if (!max_isAppBundle((NSBundle *)self)) return d;
+    if (![d isKindOfClass:[NSDictionary class]]) return d;
+    if (!g_brandedInfoCache) g_brandedInfoCache = [NSMutableDictionary new];
+    NSString *cacheKey = ((NSBundle *)self).bundlePath ?: @"main";
+    NSDictionary *cached = g_brandedInfoCache[cacheKey];
+    if (cached) return cached;
+    static NSSet *keys = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        keys = [NSSet setWithArray:@[
+            @"CFBundleDisplayName", @"CFBundleName",
+            @"NSCameraUsageDescription", @"NSContactsUsageDescription",
+            @"NSLocalNetworkUsageDescription",
+            @"NSPhotoLibraryAddUsageDescription",
+            @"NSPhotoLibraryUsageDescription",
+        ]];
+    });
+    NSMutableDictionary *m = [d mutableCopy];
+    BOOL changed = NO;
+    for (NSString *k in keys) {
+        id v = m[k];
+        NSString *b = max_rebrandString(v);
+        if ([k isEqualToString:@"CFBundleDisplayName"] || [k isEqualToString:@"CFBundleName"])
+            b = @"Потужно";
+        if (b && ![b isEqual:v]) { m[k] = b; changed = YES; }
+    }
+    id alt = m[@"INAlternativeAppNames"];
+    if ([alt isKindOfClass:[NSArray class]]) {
+        NSMutableArray *na = [NSMutableArray array];
+        for (id item in alt) {
+            if ([item isKindOfClass:[NSDictionary class]]) {
+                NSMutableDictionary *im = [item mutableCopy];
+                NSString *n = max_rebrandString(im[@"INAlternativeAppName"]);
+                if (n) im[@"INAlternativeAppName"] = n;
+                [na addObject:im];
+            } else {
+                [na addObject:item];
+            }
+        }
+        m[@"INAlternativeAppNames"] = na;
+        changed = YES;
+    }
+    NSDictionary *result = changed ? [m copy] : d;
+    g_brandedInfoCache[cacheKey] = result;
+    return result;
+}
+
+static id hook_objectForInfo(id self, SEL _cmd, NSString *key) {
+    id v = orig_objectForInfo
+        ? ((id(*)(id,SEL,id))orig_objectForInfo)(self, _cmd, key)
+        : nil;
+    if (!max_isAppBundle((NSBundle *)self)) return v;
+    return max_rebrandString(v) ?: v;
+}
+
+static void max_installBrandStrings(void) {
+    orig_localized = swizzle([NSBundle class],
+        @selector(localizedStringForKey:value:table:), (IMP)hook_localized);
+    orig_infoDict = swizzle([NSBundle class],
+        @selector(infoDictionary), (IMP)hook_infoDict);
+    orig_objectForInfo = swizzle([NSBundle class],
+        @selector(objectForInfoDictionaryKey:), (IMP)hook_objectForInfo);
+    maxlog(@"brand-strings: localized %@  infoDict %@  objectForInfo %@",
+           orig_localized ? @"OK" : @"MISS",
+           orig_infoDict ? @"OK" : @"MISS",
+           orig_objectForInfo ? @"OK" : @"MISS");
 }
 
 static void max_installAdBlocker(void) {
@@ -1753,38 +1910,56 @@ static void max_installSettingsViewPruner(void) {
 #endif  // end removed settings-view machinery
 #pragma mark - Ghost mode hook (switch-controlled)
 //
-// v10.0: the ONLY privacy switch left. Switches live in NSUserDefaults and
-// are toggled from the Моды tab:
-//   mod.read    — don't send read receipts      (block markAsReadTo:messageId:)
+// v12.3: dedicated orig IMPs. The old table lookup used object_getClass(self)
+// which misses KVO / Swift subclasses, then returned nil even with the
+// switch OFF — receipts never left. Now: one stored IMP per selector, and
+// OFF always forwards. Defaults live in standardUserDefaults AND a cache
+// so a missing key never silently blocks.
+//   mod.read — don't send read receipts (markAsReadTo: / markReactionAsReadTo:)
 // ============================================================================
 
+static BOOL g_blockRead = YES;   // matches constructor default (ON until toggled)
+
 static BOOL max_modOn(NSString *key) {
+    if ([key isEqualToString:@"mod.read"]) return g_blockRead;
     return [[NSUserDefaults standardUserDefaults] boolForKey:key];
 }
 
-typedef struct {
-    Class cls;
-    SEL sel;
-    IMP orig;
-} ModHook;
-
-static ModHook g_modHooks[128];
-static int g_nModHooks = 0;
-
-static IMP max_modOrig(Class cls, SEL sel) {
-    for (int i = 0; i < g_nModHooks; i++)
-        if (g_modHooks[i].sel == sel && g_modHooks[i].cls == cls)
-            return g_modHooks[i].orig;
-    for (int i = 0; i < g_nModHooks; i++)     // subclass fallback
-        if (g_modHooks[i].sel == sel)
-            return g_modHooks[i].orig;
-    return NULL;
+static void max_setModRead(BOOL on) {
+    g_blockRead = on;
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setBool:on forKey:@"mod.read"];
+    [d synchronize];
 }
 
+static IMP g_origMarkAsRead = NULL;
+static IMP g_origMarkReactionAsRead = NULL;
+
 static id max_hook_read2(id self, SEL _cmd, id a, id b) {
-    if (max_modOn(@"mod.read")) return nil;   // don't send the receipt
-    IMP o = max_modOrig(object_getClass(self), _cmd);
-    return o ? ((id(*)(id,SEL,id,id))o)(self, _cmd, a, b) : nil;
+    if (g_blockRead) {
+        maxlog(@"ghost: drop %@ (mod.read ON)", NSStringFromSelector(_cmd));
+        return nil;
+    }
+    IMP o = NULL;
+    if (_cmd == sel_registerName("markAsReadTo:messageId:"))
+        o = g_origMarkAsRead;
+    else if (_cmd == sel_registerName("markReactionAsReadTo:messageId:"))
+        o = g_origMarkReactionAsRead;
+    if (!o) {
+        maxlog(@"ghost: PASS %@ but orig IMP missing — calling super lookup",
+               NSStringFromSelector(_cmd));
+        Method m = class_getInstanceMethod(object_getClass(self), _cmd);
+        if (m) {
+            IMP cand = method_getImplementation(m);
+            if (cand && cand != (IMP)max_hook_read2) o = cand;
+        }
+    }
+    if (!o) {
+        maxlog(@"ghost: WARNING no orig for %@ — cannot send receipt",
+               NSStringFromSelector(_cmd));
+        return nil;
+    }
+    return ((id(*)(id,SEL,id,id))o)(self, _cmd, a, b);
 }
 
 // ============================================================================
@@ -2461,37 +2636,50 @@ static void max_installDeletedFlagHook(void) {
 }
 
 #endif  // end removed block 1 (flag/forAll hooks)
+static int max_hookOwnSel(Class cls, SEL sel, IMP hook, IMP *outOrig) {
+    if (!cls) return 0;
+    Method own = max_ownInstanceMethod(cls, sel);
+    if (!own) return 0;
+    IMP orig = method_getImplementation(own);
+    if (!orig || orig == hook) return 0;
+    if (outOrig && !*outOrig) *outOrig = orig;
+    method_setImplementation(own, hook);
+    maxlog(@"ghost: hooked %s %s orig=%p", class_getName(cls), sel_getName(sel), orig);
+    return 1;
+}
+
 static void max_installGhostHooks(void) {
-    // v10.0: privacy-ghost features (typing/online/deleted) were removed at
-    // the user's request — deletion is fully native now, and "invisible"
-    // status is pointless (MAX shows "recently" anyway). The ONLY privacy
-    // switch left is mod.read: block the read receipt.
-    SEL sel = sel_registerName("markAsReadTo:messageId:");
+    // Owner in the class dump is OKMChatHandler (markAsReadTo:messageId: at
+    // 0x100843fa8, markReactionAsReadTo:messageId: at 0x10084418c). Walk a
+    // tiny allow-list first; only then scan the class list as a safety net
+    // so a renamed class still gets hooked — but we store ONE orig IMP.
+    SEL readSel = sel_registerName("markAsReadTo:messageId:");
+    SEL reactSel = sel_registerName("markReactionAsReadTo:messageId:");
     IMP hook = (IMP)max_hook_read2;
-    unsigned int classCount = 0;
-    Class *classes = objc_copyClassList(&classCount);
+
+    const char *prefer[] = { "OKMChatHandler", "OKMChatService", NULL };
     int hits = 0;
-    for (unsigned i = 0; i < classCount; i++) {
-        Class cls = classes[i];
-        // Only classes that IMPLEMENT the selector. class_getInstanceMethod
-        // walks superclasses, so the old loop hooked every subclass of the
-        // real owner, then method_setImplementation mutated the SUPERCLASS
-        // Method — every later subclass stored the hook itself as "orig".
-        Method own = max_ownInstanceMethod(cls, sel);
-        if (!own) continue;
-        IMP orig = method_getImplementation(own);
-        if (orig == hook) continue;
-        if (g_nModHooks < 128) {
-            g_modHooks[g_nModHooks].cls = cls;
-            g_modHooks[g_nModHooks].sel = sel;
-            g_modHooks[g_nModHooks].orig = orig;
-            g_nModHooks++;
-        }
-        method_setImplementation(own, hook);
-        hits++;
+    for (int i = 0; prefer[i]; i++) {
+        Class cls = objc_getClass(prefer[i]);
+        hits += max_hookOwnSel(cls, readSel, hook, &g_origMarkAsRead);
+        hits += max_hookOwnSel(cls, reactSel, hook, &g_origMarkReactionAsRead);
     }
-    free(classes);
-    maxlog(@"ghost: hook markAsReadTo:messageId: -> %d class(es)", hits);
+
+    if (!g_origMarkAsRead || !g_origMarkReactionAsRead) {
+        unsigned int classCount = 0;
+        Class *classes = objc_copyClassList(&classCount);
+        for (unsigned i = 0; i < classCount; i++) {
+            Class cls = classes[i];
+            if (!g_origMarkAsRead)
+                hits += max_hookOwnSel(cls, readSel, hook, &g_origMarkAsRead);
+            if (!g_origMarkReactionAsRead)
+                hits += max_hookOwnSel(cls, reactSel, hook, &g_origMarkReactionAsRead);
+            if (g_origMarkAsRead && g_origMarkReactionAsRead) break;
+        }
+        free(classes);
+    }
+    maxlog(@"ghost: read-hooks %d  origRead=%p origReact=%p  block=%d",
+           hits, g_origMarkAsRead, g_origMarkReactionAsRead, (int)g_blockRead);
 }
 
 static IMP orig_deleteMessageCtx = NULL;
@@ -2659,7 +2847,7 @@ typedef struct {
 
 static ModEntry max_modEntries[] = {
     { .title = @"Не отправлять «прочитано»", .key = @"mod.read",
-      .subtitle = @"Собеседник не увидит, что вы прочитали сообщение" },
+      .subtitle = @"Выкл = обычные галочки. Вкл = собеседник не видит прочтение" },
 };
 static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntries[0]);
 
@@ -2702,6 +2890,7 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
                                     reuseIdentifier:kModCell];
         UISwitch *sw = [UISwitch new];
+        sw.onTintColor = max_potuzhnoBlue();
         [sw addTarget:self action:@selector(switchChanged:)
              forControlEvents:UIControlEventValueChanged];
         cell.accessoryView = sw;
@@ -2711,8 +2900,7 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
     cell.textLabel.text = e.title;
     cell.detailTextLabel.text = e.subtitle;
     cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
-    [(UISwitch *)cell.accessoryView
-        setOn:[[NSUserDefaults standardUserDefaults] boolForKey:e.key]];
+    [(UISwitch *)cell.accessoryView setOn:max_modOn(e.key)];
     [(UISwitch *)cell.accessoryView setTag:ip.row];
     return cell;
 }
@@ -2768,8 +2956,15 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
 - (void)switchChanged:(UISwitch *)sw {
     if (sw.tag >= (NSInteger)kModCount) return;
     ModEntry e = max_modEntries[sw.tag];
-    [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:e.key];
-    maxlog(@"mods: %@ -> %@", e.key, sw.on ? @"ON" : @"OFF");
+    if ([e.key isEqualToString:@"mod.read"]) {
+        max_setModRead(sw.on);
+    } else {
+        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+        [d setBool:sw.on forKey:e.key];
+        [d synchronize];
+    }
+    maxlog(@"mods: %@ -> %@ (blockRead=%d)", e.key,
+           sw.on ? @"ON" : @"OFF", (int)g_blockRead);
 }
 
 @end
@@ -3022,7 +3217,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.2 loading (menu fire, ghost-hook recursion, tab-bar long-press, swizzle safety)...");
+    maxlog(@"v12.3 loading (read-off fix, overlay polish, Потужно strings)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -3063,6 +3258,7 @@ static void maxmods_init(void) {
     // 3) Ads & junk blocker: promo banners, informer banners, suggested
     //    chats, myTarget ad id — all neutralized.
     max_installBrandIcons();
+    max_installBrandStrings();
     max_installAdBlocker();
 
     // 4) Feature pruning: stories / Digital ID / mini-apps / channels,
@@ -3070,29 +3266,29 @@ static void maxmods_init(void) {
     max_installFeaturePruner();
     max_installSettingsPruner();
 
-    // 5) Ghost hooks — v10.0: ONLY the read-receipt blocker (mod.read).
-    //    Everything delete-related is native now: the whole two-phase /
-    //    keep-deleted / dim machinery was removed at the user's request
-    //    (server sync of status-2 made kept messages flicker and resurrect
-    //    unpredictably — not worth fighting MAX's server behavior).
+    // defaults FIRST — g_blockRead must match the stored switch before any
+    // markAsRead call can race the constructor. Missing key => ON (privacy).
+    {
+        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+        for (NSUInteger i = 0; i < kModCount; i++) {
+            ModEntry e = max_modEntries[i];
+            if ([e.key isEqualToString:@"mod.sysmenu"]) {
+                if ([d objectForKey:e.key] == nil) [d setBool:NO forKey:e.key];
+                continue;
+            }
+            if ([d objectForKey:e.key] == nil) [d setBool:YES forKey:e.key];
+        }
+        if ([d objectForKey:@"mod.read"] != nil)
+            g_blockRead = [d boolForKey:@"mod.read"];
+        else
+            g_blockRead = YES;
+        [d synchronize];
+        maxlog(@"mods: restored mod.read=%d", (int)g_blockRead);
+    }
+
+    // 5) Ghost hooks — v12.3: dedicated orig IMPs so OFF actually sends.
     max_installGhostHooks();
     max_installSysmenuDiagnostics();
-
-    // v10.0: the marked-list reset below is gone with the dim module —
-    // stale mod.markedDeleted / mod.markedIndexPaths values are now inert
-    // (nothing reads them), but wipe them once so they don't linger.
-
-    // defaults: mods ON until the user turns them off (mod.read only, v10.0)
-    // mod.sysmenu defaults OFF — it deliberately re-enables the HANGING menu
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    for (NSUInteger i = 0; i < kModCount; i++) {
-        ModEntry e = max_modEntries[i];
-        if ([e.key isEqualToString:@"mod.sysmenu"]) {
-            if ([d objectForKey:e.key] == nil) [d setBool:NO forKey:e.key];
-            continue;
-        }
-        if ([d objectForKey:e.key] == nil) [d setBool:YES forKey:e.key];
-    }
 
     // 6) «Моды» entry points:
     //    a) long-press (0.5s) the LAST tab (Settings) — the reliable way,
@@ -3139,5 +3335,5 @@ static void maxmods_init(void) {
 
     max_scheduleWatchdog();
 
-    maxlog(@"v12.2 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v12.3 loaded OK — log file: %@", max_logPath());
 }
