@@ -2945,7 +2945,8 @@ static void hook_tabBarViewDidLoad(id self, SEL _cmd) {
     }
     for (UIGestureRecognizer *g in barView.gestureRecognizers) {
         if ([g isKindOfClass:[UILongPressGestureRecognizer class]] &&
-            g.minimumPressDuration == 0.5) return;   // already attached
+            ((UILongPressGestureRecognizer *)g).minimumPressDuration == 0.5)
+            return;   // already attached
     }
     UILongPressGestureRecognizer *lp =
         [[UILongPressGestureRecognizer alloc]

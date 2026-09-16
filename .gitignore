@@ -5,3 +5,6 @@ obj/
 MAX_test
 __pycache__/
 inject_dylib.py
+.gh_token.tmp
+output/
+*.ipa

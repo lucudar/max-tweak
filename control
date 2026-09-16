@@ -1,7 +1,7 @@
 Package: ru.oneme.maxmods
 Name: MAXMods
 Depends: mobilesubstrate
-Version: 12.2.0
+Version: 12.2.1
 Architecture: iphoneos-arm64
 Description: Ghost mode, anti-delete, force save media, remove ads for MAX messenger
 Maintainer: dev
