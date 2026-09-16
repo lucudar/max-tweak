@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Pack Potuzhno IPA: replace Frameworks/Mods.dylib and rebrand MAX strings.
+"""Pack Potuzhno IPA: replace Frameworks/Mods.dylib and rebrand display strings.
 
-The FINAL IPA already has LC_LOAD_DYLIB @executable_path/Frameworks/Mods.dylib.
-We keep that load command and only swap the file bytes so the new tweak loads
-without a second Mods.dylib (the old v6 swizzle must not ship alongside v12).
+Never touch CFBundleExecutable / bundle identifiers — signers look up
+Payload/MAX.app/MAX by the executable name in Info.plist.
 """
 from __future__ import annotations
 
@@ -25,14 +24,21 @@ MH_MAGIC_64 = 0xFEEDFACF
 TOKEN_RE = re.compile(
     r"(?<![A-Za-zА-Яа-яЁё0-9_])(MAX|Max|макс|Макс|МАКС)(?![A-Za-zА-Яа-яЁё0-9_])"
 )
-PLIST_KEYS = {
-    "CFBundleDisplayName",
-    "CFBundleName",
+
+# Keys we may rewrite on the MAIN app / localization files only.
+DISPLAY_KEYS = {"CFBundleDisplayName", "CFBundleName"}
+USAGE_KEYS = {
     "NSCameraUsageDescription",
     "NSContactsUsageDescription",
     "NSLocalNetworkUsageDescription",
     "NSPhotoLibraryAddUsageDescription",
     "NSPhotoLibraryUsageDescription",
+}
+NEVER_TOUCH = {
+    "CFBundleExecutable",
+    "CFBundleIdentifier",
+    "CFBundlePackageType",
+    "AppIdentifierPrefix",
 }
 
 
@@ -52,53 +58,95 @@ def rebrand_text(s: str) -> str:
     return TOKEN_RE.sub("Потужно", s)
 
 
-def rebrand_obj(obj):
-    if isinstance(obj, dict):
-        out = {}
-        for k, v in obj.items():
-            if k in PLIST_KEYS and isinstance(v, str):
-                if k in ("CFBundleDisplayName", "CFBundleName"):
+def is_main_app_plist(name: str) -> bool:
+    n = name.replace("\\", "/")
+    return n == "Payload/MAX.app/Info.plist"
+
+
+def is_app_lproj_strings(name: str) -> bool:
+    n = name.replace("\\", "/").lower()
+    if "/frameworks/" in n or "/plugins/" in n:
+        return False
+    return n.endswith("infoplist.strings")
+
+
+def is_extension_info_plist(name: str) -> bool:
+    n = name.replace("\\", "/").lower()
+    return "/plugins/" in n and n.endswith("info.plist") and n.count("/") <= 5
+
+
+def mutate_plist(name: str, plist):
+    """Return a new object or the same object if unchanged."""
+    if not isinstance(plist, dict):
+        return plist
+    out = dict(plist)
+    changed = False
+
+    if is_main_app_plist(name) or is_app_lproj_strings(name):
+        for k in DISPLAY_KEYS:
+            if k in out and isinstance(out[k], str):
+                if out[k] != "Потужно":
                     out[k] = "Потужно"
+                    changed = True
+        for k in USAGE_KEYS:
+            if k in out and isinstance(out[k], str):
+                branded = rebrand_text(out[k])
+                if branded != out[k]:
+                    out[k] = branded
+                    changed = True
+        alt = out.get("INAlternativeAppNames")
+        if isinstance(alt, list):
+            na = []
+            for item in alt:
+                if isinstance(item, dict):
+                    im = dict(item)
+                    if isinstance(im.get("INAlternativeAppName"), str):
+                        im["INAlternativeAppName"] = "Потужно"
+                    na.append(im)
                 else:
-                    out[k] = rebrand_text(v)
-            elif k == "INAlternativeAppNames":
-                out[k] = rebrand_obj(v)
-            elif k == "INAlternativeAppName" and isinstance(v, str):
-                out[k] = "Потужно"
-            else:
-                out[k] = rebrand_obj(v)
-        return out
-    if isinstance(obj, list):
-        return [rebrand_obj(x) for x in obj]
-    if isinstance(obj, str):
-        return rebrand_text(obj)
-    return obj
+                    na.append(item)
+            if na != alt:
+                out["INAlternativeAppNames"] = na
+                changed = True
+        return out if changed else plist
+
+    if is_extension_info_plist(name) or name.lower().endswith("infoplist.strings"):
+        # Extensions: only usage-description tokens, never executable / id.
+        for k, v in list(out.items()):
+            if k in NEVER_TOUCH:
+                continue
+            if k in USAGE_KEYS and isinstance(v, str):
+                branded = rebrand_text(v)
+                if branded != v:
+                    out[k] = branded
+                    changed = True
+            elif k in DISPLAY_KEYS and isinstance(v, str) and TOKEN_RE.search(v):
+                out[k] = TOKEN_RE.sub("Потужно", v)
+                changed = True
+        return out if changed else plist
+
+    return plist
 
 
 def maybe_rebrand_plist(name: str, data: bytes) -> bytes | None:
     lower = name.replace("\\", "/").lower()
+    if "/frameworks/" in lower:
+        return None
     if not (
-        lower.endswith("info.plist")
-        or lower.endswith("infoplist.strings")
-        or lower.endswith("appintentvocabulary.plist")
+        is_main_app_plist(name)
+        or is_app_lproj_strings(name)
+        or is_extension_info_plist(name)
+        or (lower.endswith("infoplist.strings") and "/frameworks/" not in lower)
     ):
         return None
-    if "frameworks/" in lower and "cydiasubstrate" not in lower:
-        # leave vendor frameworks alone (WebRTC, VPX, …)
-        if not lower.endswith("infoplist.strings"):
-            return None
     try:
         plist = plistlib.loads(data)
     except Exception:
         return None
-    branded = rebrand_obj(plist)
-    if branded == plist:
+    branded = mutate_plist(name, plist)
+    if branded is plist:
         return None
-    fmt = (
-        plistlib.FMT_BINARY
-        if data[:8] == b"bplist00"
-        else plistlib.FMT_XML
-    )
+    fmt = plistlib.FMT_BINARY if data[:8] == b"bplist00" else plistlib.FMT_XML
     buf = io.BytesIO()
     plistlib.dump(branded, buf, fmt=fmt, sort_keys=False)
     return buf.getvalue()
@@ -125,6 +173,10 @@ def pack(ipa_src: Path, dylib: Path, ipa_out: Path) -> None:
             zi = zipfile.ZipInfo(info.filename, date_time=info.date_time)
             zi.compress_type = zipfile.ZIP_DEFLATED
             zi.external_attr = info.external_attr
+            zi.create_system = info.create_system
+            zi.flag_bits = info.flag_bits
+            if info.extra:
+                zi.extra = info.extra
 
             if info.filename == MEMBER:
                 zout.writestr(zi, dylib_bytes)
