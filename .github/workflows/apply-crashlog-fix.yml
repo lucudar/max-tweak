@@ -1,0 +1,73 @@
+name: apply-crashlog-fix
+
+on:
+  push:
+    branches:
+      - fix/crash-log-persistence
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply crash-log persistence fix
+        run: |
+          python3 - <<'PY'
+          import io, sys
+
+          P = 'Tweak.m'
+          s = io.open(P, encoding='utf-8').read()
+
+          def J(*lines):
+              return '\n'.join(lines) + '\n'
+
+          f1 = J('        if ([attrs fileSize] > 2 * 1024 * 1024)',
+                 '            [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];')
+          r1 = J('        if ([attrs fileSize] > 2 * 1024 * 1024)',
+                 '            // atomically:NO - an atomic write renames a temp file over',
+                 '            // the log and swaps the inode, detaching the cached crash fd.',
+                 '            [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];')
+
+          f2 = J('        // truncate the log',
+                 '        [@"" writeToFile:max_logPath() atomically:YES',
+                 '              encoding:NSUTF8StringEncoding error:nil];')
+          r2 = J('        // truncate in place (atomically:NO): an atomic write swaps',
+                 '        // the inode and detaches the cached crash fd',
+                 '        [@"" writeToFile:max_logPath() atomically:NO',
+                 '              encoding:NSUTF8StringEncoding error:nil];')
+
+          f3 = J('            maxlog(@"WATCHDOG: MAIN THREAD STUCK >2s \u2014 app frozen");')
+          r3 = J('            maxlog(@"WATCHDOG: MAIN THREAD STUCK >2s \u2014 app frozen");',
+                 '            // flush: a SIGKILLed freeze would otherwise lose the async',
+                 '            // append. The log queue is independent of the stuck main thread.',
+                 '            dispatch_sync(max_logQueue(), ^{});')
+
+          applied = 0
+          for f, r in ((f1, r1), (f2, r2), (f3, r3)):
+              if r in s:
+                  print('edit already applied')
+                  continue
+              c = s.count(f)
+              if c != 1:
+                  print('FAIL: target matched %d time(s)' % c)
+                  sys.exit(1)
+              s = s.replace(f, r)
+              applied += 1
+
+          io.open(P, 'w', encoding='utf-8', newline='').write(s)
+          print('applied %d edit(s)' % applied)
+          PY
+
+      - name: Commit the fix
+        run: |
+          git --no-pager diff
+          if git diff --quiet; then echo 'nothing to commit'; exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Tweak.m
+          git commit -m 'fix(logging): keep crash-log fd valid across rotation; flush watchdog line'
+          git push origin HEAD:fix/crash-log-persistence
