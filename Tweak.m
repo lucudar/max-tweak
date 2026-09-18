@@ -238,6 +238,7 @@ static void max_scheduleWatchdog(void) {
 
 static volatile sig_atomic_t g_inCrashHandler = 0;
 static int g_crashFd = -1;   // cached at install time: no ObjC in the handler
+static BOOL g_blockRead = YES;   // declared early: crash dump reads it (ON until toggled)
 
 static void max_crashLog(const char *reason) {
     if (g_inCrashHandler) return;
@@ -1984,7 +1985,7 @@ static void max_installSettingsViewPruner(void) {
 //   mod.read — don't send read receipts (markAsReadTo: / markReactionAsReadTo:)
 // ============================================================================
 
-static BOOL g_blockRead = YES;   // matches constructor default (ON until toggled)
+// g_blockRead declared with crash-catcher globals (used by max_crashLog)
 
 static BOOL max_modOn(NSString *key) {
     if ([key isEqualToString:@"mod.read"]) return g_blockRead;
