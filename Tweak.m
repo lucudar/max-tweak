@@ -158,7 +158,9 @@ static void maxlog(NSString *fmt, ...) {
             [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
         NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
         if ([attrs fileSize] > 2 * 1024 * 1024)
-            [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            // atomically:NO - an atomic write renames a temp file over
+            // the log and swaps the inode, detaching the cached crash fd.
+            [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
 
         NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
         if (!fh) return;
@@ -179,6 +181,9 @@ static void max_scheduleWatchdog(void) {
         if (dispatch_semaphore_wait(sem,
                 dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC))) != 0) {
             maxlog(@"WATCHDOG: MAIN THREAD STUCK >2s — app frozen");
+            // flush: a SIGKILLed freeze would otherwise lose the async
+            // append. The log queue is independent of the stuck main thread.
+            dispatch_sync(max_logQueue(), ^{});
         }
         max_scheduleWatchdog();
     });
@@ -2940,8 +2945,9 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
             initWithActivityItems:@[url] applicationActivities:nil];
         [self presentViewController:av animated:YES completion:nil];
     } else if (ip.row == 2) {
-        // truncate the log
-        [@"" writeToFile:max_logPath() atomically:YES
+        // truncate in place (atomically:NO): an atomic write swaps
+        // the inode and detaches the cached crash fd
+        [@"" writeToFile:max_logPath() atomically:NO
               encoding:NSUTF8StringEncoding error:nil];
         maxlog(@"log: cleared by user");
         UIAlertController *al = [UIAlertController
