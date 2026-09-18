@@ -17,7 +17,7 @@ from pathlib import Path
 
 IPA_SRC = Path(r"C:\rev\rev\Potuzhno_v12_1_FINAL.ipa")
 DYLIB_SRC = Path(r"C:\Users\ll\Desktop\max-tweak\MAXMods.dylib")
-IPA_OUT = Path(r"C:\Users\ll\Desktop\max-tweak\Potuzhno_v12_3.ipa")
+IPA_OUT = Path(r"C:\Users\ll\Desktop\max-tweak\Potuzhno_v12_4_FULLLOG.ipa")
 MEMBER = "Payload/MAX.app/Frameworks/Mods.dylib"
 MH_MAGIC_64 = 0xFEEDFACF
 
