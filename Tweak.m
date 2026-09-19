@@ -1331,6 +1331,37 @@ static void max_installFeaturePruner(void) {
         { "MREventTracker", "trackCustomEvent:params:", (IMP)max_hookIdRetNil },
         { "MREventTracker", "trackDeeplinkEvent:clickId:", (IMP)max_hookIdRetNil },
                 { "MREventTracker", "flushIfNeeded:", (IMP)max_hookVoid1 },
+        // v12.10 audit: close the remaining MREventTracker emit/flush paths
+        // (trackInviteEvent: was missed before — the old name lacked the ':';
+        // the flush* methods are the DB->network drain, setup starts it all).
+        { "MREventTracker", "trackInviteEvent:", (IMP)max_hookVoid1 },
+        { "MREventTracker", "setup", (IMP)max_hookVoid0 },
+        { "MREventTracker", "flushEventsWithCompletionBlock:", (IMP)max_hookVoid1 },
+        { "MREventTracker", "flushWithCommand:completionBlock:", (IMP)max_hookVoid2 },
+        { "MRMainTracker", "onFlushEvents", (IMP)max_hookVoid0 },
+        // internal local-stats DB writer: never persist any stats entries
+        { "OKTTLocalStatsService", "logEntries:", (IMP)max_hookVoid1 },
+        { "OKTTLocalStatsService", "logEntries:inTransaction:", (IMP)max_hookVoid2 },
+        // v12.10 audit: myTarget SDK activity/install handlers that do NOT go
+        // through the already-blocked MRMainTracker/MREventTracker chokepoints.
+        // max_hookIdRetNil is a safe universal no-op (nil in x0) whatever the
+        // return type — never touches the args.
+        { "MRActivityHandler", "trackLaunch", (IMP)max_hookIdRetNil },
+        { "MRInstallHandler", "trackInstall:currentBuild:", (IMP)max_hookIdRetNil },
+        { "MRInstallHandler", "trackUpdate:savedBuild:currentVersion:currentBuild:", (IMP)max_hookIdRetNil },
+        { "_TtC13OMAppServices18OMMyTrackerService", "trackLoginAfterRegistration:", (IMP)max_hookIdRetNil },
+        // internal OMStatsServices SOURCES (feed OKMStatisticsService, already
+        // blocked at the delegate layer — kill at source too so nothing queues)
+        { "_TtC15OMStatsServices18BannerTrackService", "trackBannerEvent:logInfo:", (IMP)max_hookIdRetNil },
+        { "_TtC15OMStatsServices19ShareMaxStatService", "trackInlineButtonEvent:source:", (IMP)max_hookIdRetNil },
+        { "_TtC15OMStatsServices20OMStickerStatService", "trackStickerSendWithScreen:stickerSetId:position:count:", (IMP)max_hookIdRetNil },
+        { "_TtC15OMStatsServices20OMStickerStatService", "trackStickerSuggestsEnabled:", (IMP)max_hookIdRetNil },
+        { "_TtC15OMStatsServices21OMSettingsStatService", "trackEventWithWrappedEvent:", (IMP)max_hookIdRetNil },
+        { "_TtC15OMStatsServices24OMPermissionsStatService", "trackPermissionsOnStartIfNeeded", (IMP)max_hookIdRetNil },
+        { "_TtC15OMStatsServices26OMVideoMessagesStatService", "trackUploadErrorWithSessionId:sourceId:sourceType:", (IMP)max_hookIdRetNil },
+        { "OMVideoRateStatService", "trackChangeRateWithRate:source:", (IMP)max_hookIdRetNil },
+        // video diagnostics telemetry
+        { "OVDiagnosticsLog", "logMetric:withValue:", (IMP)max_hookIdRetNil },
         // the actual network send of tracker events
         { "MRMyTrackerService", "sendEventData:completion:", (IMP)max_hookVoid2 },
         // v11.3 audit: OKMStatisticsService aggregates EVERYTHING (screens,
@@ -3636,5 +3667,5 @@ static void maxmods_init(void) {
 
     // bump version string in log so we know FULL-LOG is active
     maxlog(@"v12.4-FULLLOG loaded OK — log file: %@ (sync/fsync, watchdog stack, crash dump, lifecycle)", max_logPath());
-    maxlog(@"v12.9 loaded OK (Моды header aligned + custom home icon) — log file: %@", max_logPath());
+    maxlog(@"v12.10 loaded OK (full tracker sweep) — log file: %@", max_logPath());
 }
