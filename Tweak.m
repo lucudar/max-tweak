@@ -3424,5 +3424,5 @@ static void maxmods_init(void) {
 
     // bump version string in log so we know FULL-LOG is active
     maxlog(@"v12.4-FULLLOG loaded OK — log file: %@ (sync/fsync, watchdog stack, crash dump, lifecycle)", max_logPath());
-    maxlog(@"v12.3 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v12.4 loaded OK — log file: %@", max_logPath());
 }
