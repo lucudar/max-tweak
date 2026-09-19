@@ -2797,9 +2797,13 @@ static void max_installGhostHooks(void) {
 // ============================================================================
 
 static NSMutableSet<NSString *> *g_ownDeletedPks = nil;   // user's own delete-for-all
+static NSMutableSet<NSString *> *g_keptDeletedIds = nil;  // kept (other-side) msg ids for dimming
 static IMP g_origMessagesDeletedInChat = NULL;
 static IMP g_origSendDeleteCommand = NULL;
 static IMP g_origSetStatus = NULL;
+static IMP g_origCellApplyLayout = NULL;
+static IMP g_origCellPrepareReuse = NULL;
+static const NSInteger kDeletedBadgeTag = 0x7DE1;
 
 static NSString *max_msgPk(id m) {
     if (!m) return nil;
@@ -2807,6 +2811,20 @@ static NSString *max_msgPk(id m) {
     if ([m respondsToSelector:sel])
         return [NSString stringWithFormat:@"%@", ((id(*)(id,SEL))objc_msgSend)(m, sel)];
     return nil;
+}
+
+// The chat part of a primaryKey can be "(null)" at setStatus time but real
+// when a cell shows it — so match on the trailing numeric message id only.
+static NSString *max_msgIdOnly(NSString *pk) {
+    if (pk.length == 0) return pk;
+    NSRange r = [pk rangeOfString:@"-" options:NSBackwardsSearch];
+    return (r.location != NSNotFound) ? [pk substringFromIndex:r.location + 1] : pk;
+}
+
+static CGFloat max_deletedAlpha(void) {
+    float a = [[NSUserDefaults standardUserDefaults] floatForKey:@"mod.del.alpha"];
+    if (a < 0.1f || a > 1.0f) a = 0.5f;   // default 50%
+    return a;
 }
 
 // The user deletes their own message(s) for everyone: remember the pks so
@@ -2828,7 +2846,14 @@ static id kd_hook_sendDeleteCommand(id self, SEL _cmd, id messages) {
 // keeps the message. Own deletes never come through this listener.
 static void kd_hook_messagesDeleted(id self, SEL _cmd, id ids, id chat) {
     if (max_modOn(@"mod.del")) {
-        maxlog(@"keep-del: suppressed incoming _messagesDeleted:inChat:");
+        @try {
+            NSArray *arr = [ids isKindOfClass:[NSArray class]] ? (NSArray *)ids
+                          : (ids ? @[ids] : @[]);
+            for (id mid in arr)
+                if (g_keptDeletedIds)
+                    [g_keptDeletedIds addObject:max_msgIdOnly([NSString stringWithFormat:@"%@", mid])];
+        } @catch (NSException *e) {}
+        maxlog(@"keep-del: suppressed incoming _messagesDeleted:inChat: ids=%@", ids);
         return;
     }
     if (g_origMessagesDeletedInChat)
@@ -2841,6 +2866,7 @@ static void kd_hook_setStatus(id self, SEL _cmd, long long status) {
     if (status == 2 && max_modOn(@"mod.del")) {
         NSString *pk = max_msgPk(self);
         if (!(pk && [g_ownDeletedPks containsObject:pk])) {
+            if (g_keptDeletedIds && pk) [g_keptDeletedIds addObject:max_msgIdOnly(pk)];
             maxlog(@"keep-del: kept message (blocked status2) pk=%@", pk);
             ((void(*)(id,SEL,long long))g_origSetStatus)(self, _cmd, 0);
             return;
@@ -2850,8 +2876,91 @@ static void kd_hook_setStatus(id self, SEL _cmd, long long status) {
     ((void(*)(id,SEL,long long))g_origSetStatus)(self, _cmd, status);
 }
 
+// ---- Visual mark: dim kept-deleted message cells + a trash badge ----------
+// MessageCell (Swift) exposes no message property, so find a message-like
+// object among its object ivars (the view model, or its .message) and read
+// the pk. Only object-typed ivars are dereferenced. Everything guarded.
+static id max_cellMessage(id cell) {
+    Class c = object_getClass(cell);
+    for (int depth = 0; c && depth < 5; depth++, c = class_getSuperclass(c)) {
+        unsigned int n = 0;
+        Ivar *ivars = class_copyIvarList(c, &n);
+        if (!ivars) continue;
+        id found = nil;
+        for (unsigned i = 0; i < n && !found; i++) {
+            const char *enc = ivar_getTypeEncoding(ivars[i]);
+            if (!enc || enc[0] != '@') continue;   // objects only
+            @try {
+                id val = object_getIvar(cell, ivars[i]);
+                if (!val) continue;
+                if ([val respondsToSelector:sel_registerName("primaryKey")] ||
+                    [val respondsToSelector:sel_registerName("messagePk")]) {
+                    found = val; break;
+                }
+                SEL msgSel = sel_registerName("message");
+                if ([val respondsToSelector:msgSel]) {
+                    id mm = ((id(*)(id,SEL))objc_msgSend)(val, msgSel);
+                    if (mm && [mm respondsToSelector:sel_registerName("primaryKey")]) {
+                        found = mm; break;
+                    }
+                }
+            } @catch (NSException *e) {}
+        }
+        free(ivars);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static void kd_applyDeletedStyle(UICollectionViewCell *cell, BOOL kept) {
+    UIView *cv = cell.contentView ?: (UIView *)cell;
+    UIImageView *badge = [cv viewWithTag:kDeletedBadgeTag];
+    if (kept) {
+        cv.alpha = max_deletedAlpha();
+        if (!badge) {
+            UIImage *img = [UIImage systemImageNamed:@"trash.fill"];
+            badge = [[UIImageView alloc] initWithImage:img];
+            badge.tag = kDeletedBadgeTag;
+            badge.tintColor = [UIColor systemRedColor];
+            badge.translatesAutoresizingMaskIntoConstraints = NO;
+            [cv addSubview:badge];
+            [NSLayoutConstraint activateConstraints:@[
+                [badge.topAnchor constraintEqualToAnchor:cv.topAnchor constant:2],
+                [badge.trailingAnchor constraintEqualToAnchor:cv.trailingAnchor constant:-6],
+                [badge.widthAnchor constraintEqualToConstant:15],
+                [badge.heightAnchor constraintEqualToConstant:15],
+            ]];
+        }
+        badge.hidden = NO;
+    } else {
+        cv.alpha = 1.0;
+        if (badge) badge.hidden = YES;
+    }
+}
+
+static void kd_hook_cellApplyLayout(id self, SEL _cmd, id attrs) {
+    if (g_origCellApplyLayout)
+        ((void(*)(id,SEL,id))g_origCellApplyLayout)(self, _cmd, attrs);
+    @try {
+        BOOL kept = NO;
+        if (max_modOn(@"mod.del") && g_keptDeletedIds.count) {
+            id msg = max_cellMessage(self);
+            NSString *pk = msg ? max_msgPk(msg) : nil;
+            if (pk && [g_keptDeletedIds containsObject:max_msgIdOnly(pk)]) kept = YES;
+        }
+        kd_applyDeletedStyle((UICollectionViewCell *)self, kept);
+    } @catch (NSException *e) {}
+}
+
+static void kd_hook_cellPrepareReuse(id self, SEL _cmd) {
+    @try { kd_applyDeletedStyle((UICollectionViewCell *)self, NO); } @catch (NSException *e) {}
+    if (g_origCellPrepareReuse)
+        ((void(*)(id,SEL))g_origCellPrepareReuse)(self, _cmd);
+}
+
 static void max_installKeepDeleted(void) {
     g_ownDeletedPks = [NSMutableSet set];
+    g_keptDeletedIds = [NSMutableSet set];
 
     Class listener = objc_getClass("OKMMessageDeleteListener");
     if (listener) {
@@ -2889,6 +2998,25 @@ static void max_installKeepDeleted(void) {
         } else {
             maxlog(@"keep-del: OKMMessage setStatus: not found");
         }
+    }
+
+    // Visual marking: dim + trash badge on kept-deleted message cells.
+    Class cell = objc_getClass("_TtC13ChatHistoryUI11MessageCell");
+    if (cell) {
+        Method m = class_getInstanceMethod(cell, sel_registerName("applyLayoutAttributes:"));
+        if (m) {
+            g_origCellApplyLayout = method_getImplementation(m);
+            method_setImplementation(m, (IMP)kd_hook_cellApplyLayout);
+            maxlog(@"keep-del: hooked MessageCell applyLayoutAttributes:");
+        }
+        Method pr = class_getInstanceMethod(cell, sel_registerName("prepareForReuse"));
+        if (pr) {
+            g_origCellPrepareReuse = method_getImplementation(pr);
+            method_setImplementation(pr, (IMP)kd_hook_cellPrepareReuse);
+            maxlog(@"keep-del: hooked MessageCell prepareForReuse");
+        }
+    } else {
+        maxlog(@"keep-del: MessageCell class not found (no dim)");
     }
 }
 
@@ -3132,7 +3260,9 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
 }
 
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
-    return (s == 0) ? @"Приватность" : @"Отладка";
+    if (s == 0) return @"Приватность";
+    if (s == 1) return @"Прозрачность удалённых";
+    return @"Отладка";
 }
 
 - (void)tableView:(UITableView *)tv willDisplayHeaderView:(UIView *)view
@@ -3145,20 +3275,61 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
 }
 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
-    return (s == 0)
-        ? @"Тумблеры хранятся на устройстве и работают сразу."
-        : @"Лог пишется в Documents/maxmods_log.txt.";
+    if (s == 0) return @"Тумблеры хранятся на устройстве и работают сразу.";
+    if (s == 1) return @"Насколько бледными показывать удалённые собеседником сообщения (нужен включённый «Видеть удалённые»).";
+    return @"Лог пишется в Documents/maxmods_log.txt.";
 }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 2; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 3; }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    return (s == 0) ? (NSInteger)kModCount : 3;   // 0: mods, 1: log actions
+    if (s == 0) return (NSInteger)kModCount;   // mods
+    if (s == 1) return 1;                       // opacity slider
+    return 3;                                   // log actions
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv
          cellForRowAtIndexPath:(NSIndexPath *)ip {
     if (ip.section == 1) {
+        // opacity slider for kept-deleted messages
+        static NSString *kSliderCell = @"maxslidercell";
+        UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:kSliderCell];
+        if (!cell) {
+            cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
+                                    reuseIdentifier:kSliderCell];
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            UISlider *sl = [[UISlider alloc] initWithFrame:CGRectZero];
+            sl.tag = 7100;
+            sl.minimumValue = 0.15f;
+            sl.maximumValue = 1.0f;
+            sl.minimumTrackTintColor = max_potuzhnoBlue();
+            sl.translatesAutoresizingMaskIntoConstraints = NO;
+            [sl addTarget:self action:@selector(sliderChanged:)
+                 forControlEvents:UIControlEventValueChanged];
+            [cell.contentView addSubview:sl];
+            UILabel *pct = [[UILabel alloc] initWithFrame:CGRectZero];
+            pct.tag = 7101;
+            pct.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightSemibold];
+            pct.textColor = max_potuzhnoBlue();
+            pct.textAlignment = NSTextAlignmentRight;
+            pct.translatesAutoresizingMaskIntoConstraints = NO;
+            [cell.contentView addSubview:pct];
+            [NSLayoutConstraint activateConstraints:@[
+                [sl.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16],
+                [sl.centerYAnchor constraintEqualToAnchor:cell.contentView.centerYAnchor],
+                [pct.leadingAnchor constraintEqualToAnchor:sl.trailingAnchor constant:12],
+                [pct.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16],
+                [pct.centerYAnchor constraintEqualToAnchor:cell.contentView.centerYAnchor],
+                [pct.widthAnchor constraintEqualToConstant:48],
+            ]];
+        }
+        CGFloat a = max_deletedAlpha();
+        [(UISlider *)[cell.contentView viewWithTag:7100] setValue:a animated:NO];
+        ((UILabel *)[cell.contentView viewWithTag:7101]).text =
+            [NSString stringWithFormat:@"%d%%", (int)(a * 100)];
+        return cell;
+    }
+    if (ip.section == 2) {
         // log actions: view / share / clear
         static NSString *kLogCell = @"maxlogcell";
         UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:kLogCell];
@@ -3207,11 +3378,21 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
 }
 
 - (CGFloat)tableView:(UITableView *)tv heightForRowAtIndexPath:(NSIndexPath *)ip {
-    return (ip.section == 0) ? 64.0 : 48.0;
+    if (ip.section == 0) return 64.0;
+    if (ip.section == 1) return 52.0;
+    return 48.0;
+}
+
+- (void)sliderChanged:(UISlider *)sl {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setFloat:sl.value forKey:@"mod.del.alpha"];
+    [d synchronize];
+    UILabel *pct = [(UIView *)sl.superview viewWithTag:7101];
+    pct.text = [NSString stringWithFormat:@"%d%%", (int)(sl.value * 100)];
 }
 
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
-    if (ip.section != 1) return;
+    if (ip.section != 2) return;   // only the log-actions section is tappable
     [tv deselectRowAtIndexPath:ip animated:YES];
 
     if (ip.row == 0) {
@@ -3782,5 +3963,5 @@ static void maxmods_init(void) {
 
     // bump version string in log so we know FULL-LOG is active
     maxlog(@"v12.4-FULLLOG loaded OK — log file: %@ (sync/fsync, watchdog stack, crash dump, lifecycle)", max_logPath());
-    maxlog(@"v12.11 loaded OK (keep-deleted experimental) — log file: %@", max_logPath());
+    maxlog(@"v12.12 loaded OK (keep-deleted dim + trash badge + opacity) — log file: %@", max_logPath());
 }
