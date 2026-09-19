@@ -2798,7 +2798,8 @@ static void max_installGhostHooks(void) {
 
 static NSMutableSet<NSString *> *g_ownDeletedPks = nil;   // user's own delete-for-all (pk)
 static NSMutableSet<NSString *> *g_ownDeletedIds = nil;   // user's own delete-for-all (id only)
-static NSMutableSet<NSString *> *g_keptDeletedIds = nil;  // kept (other-side) msg ids for dimming
+static NSMutableSet<NSString *> *g_keptDeletedIds = nil;  // kept (other-side) msg ids
+static NSMutableSet<NSString *> *g_keptDeletedTexts = nil; // kept msg TEXT (normalized) for cell match
 static IMP g_origMessagesDeletedInChat = NULL;
 static IMP g_origSendDeleteCommand = NULL;
 static IMP g_origSetStatus = NULL;
@@ -2813,6 +2814,37 @@ static NSString *max_msgPk(id m) {
     if ([m respondsToSelector:sel])
         return [NSString stringWithFormat:@"%@", ((id(*)(id,SEL))objc_msgSend)(m, sel)];
     return nil;
+}
+
+// Normalize a display string for matching: trim, collapse nothing (labels show
+// the text verbatim). Return nil for empty/too-short (avoid matching "").
+static NSString *max_normText(id s) {
+    if (!s) return nil;
+    NSString *str = nil;
+    if ([s isKindOfClass:[NSString class]]) str = (NSString *)s;
+    else if ([s respondsToSelector:@selector(string)])
+        @try { str = ((id(*)(id,SEL))objc_msgSend)(s, @selector(string)); } @catch (NSException *e) {}
+    if (![str isKindOfClass:[NSString class]]) return nil;
+    str = [str stringByTrimmingCharactersInSet:
+           [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return (str.length >= 2) ? str : nil;
+}
+
+// Pull the message text out of an OKMMessage via its several text accessors.
+static void max_captureMsgText(id msg) {
+    if (!msg || !g_keptDeletedTexts) return;
+    const char *sels[] = {"shownMessageText", "messageText", "shownText"};
+    for (int i = 0; i < 3; i++) {
+        SEL s = sel_registerName(sels[i]);
+        if (![msg respondsToSelector:s]) continue;
+        @try {
+            id v = ((id(*)(id,SEL))objc_msgSend)(msg, s);
+            NSString *n = max_normText(v);
+            if (n) { [g_keptDeletedTexts addObject:n];
+                     maxlog(@"keep-del: captured text via %s: \"%@\"", sels[i],
+                            n.length > 40 ? [n substringToIndex:40] : n); }
+        } @catch (NSException *e) {}
+    }
 }
 
 // The chat part of a primaryKey can be "(null)" at setStatus time but real
@@ -2854,11 +2886,47 @@ static void kd_hook_messagesDeleted(id self, SEL _cmd, id ids, id chat) {
         @try {
             NSArray *arr = [ids isKindOfClass:[NSArray class]] ? (NSArray *)ids
                           : (ids ? @[ids] : @[]);
-            for (id mid in arr)
-                if (g_keptDeletedIds)
-                    [g_keptDeletedIds addObject:max_msgIdOnly([NSString stringWithFormat:@"%@", mid])];
+            // Resolve each id -> OKMMessage via the listener's chatService, so
+            // we can capture its TEXT (the only thing reachable in the cell).
+            id svc = nil;
+            @try {
+                SEL cs = sel_registerName("chatService");
+                if ([self respondsToSelector:cs])
+                    svc = ((id(*)(id,SEL))objc_msgSend)(self, cs);
+            } @catch (NSException *e) {}
+            NSString *chatId = nil;
+            @try {
+                const char *csels[] = {"primaryKey", "chatId", "pk"};
+                for (int ci = 0; ci < 3 && !chatId; ci++) {
+                    SEL s = sel_registerName(csels[ci]);
+                    if (chat && [chat respondsToSelector:s]) {
+                        id v = ((id(*)(id,SEL))objc_msgSend)(chat, s);
+                        if (v) chatId = [NSString stringWithFormat:@"%@", v];
+                    }
+                }
+            } @catch (NSException *e) {}
+            for (id mid in arr) {
+                NSString *idn = max_msgIdOnly([NSString stringWithFormat:@"%@", mid]);
+                if (g_keptDeletedIds) [g_keptDeletedIds addObject:idn];
+                if (svc) {
+                    id msg = nil;
+                    @try {
+                        SEL mw = sel_registerName("messageWithId:chatId:");
+                        if (chatId && [svc respondsToSelector:mw])
+                            msg = ((id(*)(id,SEL,id,id))objc_msgSend)(svc, mw, mid, chatId);
+                        if (!msg) {
+                            SEL mp = sel_registerName("messageWithPk:");
+                            NSString *pk = chatId ? [NSString stringWithFormat:@"%@-%@", chatId, idn] : nil;
+                            if (pk && [svc respondsToSelector:mp])
+                                msg = ((id(*)(id,SEL,id))objc_msgSend)(svc, mp, pk);
+                        }
+                    } @catch (NSException *e) {}
+                    if (msg) max_captureMsgText(msg);
+                }
+            }
         } @catch (NSException *e) {}
-        maxlog(@"keep-del: suppressed incoming _messagesDeleted:inChat: ids=%@", ids);
+        maxlog(@"keep-del: suppressed incoming _messagesDeleted:inChat: ids=%@ texts=%lu",
+               ids, (unsigned long)g_keptDeletedTexts.count);
         return;
     }
     if (g_origMessagesDeletedInChat)
@@ -2872,6 +2940,7 @@ static void kd_hook_setStatus(id self, SEL _cmd, long long status) {
         NSString *pk = max_msgPk(self);
         if (!(pk && [g_ownDeletedPks containsObject:pk])) {
             if (g_keptDeletedIds && pk) [g_keptDeletedIds addObject:max_msgIdOnly(pk)];
+            max_captureMsgText(self);   // capture text NOW while the object is live
             maxlog(@"keep-del: kept message (blocked status2) pk=%@", pk);
             ((void(*)(id,SEL,long long))g_origSetStatus)(self, _cmd, 0);
             return;
@@ -2911,38 +2980,45 @@ static void kd_hook_deleteLocally(id self, SEL _cmd, id ids, BOOL updateChat) {
 }
 
 // ---- Visual mark: dim kept-deleted message cells + a trash badge ----------
-// The layout attributes carry NO message (log(8): attrs only hold _indexPath).
-// The message DOES render, so its object lives in the cell's view hierarchy
-// (MessageCell -> contentView -> Body/Bubble view -> view model -> message).
-// We do a bounded breadth-first walk over the cell's subviews AND object
-// ivars, reading a pk off anything that answers primaryKey/messagePk, and
-// match it against the kept set. Fires on every applyLayoutAttributes:, so it
-// refreshes on scroll and chat re-open. All guarded, capped, cheap.
-static int g_kdCellDumpBudget = 12;   // dump cell node layout N times for diag
+// v12.15 proved the message object is NOT reachable in the cell's ObjC graph
+// (BFS hit 401 nodes, zero answered primaryKey) — ChatHistoryUI renders from a
+// Swift STRUCT view model. But the rendered TEXT is reachable (UILabel /
+// UITextView). So we capture each kept message's text at delete time and match
+// the cell's label text against it. Fires on every applyLayoutAttributes:, so
+// it refreshes on scroll and chat re-open. All guarded, capped, cheap.
+static int g_kdCellDumpBudget = 12;   // dump cell label text N times for diag
 
-// Read a pk-like string off any object that answers primaryKey/messagePk.
-static NSString *max_pkOf(id o) {
-    if (!o) return nil;
+// Read displayed text off a text-bearing view (label/textview/textfield).
+static NSString *max_viewText(id v) {
+    if (![v isKindOfClass:[UIView class]]) return nil;
     @try {
-        SEL s1 = sel_registerName("primaryKey");
-        if ([o respondsToSelector:s1]) {
-            id v = ((id(*)(id,SEL))objc_msgSend)(o, s1);
-            if (v) return [NSString stringWithFormat:@"%@", v];
-        }
-        SEL s2 = sel_registerName("messagePk");
-        if ([o respondsToSelector:s2]) {
-            id v = ((id(*)(id,SEL))objc_msgSend)(o, s2);
-            if (v) return [NSString stringWithFormat:@"%@", v];
-        }
+        if ([v isKindOfClass:[UILabel class]])   return max_normText([(UILabel *)v text]);
+        if ([v isKindOfClass:[UITextView class]]) return max_normText([(UITextView *)v text]);
+        if ([v isKindOfClass:[UITextField class]]) return max_normText([(UITextField *)v text]);
+        // Some custom views expose -text / -attributedText too.
+        if ([v respondsToSelector:@selector(attributedText)])
+            return max_normText(((id(*)(id,SEL))objc_msgSend)(v, @selector(attributedText)));
+        if ([v respondsToSelector:@selector(text)])
+            return max_normText(((id(*)(id,SEL))objc_msgSend)(v, @selector(text)));
     } @catch (NSException *e) {}
     return nil;
 }
 
-// BFS the cell's view tree + object ivars for a kept message id. Returns the
-// matching pk (so the caller can log it) or nil. Never recurses into
-// Foundation/CoreAnimation containers; skips already-seen nodes; hard node cap.
-static NSString *max_cellKeptPk(id cell, BOOL wantDump) {
-    if (!cell || g_keptDeletedIds.count == 0) return nil;
+// True if `t` matches any kept-deleted text. Exact match, or (for longer
+// strings) a kept text contained in the label (labels may append time, etc.).
+static BOOL max_textIsKept(NSString *t) {
+    if (t.length < 2 || g_keptDeletedTexts.count == 0) return NO;
+    if ([g_keptDeletedTexts containsObject:t]) return YES;
+    for (NSString *k in g_keptDeletedTexts) {
+        if (k.length >= 4 && ([t containsString:k] || [k containsString:t])) return YES;
+    }
+    return NO;
+}
+
+// BFS the cell's view tree for a label whose text is a kept-deleted message.
+// Returns the matched text (for logging) or nil. Only descends UIViews.
+static NSString *max_cellKeptText(id cell, BOOL wantDump) {
+    if (!cell || g_keptDeletedTexts.count == 0) return nil;
     NSMutableSet *seen = [NSMutableSet set];
     NSMutableArray *queue = [NSMutableArray arrayWithObject:cell];
     NSMutableString *dump = wantDump ? [NSMutableString string] : nil;
@@ -2956,49 +3032,19 @@ static NSString *max_cellKeptPk(id cell, BOOL wantDump) {
         if ([seen containsObject:nk]) continue;
         [seen addObject:nk];
 
-        NSString *pk = max_pkOf(node);
-        if (pk) {
-            if (dump) [dump appendFormat:@"<%@ pk=%@> ",
-                       NSStringFromClass(object_getClass(node)), max_msgIdOnly(pk)];
-            if ([g_keptDeletedIds containsObject:max_msgIdOnly(pk)]) { hit = pk; break; }
+        NSString *t = max_viewText(node);
+        if (t) {
+            if (dump) [dump appendFormat:@"\"%@\" ",
+                       t.length > 24 ? [t substringToIndex:24] : t];
+            if (max_textIsKept(t)) { hit = t; break; }
         }
-
-        // Enqueue subviews (descend the render tree).
         if ([node isKindOfClass:[UIView class]]) {
             @try { for (UIView *sv in [(UIView *)node subviews]) if (sv) [queue addObject:sv]; }
             @catch (NSException *e) {}
         }
-
-        // Enqueue object-typed ivars (view models, message, etc.). Skip
-        // Foundation/CA/CF/CG containers to stay bounded.
-        Class c = object_getClass(node);
-        for (int d = 0; c && d < 5; d++, c = class_getSuperclass(c)) {
-            const char *cn = class_getName(c);
-            if (cn && (strncmp(cn, "UIView", 6) == 0 || strncmp(cn, "UIResponder", 11) == 0 ||
-                       strncmp(cn, "NS", 2) == 0)) break;  // stop at UIKit/NS base ivars
-            unsigned int n = 0;
-            Ivar *ivars = class_copyIvarList(c, &n);
-            if (!ivars) continue;
-            for (unsigned i = 0; i < n; i++) {
-                const char *enc = ivar_getTypeEncoding(ivars[i]);
-                if (!enc || enc[0] != '@') continue;
-                @try {
-                    id val = object_getIvar(node, ivars[i]);
-                    if (!val || val == node) continue;
-                    const char *vn = class_getName(object_getClass(val));
-                    if (!vn) continue;
-                    if (strncmp(vn, "NS", 2) == 0 || strncmp(vn, "__NS", 4) == 0 ||
-                        strncmp(vn, "_NS", 3) == 0 || strncmp(vn, "CA", 2) == 0 ||
-                        strncmp(vn, "CF", 2) == 0 || strncmp(vn, "CG", 2) == 0)
-                        continue;
-                    [queue addObject:val];
-                } @catch (NSException *e) {}
-            }
-            free(ivars);
-        }
     }
-    if (dump) maxlog(@"keep-del: cell walk hit=%@ nodes<=%d dump=[%@]",
-                     hit ? max_msgIdOnly(hit) : @"none", 400 - budget, dump);
+    if (dump) maxlog(@"keep-del: cell text walk hit=%@ nodes<=%d labels=[%@]",
+                     hit ? @"YES" : @"none", 400 - budget, dump);
     return hit;
 }
 
@@ -3039,11 +3085,11 @@ static void kd_hook_cellApplyLayout(id self, SEL _cmd, id attrs) {
         ((void(*)(id,SEL,id))g_origCellApplyLayout)(self, _cmd, attrs);
     @try {
         BOOL kept = NO;
-        if (max_modOn(@"mod.del") && g_keptDeletedIds.count) {
+        if (max_modOn(@"mod.del") && g_keptDeletedTexts.count) {
             BOOL wantDump = g_kdCellDumpBudget > 0;
             if (wantDump) g_kdCellDumpBudget--;
-            NSString *pk = max_cellKeptPk(self, wantDump);
-            if (pk) kept = YES;
+            NSString *t = max_cellKeptText(self, wantDump);
+            if (t) kept = YES;
         }
         kd_applyDeletedStyle((UICollectionViewCell *)self, kept);
     } @catch (NSException *e) {}
@@ -3059,6 +3105,7 @@ static void max_installKeepDeleted(void) {
     g_ownDeletedPks = [NSMutableSet set];
     g_ownDeletedIds = [NSMutableSet set];
     g_keptDeletedIds = [NSMutableSet set];
+    g_keptDeletedTexts = [NSMutableSet set];
 
     Class listener = objc_getClass("OKMMessageDeleteListener");
     if (listener) {
@@ -4076,5 +4123,5 @@ static void maxmods_init(void) {
 
     // bump version string in log so we know FULL-LOG is active
     maxlog(@"v12.4-FULLLOG loaded OK — log file: %@ (sync/fsync, watchdog stack, crash dump, lifecycle)", max_logPath());
-    maxlog(@"v12.15 loaded OK (keep-del visual via cell BFS) — log file: %@", max_logPath());
+    maxlog(@"v12.16 loaded OK (keep-del visual via label-text match) — log file: %@", max_logPath());
 }
