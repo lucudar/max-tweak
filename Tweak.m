@@ -3211,23 +3211,35 @@ static void max_periodicModsTabCheck(void) {
 
 static void maxmods_tabBarLongPressImp(id self, SEL _cmd,
                                        UILongPressGestureRecognizer *gesture) {
+    UIView *gv = gesture.view;
+    // FULL-LOG: log EVERY state change so we see the recognizer even when it
+    // fails/cancels instead of beginning.
+    maxlog(@"mods: LP state=%ld on %@", (long)gesture.state, NSStringFromClass(gv.class));
     if (gesture.state != UIGestureRecognizerStateBegan) return;
 
-    UIView *tabBarView = gesture.view;
-    CGPoint point = [gesture locationInView:tabBarView];
-    maxlog(@"mods: long-press BEGAN on %@ at x=%.0f w=%.0f",
-           NSStringFromClass(tabBarView.class), point.x, tabBarView.bounds.size.width);
+    // If we're on the window-level catch-all, only act when the press is in
+    // the bottom tab-bar strip; otherwise ignore (don't hijack chat presses).
+    if ([gv isKindOfClass:[UIWindow class]]) {
+        CGPoint p = [gesture locationInView:gv];
+        CGFloat h = gv.bounds.size.height;
+        if (p.y < h - 150) {
+            maxlog(@"mods: WINDOW long-press ignored (y=%.0f h=%.0f, not bottom)", p.y, h);
+            return;
+        }
+        maxlog(@"mods: WINDOW long-press in bottom strip (y=%.0f h=%.0f)", p.y, h);
+    } else {
+        CGPoint point = [gesture locationInView:gv];
+        maxlog(@"mods: BAR long-press BEGAN on %@ at x=%.0f w=%.0f",
+               NSStringFromClass(gv.class), point.x, gv.bounds.size.width);
+    }
 
-    // v12.6: any 0.5s long-press ON THE TAB BAR opens Моды. The old
-    // "last item only" x-math failed once the Моды tab was injected (the
-    // last slot became Моды, not Settings) and on MAX's custom bar where the
-    // item rects don't map to width/count. A deliberate long-press on the
-    // small bottom strip is intentional enough — no position filter.
     UIViewController *host = nil;
-    UIResponder *responder = tabBarView;
+    UIResponder *responder = gv;
     while (responder && ![responder isKindOfClass:[UIViewController class]])
         responder = responder.nextResponder;
     host = (UIViewController *)responder;
+    if (!host && [gv isKindOfClass:[UIWindow class]])
+        host = ((UIWindow *)gv).rootViewController;
     // climb to the topmost presenter so present never fails on an already-
     // presenting controller
     UIViewController *top = host;
@@ -3277,11 +3289,19 @@ static IMP orig_tabBarViewDidLoad = NULL;
 @implementation MAXLongPressDelegate
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
         shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)o {
+    maxlog(@"LP-DELEGATE: simultaneous with %@", NSStringFromClass(o.class));
     return YES;
 }
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldReceiveTouch:(UITouch *)touch {
+    CGPoint p = [touch locationInView:touch.window];
+    maxlog(@"LP-DELEGATE: shouldReceiveTouch view=%@ win=(%.0f,%.0f)",
+           NSStringFromClass([touch.view class]), p.x, p.y);
     return YES;
 }
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
+        shouldRequireFailureOfGestureRecognizer:(UIGestureRecognizer *)o { return NO; }
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
+        shouldBeRequiredToFailByGestureRecognizer:(UIGestureRecognizer *)o { return NO; }
 @end
 static MAXLongPressDelegate *g_lpDelegate = nil;
 
@@ -3302,9 +3322,51 @@ static UIView *max_findTabBarView(UIView *root, int depth) {
     return nil;
 }
 
+static BOOL max_barHasOurLP(UIView *v) {
+    for (UIGestureRecognizer *g in v.gestureRecognizers)
+        if ([g isKindOfClass:[UILongPressGestureRecognizer class]] &&
+            ((UILongPressGestureRecognizer *)g).minimumPressDuration == 0.5 &&
+            g.delegate == g_lpDelegate)
+            return YES;
+    return NO;
+}
+
+static UILongPressGestureRecognizer *max_makeLP(id target) {
+    if (!g_lpDelegate) g_lpDelegate = [MAXLongPressDelegate new];
+    UILongPressGestureRecognizer *lp =
+        [[UILongPressGestureRecognizer alloc]
+            initWithTarget:target action:@selector(maxmods_tabBarLongPress:)];
+    lp.minimumPressDuration = 0.5;
+    lp.cancelsTouchesInView = NO;
+    lp.delaysTouchesBegan = NO;
+    lp.delaysTouchesEnded = NO;
+    lp.delegate = g_lpDelegate;
+    return lp;
+}
+
+// FULL-LOG: dump the tab bar view + recognizers + a few subviews so we can
+// see what iOS 26 actually renders as the bar and why touches aren't caught.
+static void max_dumpBar(UIView *bar) {
+    if (!bar) return;
+    maxlog(@"mods: BAR=%@ frame=%@ ui=%d recs=%lu",
+           NSStringFromClass(bar.class), NSStringFromCGRect(bar.frame),
+           (int)bar.userInteractionEnabled,
+           (unsigned long)bar.gestureRecognizers.count);
+    for (UIGestureRecognizer *g in bar.gestureRecognizers)
+        maxlog(@"mods:   rec=%@ enabled=%d", NSStringFromClass(g.class), (int)g.isEnabled);
+    int i = 0;
+    for (UIView *sub in bar.subviews) {
+        maxlog(@"mods:   sub[%d]=%@ frame=%@ ui=%d", i++,
+               NSStringFromClass(sub.class), NSStringFromCGRect(sub.frame),
+               (int)sub.userInteractionEnabled);
+    }
+}
+
 // Attach the 0.5s long-press once, wherever the tab bar currently lives.
 // Called from viewDidLoad AND the periodic tab check so a warm launch (no
-// fresh viewDidLoad) or a rebuilt tab bar still gets the gesture.
+// fresh viewDidLoad) or a rebuilt tab bar still gets the gesture. Also
+// attaches a WINDOW-level recognizer gated to the bottom strip, as a
+// catch-all in case the tab-bar view never receives the touch.
 static void max_attachModsLongPress(id tabBarController) {
     if (![tabBarController isKindOfClass:[UIViewController class]]) return;
     UIView *barView = nil;
@@ -3312,27 +3374,30 @@ static void max_attachModsLongPress(id tabBarController) {
         barView = ((UITabBarController *)tabBarController).tabBar;
     if (!barView)
         barView = max_findTabBarView(((UIViewController *)tabBarController).view, 0);
-    if (!barView) {
-        maxlog(@"mods: no tab-bar view to attach long-press");
-        return;
+
+    if (barView && !max_barHasOurLP(barView)) {
+        max_dumpBar(barView);
+        [barView addGestureRecognizer:max_makeLP(tabBarController)];
+        maxlog(@"mods: long-press attached to BAR %@ (host %@)",
+               NSStringFromClass(barView.class), NSStringFromClass([tabBarController class]));
+    } else if (!barView) {
+        maxlog(@"mods: no tab-bar view found for long-press");
     }
-    for (UIGestureRecognizer *g in barView.gestureRecognizers) {
-        if ([g isKindOfClass:[UILongPressGestureRecognizer class]] &&
-            ((UILongPressGestureRecognizer *)g).minimumPressDuration == 0.5)
-            return;   // already attached
+
+    // window-level catch-all
+    UIWindow *win = ((UIViewController *)tabBarController).view.window;
+    if (!win) {
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes)
+            if ([sc isKindOfClass:[UIWindowScene class]]) {
+                win = ((UIWindowScene *)sc).keyWindow ?: ((UIWindowScene *)sc).windows.firstObject;
+                if (win) break;
+            }
     }
-    if (!g_lpDelegate) g_lpDelegate = [MAXLongPressDelegate new];
-    UILongPressGestureRecognizer *lp =
-        [[UILongPressGestureRecognizer alloc]
-            initWithTarget:tabBarController action:@selector(maxmods_tabBarLongPress:)];
-    lp.minimumPressDuration = 0.5;
-    lp.cancelsTouchesInView = NO;
-    lp.delaysTouchesBegan = NO;
-    lp.delaysTouchesEnded = NO;
-    lp.delegate = g_lpDelegate;   // receive touches even on the tab buttons
-    [barView addGestureRecognizer:lp];
-    maxlog(@"mods: long-press gesture attached to %@ (host %@)",
-           NSStringFromClass(barView.class), NSStringFromClass([tabBarController class]));
+    if (win && !max_barHasOurLP(win)) {
+        [win addGestureRecognizer:max_makeLP(tabBarController)];
+        maxlog(@"mods: long-press attached to WINDOW %@ frame=%@",
+               NSStringFromClass(win.class), NSStringFromCGRect(win.frame));
+    }
 }
 
 static void hook_tabBarViewDidLoad(id self, SEL _cmd) {
@@ -3546,5 +3611,5 @@ static void maxmods_init(void) {
 
     // bump version string in log so we know FULL-LOG is active
     maxlog(@"v12.4-FULLLOG loaded OK — log file: %@ (sync/fsync, watchdog stack, crash dump, lifecycle)", max_logPath());
-    maxlog(@"v12.7 loaded OK (long-press delegate: receive touches on tab buttons) — log file: %@", max_logPath());
+    maxlog(@"v12.8 loaded OK (long-press diagnostics + window catch-all) — log file: %@", max_logPath());
 }
