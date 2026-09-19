@@ -2922,13 +2922,64 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
 
 @implementation MAXModsViewController
 
+// Потужно flag header: blue over yellow bar + wordmark, sits above the table.
+- (UIView *)max_makeHeader {
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320, 132)];
+
+    UIView *card = [[UIView alloc] initWithFrame:CGRectMake(16, 12, 288, 104)];
+    card.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    card.layer.cornerRadius = 18;
+    card.layer.cornerCurve = kCACornerCurveContinuous;
+    card.layer.masksToBounds = YES;
+    card.backgroundColor = max_potuzhnoBlue();
+    [header addSubview:card];
+
+    // bottom yellow band = the flag
+    UIView *band = [[UIView alloc] initWithFrame:CGRectMake(0, 52, 288, 52)];
+    band.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
+    band.backgroundColor = max_potuzhnoYellow();
+    [card addSubview:band];
+
+    UILabel *title = [[UILabel alloc] initWithFrame:card.bounds];
+    title.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    title.textAlignment = NSTextAlignmentCenter;
+    title.font = [UIFont systemFontOfSize:30 weight:UIFontWeightHeavy];
+    title.text = @"ПОТУЖНО";
+    title.textColor = UIColor.whiteColor;
+    title.layer.shadowColor = [UIColor colorWithWhite:0 alpha:0.35].CGColor;
+    title.layer.shadowOffset = CGSizeMake(0, 1);
+    title.layer.shadowOpacity = 1;
+    title.layer.shadowRadius = 3;
+    [card addSubview:title];
+
+    return header;
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"Моды";
+    self.tableView.tableHeaderView = [self max_makeHeader];
+    if (@available(iOS 13.0, *))
+        self.navigationController.navigationBar.tintColor = max_potuzhnoBlue();
 }
 
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
     return (s == 0) ? @"Приватность" : @"Отладка";
+}
+
+- (void)tableView:(UITableView *)tv willDisplayHeaderView:(UIView *)view
+       forSection:(NSInteger)section {
+    if ([view isKindOfClass:[UITableViewHeaderFooterView class]]) {
+        UITableViewHeaderFooterView *h = (UITableViewHeaderFooterView *)view;
+        h.textLabel.textColor = max_potuzhnoBlue();
+        h.textLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    }
+}
+
+- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
+    return (s == 0)
+        ? @"Тумблеры хранятся на устройстве и работают сразу."
+        : @"Лог пишется в Documents/maxmods_log.txt.";
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 2; }
@@ -2952,6 +3003,9 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
         NSArray *icons = @[ @"doc.text", @"square.and.arrow.up", @"trash" ];
         cell.textLabel.text = titles[ip.row];
         cell.imageView.image = [UIImage systemImageNamed:icons[ip.row]];
+        cell.imageView.tintColor = (ip.row == 2)
+            ? [UIColor systemRedColor] : max_potuzhnoBlue();
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         return cell;
     }
     UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:kModCell];
@@ -2964,7 +3018,17 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
              forControlEvents:UIControlEventValueChanged];
         cell.accessoryView = sw;
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        cell.textLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+        cell.detailTextLabel.numberOfLines = 0;
+        // leading Потужно accent bar on each mod row
+        UIView *accent = [[UIView alloc] initWithFrame:CGRectMake(0, 6, 3, 40)];
+        accent.tag = 7001;
+        accent.backgroundColor = max_potuzhnoYellow();
+        accent.layer.cornerRadius = 1.5;
+        [cell.contentView addSubview:accent];
     }
+    UIView *accent = [cell.contentView viewWithTag:7001];
+    accent.frame = CGRectMake(0, 6, 3, cell.contentView.bounds.size.height - 12);
     ModEntry e = max_modEntries[ip.row];
     cell.textLabel.text = e.title;
     cell.detailTextLabel.text = e.subtitle;
@@ -2972,6 +3036,10 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
     [(UISwitch *)cell.accessoryView setOn:max_modOn(e.key)];
     [(UISwitch *)cell.accessoryView setTag:ip.row];
     return cell;
+}
+
+- (CGFloat)tableView:(UITableView *)tv heightForRowAtIndexPath:(NSIndexPath *)ip {
+    return (ip.section == 0) ? 64.0 : 48.0;
 }
 
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
@@ -3424,5 +3492,5 @@ static void maxmods_init(void) {
 
     // bump version string in log so we know FULL-LOG is active
     maxlog(@"v12.4-FULLLOG loaded OK — log file: %@ (sync/fsync, watchdog stack, crash dump, lifecycle)", max_logPath());
-    maxlog(@"v12.4 loaded OK — log file: %@", max_logPath());
+    maxlog(@"v12.5 loaded OK (Моды redesign, Потужно theme) — log file: %@", max_logPath());
 }
