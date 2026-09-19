@@ -3266,6 +3266,25 @@ static void maxmods_dismissImp(id self, SEL _cmd) {
 
 static IMP orig_tabBarViewDidLoad = NULL;
 
+// Gesture delegate: a UILongPressGestureRecognizer added to UITabBar never
+// fired because the tab BUTTONS (UIControls) swallow the touch before the
+// bar's recognizer can begin — no "long-press BEGAN" ever appeared in the
+// device log. shouldReceiveTouch:YES forces the recognizer to see touches
+// even on those controls; simultaneous-recognition lets the normal tab tap
+// still work.
+@interface MAXLongPressDelegate : NSObject <UIGestureRecognizerDelegate>
+@end
+@implementation MAXLongPressDelegate
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
+        shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)o {
+    return YES;
+}
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldReceiveTouch:(UITouch *)touch {
+    return YES;
+}
+@end
+static MAXLongPressDelegate *g_lpDelegate = nil;
+
 // Recursively locate the real tab-bar view. MAX wraps its bar in custom
 // containers, so a UITabBar may sit several levels below the VC's view.
 static UIView *max_findTabBarView(UIView *root, int depth) {
@@ -3302,11 +3321,15 @@ static void max_attachModsLongPress(id tabBarController) {
             ((UILongPressGestureRecognizer *)g).minimumPressDuration == 0.5)
             return;   // already attached
     }
+    if (!g_lpDelegate) g_lpDelegate = [MAXLongPressDelegate new];
     UILongPressGestureRecognizer *lp =
         [[UILongPressGestureRecognizer alloc]
             initWithTarget:tabBarController action:@selector(maxmods_tabBarLongPress:)];
     lp.minimumPressDuration = 0.5;
     lp.cancelsTouchesInView = NO;
+    lp.delaysTouchesBegan = NO;
+    lp.delaysTouchesEnded = NO;
+    lp.delegate = g_lpDelegate;   // receive touches even on the tab buttons
     [barView addGestureRecognizer:lp];
     maxlog(@"mods: long-press gesture attached to %@ (host %@)",
            NSStringFromClass(barView.class), NSStringFromClass([tabBarController class]));
@@ -3523,5 +3546,5 @@ static void maxmods_init(void) {
 
     // bump version string in log so we know FULL-LOG is active
     maxlog(@"v12.4-FULLLOG loaded OK — log file: %@ (sync/fsync, watchdog stack, crash dump, lifecycle)", max_logPath());
-    maxlog(@"v12.6 loaded OK (long-press reattach, any-position bar) — log file: %@", max_logPath());
+    maxlog(@"v12.7 loaded OK (long-press delegate: receive touches on tab buttons) — log file: %@", max_logPath());
 }
