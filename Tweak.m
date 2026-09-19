@@ -2782,6 +2782,116 @@ static void max_installGhostHooks(void) {
            hits, g_origMarkAsRead, g_origMarkReactionAsRead, (int)g_blockRead);
 }
 
+// ============================================================================
+#pragma mark - Keep-deleted (mod.del) — v12.11, clean self-contained module
+//
+// TG-fork behaviour: when the OTHER side deletes a message you keep seeing it.
+// Trace from the earlier removed machinery (v9.x) on THIS binary:
+//   * incoming remote delete = OKMMessageDeleteListener._messagesDeleted:inChat:
+//   * the message is then flagged via OKMMessage.setStatus: 2  (== deleted)
+//   * OKMMessage has no "deleted" property, only status
+//   * the server RE-SENDS status 2 on every history sync — so blocking ALL
+//     status-2 also resurrected the user's OWN deleted messages. Fix: record
+//     the pks the user deletes-for-everyone and always let THOSE reach 2.
+// Everything here is gated by mod.del, which DEFAULTS OFF (experimental).
+// ============================================================================
+
+static NSMutableSet<NSString *> *g_ownDeletedPks = nil;   // user's own delete-for-all
+static IMP g_origMessagesDeletedInChat = NULL;
+static IMP g_origSendDeleteCommand = NULL;
+static IMP g_origSetStatus = NULL;
+
+static NSString *max_msgPk(id m) {
+    if (!m) return nil;
+    SEL sel = sel_registerName("primaryKey");
+    if ([m respondsToSelector:sel])
+        return [NSString stringWithFormat:@"%@", ((id(*)(id,SEL))objc_msgSend)(m, sel)];
+    return nil;
+}
+
+// The user deletes their own message(s) for everyone: remember the pks so
+// their server status:2 is allowed through and never "resurrected".
+static id kd_hook_sendDeleteCommand(id self, SEL _cmd, id messages) {
+    @try {
+        NSArray *items = [messages isKindOfClass:[NSArray class]]
+            ? (NSArray *)messages : (messages ? @[messages] : @[]);
+        for (id m in items) {
+            NSString *pk = max_msgPk(m);
+            if (pk && g_ownDeletedPks) [g_ownDeletedPks addObject:pk];
+        }
+    } @catch (NSException *e) { maxlog(@"keep-del: sendDelete note err %@", e); }
+    // Always call through (returns a RACSignal the caller subscribes to).
+    return ((id(*)(id,SEL,id))g_origSendDeleteCommand)(self, _cmd, messages);
+}
+
+// Incoming remote-delete event: with mod.del ON, swallow it so the history
+// keeps the message. Own deletes never come through this listener.
+static void kd_hook_messagesDeleted(id self, SEL _cmd, id ids, id chat) {
+    if (max_modOn(@"mod.del")) {
+        maxlog(@"keep-del: suppressed incoming _messagesDeleted:inChat:");
+        return;
+    }
+    if (g_origMessagesDeletedInChat)
+        ((void(*)(id,SEL,id,id))g_origMessagesDeletedInChat)(self, _cmd, ids, chat);
+}
+
+// OKMMessage.setStatus: — status 2 = deleted. With mod.del ON, force the
+// OTHER side's deletes back to 0 (stay visible); OWN deletes pass through.
+static void kd_hook_setStatus(id self, SEL _cmd, long long status) {
+    if (status == 2 && max_modOn(@"mod.del")) {
+        NSString *pk = max_msgPk(self);
+        if (!(pk && [g_ownDeletedPks containsObject:pk])) {
+            maxlog(@"keep-del: kept message (blocked status2) pk=%@", pk);
+            ((void(*)(id,SEL,long long))g_origSetStatus)(self, _cmd, 0);
+            return;
+        }
+        maxlog(@"keep-del: own delete allowed pk=%@", pk);
+    }
+    ((void(*)(id,SEL,long long))g_origSetStatus)(self, _cmd, status);
+}
+
+static void max_installKeepDeleted(void) {
+    g_ownDeletedPks = [NSMutableSet set];
+
+    Class listener = objc_getClass("OKMMessageDeleteListener");
+    if (listener) {
+        Method m = class_getInstanceMethod(listener,
+            sel_registerName("_messagesDeleted:inChat:"));
+        if (m) {
+            g_origMessagesDeletedInChat = method_getImplementation(m);
+            method_setImplementation(m, (IMP)kd_hook_messagesDeleted);
+            maxlog(@"keep-del: hooked _messagesDeleted:inChat:");
+        } else {
+            maxlog(@"keep-del: _messagesDeleted:inChat: not found");
+        }
+    } else {
+        maxlog(@"keep-del: OKMMessageDeleteListener not found");
+    }
+
+    Class task = objc_getClass("OKMDeleteMessagesTask");
+    if (task) {
+        Method m = class_getInstanceMethod(task,
+            sel_registerName("_sendDeleteCommandForMessages:"));
+        if (m) {
+            g_origSendDeleteCommand = method_getImplementation(m);
+            method_setImplementation(m, (IMP)kd_hook_sendDeleteCommand);
+            maxlog(@"keep-del: hooked _sendDeleteCommandForMessages:");
+        }
+    }
+
+    Class msg = objc_getClass("OKMMessage");
+    if (msg) {
+        Method m = class_getInstanceMethod(msg, sel_registerName("setStatus:"));
+        if (m) {
+            g_origSetStatus = method_getImplementation(m);
+            method_setImplementation(m, (IMP)kd_hook_setStatus);
+            maxlog(@"keep-del: hooked OKMMessage setStatus:");
+        } else {
+            maxlog(@"keep-del: OKMMessage setStatus: not found");
+        }
+    }
+}
+
 static IMP orig_deleteMessageCtx = NULL;
 
 // ============================================================================
@@ -2948,6 +3058,8 @@ typedef struct {
 static ModEntry max_modEntries[] = {
     { .title = @"Не отправлять «прочитано»", .key = @"mod.read",
       .subtitle = @"Выкл = обычные галочки. Вкл = собеседник не видит прочтение" },
+    { .title = @"Видеть удалённые", .key = @"mod.del",
+      .subtitle = @"Экспериментально. Сообщения, удалённые собеседником, остаются у вас" },
 };
 static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntries[0]);
 
@@ -3585,7 +3697,9 @@ static void maxmods_init(void) {
         NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
         for (NSUInteger i = 0; i < kModCount; i++) {
             ModEntry e = max_modEntries[i];
-            if ([e.key isEqualToString:@"mod.sysmenu"]) {
+            // mod.del is experimental -> defaults OFF like mod.sysmenu.
+            if ([e.key isEqualToString:@"mod.sysmenu"] ||
+                [e.key isEqualToString:@"mod.del"]) {
                 if ([d objectForKey:e.key] == nil) [d setBool:NO forKey:e.key];
                 continue;
             }
@@ -3601,6 +3715,7 @@ static void maxmods_init(void) {
 
     // 5) Ghost hooks — v12.3: dedicated orig IMPs so OFF actually sends.
     max_installGhostHooks();
+    max_installKeepDeleted();   // mod.del — experimental, default OFF
     max_installSysmenuDiagnostics();
 
     // 6) «Моды» entry points:
@@ -3667,5 +3782,5 @@ static void maxmods_init(void) {
 
     // bump version string in log so we know FULL-LOG is active
     maxlog(@"v12.4-FULLLOG loaded OK — log file: %@ (sync/fsync, watchdog stack, crash dump, lifecycle)", max_logPath());
-    maxlog(@"v12.10 loaded OK (full tracker sweep) — log file: %@", max_logPath());
+    maxlog(@"v12.11 loaded OK (keep-deleted experimental) — log file: %@", max_logPath());
 }
