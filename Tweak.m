@@ -2796,11 +2796,13 @@ static void max_installGhostHooks(void) {
 // Everything here is gated by mod.del, which DEFAULTS OFF (experimental).
 // ============================================================================
 
-static NSMutableSet<NSString *> *g_ownDeletedPks = nil;   // user's own delete-for-all
+static NSMutableSet<NSString *> *g_ownDeletedPks = nil;   // user's own delete-for-all (pk)
+static NSMutableSet<NSString *> *g_ownDeletedIds = nil;   // user's own delete-for-all (id only)
 static NSMutableSet<NSString *> *g_keptDeletedIds = nil;  // kept (other-side) msg ids for dimming
 static IMP g_origMessagesDeletedInChat = NULL;
 static IMP g_origSendDeleteCommand = NULL;
 static IMP g_origSetStatus = NULL;
+static IMP g_origDeleteLocally = NULL;
 static IMP g_origCellApplyLayout = NULL;
 static IMP g_origCellPrepareReuse = NULL;
 static const NSInteger kDeletedBadgeTag = 0x7DE1;
@@ -2835,7 +2837,10 @@ static id kd_hook_sendDeleteCommand(id self, SEL _cmd, id messages) {
             ? (NSArray *)messages : (messages ? @[messages] : @[]);
         for (id m in items) {
             NSString *pk = max_msgPk(m);
-            if (pk && g_ownDeletedPks) [g_ownDeletedPks addObject:pk];
+            if (pk && g_ownDeletedPks) {
+                [g_ownDeletedPks addObject:pk];
+                [g_ownDeletedIds addObject:max_msgIdOnly(pk)];
+            }
         }
     } @catch (NSException *e) { maxlog(@"keep-del: sendDelete note err %@", e); }
     // Always call through (returns a RACSignal the caller subscribes to).
@@ -2876,40 +2881,95 @@ static void kd_hook_setStatus(id self, SEL _cmd, long long status) {
     ((void(*)(id,SEL,long long))g_origSetStatus)(self, _cmd, status);
 }
 
+// Local DB removal. For the OTHER side's remote delete this is what erases
+// the row, so the kept message vanishes once you leave and re-open the chat.
+// With mod.del ON, suppress it unless every id is one the user deleted
+// themselves (own delete / clear-chat still work).
+static void kd_hook_deleteLocally(id self, SEL _cmd, id ids, BOOL updateChat) {
+    if (max_modOn(@"mod.del")) {
+        @try {
+            NSArray *arr = [ids isKindOfClass:[NSArray class]] ? (NSArray *)ids
+                          : (ids ? @[ids] : @[]);
+            BOOL allOwn = arr.count > 0;
+            for (id mid in arr) {
+                NSString *idn = max_msgIdOnly([NSString stringWithFormat:@"%@", mid]);
+                if (![g_ownDeletedIds containsObject:idn]) {
+                    allOwn = NO;
+                    if (g_keptDeletedIds) [g_keptDeletedIds addObject:idn];
+                }
+            }
+            if (!allOwn) {
+                maxlog(@"keep-del: SUPPRESSED deleteLocally (kept) ids=%@ updateChat=%d",
+                       ids, (int)updateChat);
+                return;
+            }
+            maxlog(@"keep-del: deleteLocally allowed (own) ids=%@", ids);
+        } @catch (NSException *e) {}
+    }
+    if (g_origDeleteLocally)
+        ((void(*)(id,SEL,id,BOOL))g_origDeleteLocally)(self, _cmd, ids, updateChat);
+}
+
 // ---- Visual mark: dim kept-deleted message cells + a trash badge ----------
 // MessageCell (Swift) exposes no message property, so find a message-like
 // object among its object ivars (the view model, or its .message) and read
 // the pk. Only object-typed ivars are dereferenced. Everything guarded.
+static int g_kdCellDumpBudget = 24;   // FULL-LOG: dump cell ivar layout N times
+
+// does obj (or obj.message / obj.viewModel) expose a message pk?
+static id max_msgLike(id val) {
+    if (!val) return nil;
+    @try {
+        if ([val respondsToSelector:sel_registerName("primaryKey")] ||
+            [val respondsToSelector:sel_registerName("messagePk")])
+            return val;
+        static const char *subKeys[] = { "message", "viewModel", "model", "item", "messageViewModel" };
+        for (size_t k = 0; k < sizeof(subKeys)/sizeof(subKeys[0]); k++) {
+            SEL sel = sel_registerName(subKeys[k]);
+            if ([val respondsToSelector:sel]) {
+                id sub = ((id(*)(id,SEL))objc_msgSend)(val, sel);
+                if (sub && ([sub respondsToSelector:sel_registerName("primaryKey")] ||
+                            [sub respondsToSelector:sel_registerName("messagePk")]))
+                    return sub;
+            }
+        }
+    } @catch (NSException *e) {}
+    return nil;
+}
+
 static id max_cellMessage(id cell) {
+    BOOL dump = (g_kdCellDumpBudget > 0);
+    NSMutableString *layout = dump ? [NSMutableString string] : nil;
     Class c = object_getClass(cell);
-    for (int depth = 0; c && depth < 5; depth++, c = class_getSuperclass(c)) {
+    id found = nil;
+    for (int depth = 0; c && depth < 6; depth++, c = class_getSuperclass(c)) {
         unsigned int n = 0;
         Ivar *ivars = class_copyIvarList(c, &n);
         if (!ivars) continue;
-        id found = nil;
-        for (unsigned i = 0; i < n && !found; i++) {
+        for (unsigned i = 0; i < n; i++) {
             const char *enc = ivar_getTypeEncoding(ivars[i]);
             if (!enc || enc[0] != '@') continue;   // objects only
             @try {
                 id val = object_getIvar(cell, ivars[i]);
                 if (!val) continue;
-                if ([val respondsToSelector:sel_registerName("primaryKey")] ||
-                    [val respondsToSelector:sel_registerName("messagePk")]) {
-                    found = val; break;
-                }
-                SEL msgSel = sel_registerName("message");
-                if ([val respondsToSelector:msgSel]) {
-                    id mm = ((id(*)(id,SEL))objc_msgSend)(val, msgSel);
-                    if (mm && [mm respondsToSelector:sel_registerName("primaryKey")]) {
-                        found = mm; break;
-                    }
+                if (dump) [layout appendFormat:@"%s(%@) ", ivar_getName(ivars[i]),
+                          NSStringFromClass(object_getClass(val))];
+                if (!found) {
+                    id m = max_msgLike(val);
+                    if (m) found = m;
                 }
             } @catch (NSException *e) {}
         }
         free(ivars);
-        if (found) return found;
+        if (found && !dump) break;
     }
-    return nil;
+    if (dump) {
+        g_kdCellDumpBudget--;
+        maxlog(@"keep-del: cell=%@ msg=%@ ivars=[%@]",
+               NSStringFromClass(object_getClass(cell)),
+               found ? @"FOUND" : @"none", layout);
+    }
+    return found;
 }
 
 static void kd_applyDeletedStyle(UICollectionViewCell *cell, BOOL kept) {
@@ -2960,6 +3020,7 @@ static void kd_hook_cellPrepareReuse(id self, SEL _cmd) {
 
 static void max_installKeepDeleted(void) {
     g_ownDeletedPks = [NSMutableSet set];
+    g_ownDeletedIds = [NSMutableSet set];
     g_keptDeletedIds = [NSMutableSet set];
 
     Class listener = objc_getClass("OKMMessageDeleteListener");
@@ -2997,6 +3058,21 @@ static void max_installKeepDeleted(void) {
             maxlog(@"keep-del: hooked OKMMessage setStatus:");
         } else {
             maxlog(@"keep-del: OKMMessage setStatus: not found");
+        }
+    }
+
+    // Persistence: stop the local DB row from being erased for the other
+    // side's deletes (that is why the kept message vanished after re-opening).
+    Class svc = objc_getClass("OKMChatService");
+    if (svc) {
+        Method m = class_getInstanceMethod(svc,
+            sel_registerName("deleteLocallyMessagesWithIds:updateChat:"));
+        if (m) {
+            g_origDeleteLocally = method_getImplementation(m);
+            method_setImplementation(m, (IMP)kd_hook_deleteLocally);
+            maxlog(@"keep-del: hooked deleteLocallyMessagesWithIds:updateChat:");
+        } else {
+            maxlog(@"keep-del: deleteLocallyMessagesWithIds:updateChat: not found");
         }
     }
 
@@ -3963,5 +4039,5 @@ static void maxmods_init(void) {
 
     // bump version string in log so we know FULL-LOG is active
     maxlog(@"v12.4-FULLLOG loaded OK — log file: %@ (sync/fsync, watchdog stack, crash dump, lifecycle)", max_logPath());
-    maxlog(@"v12.12 loaded OK (keep-deleted dim + trash badge + opacity) — log file: %@", max_logPath());
+    maxlog(@"v12.13 loaded OK (keep-deleted persistence + cell-ivar diag) — log file: %@", max_logPath());
 }
