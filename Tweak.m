@@ -3132,6 +3132,9 @@ static UINavigationController *max_makeModsNav(void) {
 }
 
 static void max_injectModsTab(void);
+static void maxmods_tabBarLongPressImp(id self, SEL _cmd,
+                                       UILongPressGestureRecognizer *gesture);
+static void max_attachModsLongPress(id tabBarController);
 
 static void max_retryModsTab(void) {
     static int triesLeft = 180;   // ~3 min of retries after launch
@@ -3167,7 +3170,14 @@ static void max_injectModsTab(void) {
         UITabBarController *tbc = max_findTabBar(win.rootViewController, 0);
         if (!tbc) continue;
 
-        if (max_tabHasMods(tbc)) return;   // already there
+        // Always (re)attach the long-press to the LIVE tab bar — this is the
+        // reliable entry even on warm launches where viewDidLoad never re-fired.
+        if (![tbc respondsToSelector:@selector(maxmods_tabBarLongPress:)])
+            class_addMethod([tbc class], @selector(maxmods_tabBarLongPress:),
+                            (IMP)maxmods_tabBarLongPressImp, "v@:@");
+        max_attachModsLongPress(tbc);
+
+        if (max_tabHasMods(tbc)) return;   // tab already there
         if (tbc.viewControllers.count < 2) { max_retryModsTab(); return; }
         NSMutableArray *vcs = [tbc.viewControllers mutableCopy];
         [vcs addObject:max_makeModsNav()];
@@ -3205,43 +3215,46 @@ static void maxmods_tabBarLongPressImp(id self, SEL _cmd,
 
     UIView *tabBarView = gesture.view;
     CGPoint point = [gesture locationInView:tabBarView];
-    CGFloat w = tabBarView.bounds.size.width;
-    if (w < 1) return;
+    maxlog(@"mods: long-press BEGAN on %@ at x=%.0f w=%.0f",
+           NSStringFromClass(tabBarView.class), point.x, tabBarView.bounds.size.width);
 
-    // Prefer UITabBar.items — counting every subview (badges, blur, hit-slop
-    // views) made the "last item" slot tiny and the long-press almost never
-    // opened Моды. Fall back to the rightmost ~28% of a custom bar.
-    NSInteger itemCount = 0;
-    if ([tabBarView isKindOfClass:[UITabBar class]])
-        itemCount = (NSInteger)((UITabBar *)tabBarView).items.count;
-    BOOL onLastItem = NO;
-    if (itemCount >= 2) {
-        NSInteger tappedIndex = (NSInteger)(point.x / (w / itemCount));
-        onLastItem = (tappedIndex >= itemCount - 1);
-    } else {
-        onLastItem = (point.x >= w * 0.72);
+    // v12.6: any 0.5s long-press ON THE TAB BAR opens Моды. The old
+    // "last item only" x-math failed once the Моды tab was injected (the
+    // last slot became Моды, not Settings) and on MAX's custom bar where the
+    // item rects don't map to width/count. A deliberate long-press on the
+    // small bottom strip is intentional enough — no position filter.
+    UIViewController *host = nil;
+    UIResponder *responder = tabBarView;
+    while (responder && ![responder isKindOfClass:[UIViewController class]])
+        responder = responder.nextResponder;
+    host = (UIViewController *)responder;
+    // climb to the topmost presenter so present never fails on an already-
+    // presenting controller
+    UIViewController *top = host;
+    while (top.presentedViewController) top = top.presentedViewController;
+    if (!top) { maxlog(@"mods: long-press — no host VC"); return; }
+    // already showing Моды? don't stack a second one
+    for (UIViewController *c = top; c; c = c.presentingViewController) {
+        if ([c isKindOfClass:[MAXModsViewController class]]) return;
+        if ([c isKindOfClass:[UINavigationController class]] &&
+            [((UINavigationController *)c).topViewController isKindOfClass:[MAXModsViewController class]])
+            return;
     }
 
-    if (onLastItem) {
-        UIViewController *host = nil;
-        // walk up from the tab bar view to a ViewController able to present
-        UIResponder *responder = tabBarView;
-        while (responder && ![responder isKindOfClass:[UIViewController class]])
-            responder = responder.nextResponder;
-        host = (UIViewController *)responder;
-        if (!host) return;
-
-        MAXModsViewController *modsVC = [[MAXModsViewController alloc]
-            initWithStyle:UITableViewStyleGrouped];
-        UINavigationController *nav = [[UINavigationController alloc]
-            initWithRootViewController:modsVC];
-        modsVC.navigationItem.leftBarButtonItem =
-            [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
-                                                           target:modsVC
-                                                           action:@selector(maxmods_dismiss)];
-        [host presentViewController:nav animated:YES completion:nil];
-        maxlog(@"mods: opened via long-press on tab bar");
-    }
+    MAXModsViewController *modsVC = [[MAXModsViewController alloc]
+        initWithStyle:UITableViewStyleGrouped];
+    UINavigationController *nav = [[UINavigationController alloc]
+        initWithRootViewController:modsVC];
+    nav.modalPresentationStyle = UIModalPresentationFullScreen;
+    modsVC.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                                                       target:modsVC
+                                                       action:@selector(maxmods_dismiss)];
+    [top presentViewController:nav animated:YES completion:^{
+        maxlog(@"mods: opened via long-press (present completed)");
+    }];
+    maxlog(@"mods: opened via long-press on tab bar (host=%@)",
+           NSStringFromClass([top class]));
 }
 
 // helper: dismiss for the Done button
@@ -3253,25 +3266,33 @@ static void maxmods_dismissImp(id self, SEL _cmd) {
 
 static IMP orig_tabBarViewDidLoad = NULL;
 
-static void hook_tabBarViewDidLoad(id self, SEL _cmd) {
-    if (orig_tabBarViewDidLoad)
-        ((void(*)(id,SEL))orig_tabBarViewDidLoad)(self, _cmd);
-
-    // Attach to the TAB BAR, not the whole VC view — a recognizer on the
-    // controller's view sits over the chat list and steals long-presses.
-    // OMUIKit.TabBarController may or may not subclass UITabBarController.
-    UIView *barView = nil;
-    if ([self isKindOfClass:[UITabBarController class]])
-        barView = ((UITabBarController *)self).tabBar;
-    if (!barView) {
-        UIView *root = ((UIViewController *)self).view;
-        for (UIView *sub in root.subviews) {
-            NSString *cls = NSStringFromClass(sub.class);
-            if ([sub isKindOfClass:[UITabBar class]] ||
-                [cls rangeOfString:@"TabBar"].location != NSNotFound)
-                barView = sub;
-        }
+// Recursively locate the real tab-bar view. MAX wraps its bar in custom
+// containers, so a UITabBar may sit several levels below the VC's view.
+static UIView *max_findTabBarView(UIView *root, int depth) {
+    if (!root || depth > 8) return nil;
+    if ([root isKindOfClass:[UITabBar class]]) return root;
+    NSString *cls = NSStringFromClass(root.class);
+    if ([cls rangeOfString:@"TabBar"].location != NSNotFound &&
+        [cls rangeOfString:@"Controller"].location == NSNotFound &&
+        root.subviews.count > 0)
+        return root;
+    for (UIView *sub in root.subviews) {
+        UIView *found = max_findTabBarView(sub, depth + 1);
+        if (found) return found;
     }
+    return nil;
+}
+
+// Attach the 0.5s long-press once, wherever the tab bar currently lives.
+// Called from viewDidLoad AND the periodic tab check so a warm launch (no
+// fresh viewDidLoad) or a rebuilt tab bar still gets the gesture.
+static void max_attachModsLongPress(id tabBarController) {
+    if (![tabBarController isKindOfClass:[UIViewController class]]) return;
+    UIView *barView = nil;
+    if ([tabBarController isKindOfClass:[UITabBarController class]])
+        barView = ((UITabBarController *)tabBarController).tabBar;
+    if (!barView)
+        barView = max_findTabBarView(((UIViewController *)tabBarController).view, 0);
     if (!barView) {
         maxlog(@"mods: no tab-bar view to attach long-press");
         return;
@@ -3283,11 +3304,21 @@ static void hook_tabBarViewDidLoad(id self, SEL _cmd) {
     }
     UILongPressGestureRecognizer *lp =
         [[UILongPressGestureRecognizer alloc]
-            initWithTarget:self action:@selector(maxmods_tabBarLongPress:)];
+            initWithTarget:tabBarController action:@selector(maxmods_tabBarLongPress:)];
     lp.minimumPressDuration = 0.5;
     lp.cancelsTouchesInView = NO;
     [barView addGestureRecognizer:lp];
-    maxlog(@"mods: long-press gesture attached to %@", NSStringFromClass(barView.class));
+    maxlog(@"mods: long-press gesture attached to %@ (host %@)",
+           NSStringFromClass(barView.class), NSStringFromClass([tabBarController class]));
+}
+
+static void hook_tabBarViewDidLoad(id self, SEL _cmd) {
+    if (orig_tabBarViewDidLoad)
+        ((void(*)(id,SEL))orig_tabBarViewDidLoad)(self, _cmd);
+    // defer once: the custom tab bar is often built after viewDidLoad returns
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ max_attachModsLongPress(self); });
+    max_attachModsLongPress(self);
 }
 
 // ============================================================================
@@ -3492,5 +3523,5 @@ static void maxmods_init(void) {
 
     // bump version string in log so we know FULL-LOG is active
     maxlog(@"v12.4-FULLLOG loaded OK — log file: %@ (sync/fsync, watchdog stack, crash dump, lifecycle)", max_logPath());
-    maxlog(@"v12.5 loaded OK (Моды redesign, Потужно theme) — log file: %@", max_logPath());
+    maxlog(@"v12.6 loaded OK (long-press reattach, any-position bar) — log file: %@", max_logPath());
 }
