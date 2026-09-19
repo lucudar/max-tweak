@@ -2914,62 +2914,86 @@ static void kd_hook_deleteLocally(id self, SEL _cmd, id ids, BOOL updateChat) {
 // MessageCell (Swift) exposes no message property, so find a message-like
 // object among its object ivars (the view model, or its .message) and read
 // the pk. Only object-typed ivars are dereferenced. Everything guarded.
-static int g_kdCellDumpBudget = 24;   // FULL-LOG: dump cell ivar layout N times
+static int g_kdCellDumpBudget = 20;   // FULL-LOG: dump attrs ivar layout N times
 
-// does obj (or obj.message / obj.viewModel) expose a message pk?
-static id max_msgLike(id val) {
-    if (!val) return nil;
-    @try {
-        if ([val respondsToSelector:sel_registerName("primaryKey")] ||
-            [val respondsToSelector:sel_registerName("messagePk")])
-            return val;
-        static const char *subKeys[] = { "message", "viewModel", "model", "item", "messageViewModel" };
-        for (size_t k = 0; k < sizeof(subKeys)/sizeof(subKeys[0]); k++) {
-            SEL sel = sel_registerName(subKeys[k]);
-            if ([val respondsToSelector:sel]) {
-                id sub = ((id(*)(id,SEL))objc_msgSend)(val, sel);
-                if (sub && ([sub respondsToSelector:sel_registerName("primaryKey")] ||
-                            [sub respondsToSelector:sel_registerName("messagePk")]))
-                    return sub;
-            }
-        }
-    } @catch (NSException *e) {}
-    return nil;
+// Recurse only into app/framework model objects — never UIKit/Foundation
+// containers (avoids huge trees and picking an unrelated message).
+static BOOL max_isModelClass(id v) {
+    const char *n = class_getName(object_getClass(v));
+    if (!n) return NO;
+    if (strncmp(n, "UI", 2) == 0 || strncmp(n, "NS", 2) == 0 ||
+        strncmp(n, "_NS", 3) == 0 || strncmp(n, "__NS", 4) == 0 ||
+        strncmp(n, "CA", 2) == 0 || strncmp(n, "CF", 2) == 0)
+        return NO;
+    return YES;
 }
 
-static id max_cellMessage(id cell) {
-    BOOL dump = (g_kdCellDumpBudget > 0);
-    NSMutableString *layout = dump ? [NSMutableString string] : nil;
-    Class c = object_getClass(cell);
-    id found = nil;
-    for (int depth = 0; c && depth < 6; depth++, c = class_getSuperclass(c)) {
+// Depth-first hunt for a message-like object (responds to primaryKey /
+// messagePk) inside `root` — used on the cell's OWN layout attributes, so
+// whatever it finds belongs to this exact cell.
+static id max_findMsgDeep(id root, int depth, NSMutableSet *seen) {
+    if (!root || depth > 4) return nil;
+    @try {
+        if ([root respondsToSelector:sel_registerName("primaryKey")] ||
+            [root respondsToSelector:sel_registerName("messagePk")])
+            return root;
+    } @catch (NSException *e) { return nil; }
+    NSValue *key = [NSValue valueWithNonretainedObject:root];
+    if ([seen containsObject:key]) return nil;
+    [seen addObject:key];
+    Class c = object_getClass(root);
+    for (int d = 0; c && d < 4; d++, c = class_getSuperclass(c)) {
         unsigned int n = 0;
         Ivar *ivars = class_copyIvarList(c, &n);
         if (!ivars) continue;
-        for (unsigned i = 0; i < n; i++) {
+        id found = nil;
+        for (unsigned i = 0; i < n && !found; i++) {
             const char *enc = ivar_getTypeEncoding(ivars[i]);
-            if (!enc || enc[0] != '@') continue;   // objects only
+            if (!enc || enc[0] != '@') continue;
             @try {
-                id val = object_getIvar(cell, ivars[i]);
-                if (!val) continue;
-                if (dump) [layout appendFormat:@"%s(%@) ", ivar_getName(ivars[i]),
-                          NSStringFromClass(object_getClass(val))];
-                if (!found) {
-                    id m = max_msgLike(val);
-                    if (m) found = m;
+                id val = object_getIvar(root, ivars[i]);
+                if (!val || val == root) continue;
+                if ([val respondsToSelector:sel_registerName("primaryKey")] ||
+                    [val respondsToSelector:sel_registerName("messagePk")]) {
+                    found = val; break;
                 }
+                if (max_isModelClass(val))
+                    found = max_findMsgDeep(val, depth + 1, seen);
             } @catch (NSException *e) {}
         }
         free(ivars);
-        if (found && !dump) break;
+        if (found) return found;
     }
-    if (dump) {
+    return nil;
+}
+
+// Resolve this cell's message from the layout attributes it was given.
+static id max_cellMessageFromAttrs(id attrs) {
+    if (!attrs) return nil;
+    id msg = max_findMsgDeep(attrs, 0, [NSMutableSet set]);
+    if (g_kdCellDumpBudget > 0) {
         g_kdCellDumpBudget--;
-        maxlog(@"keep-del: cell=%@ msg=%@ ivars=[%@]",
-               NSStringFromClass(object_getClass(cell)),
-               found ? @"FOUND" : @"none", layout);
+        NSMutableString *layout = [NSMutableString string];
+        Class c = object_getClass(attrs);
+        for (int d = 0; c && d < 3; d++, c = class_getSuperclass(c)) {
+            unsigned int n = 0; Ivar *iv = class_copyIvarList(c, &n);
+            if (!iv) continue;
+            for (unsigned i = 0; i < n; i++) {
+                const char *e = ivar_getTypeEncoding(iv[i]);
+                if (!e || e[0] != '@') continue;
+                @try {
+                    id v = object_getIvar(attrs, iv[i]);
+                    [layout appendFormat:@"%s(%@) ", ivar_getName(iv[i]),
+                        v ? NSStringFromClass(object_getClass(v)) : @"nil"];
+                } @catch (NSException *ex) {}
+            }
+            free(iv);
+        }
+        maxlog(@"keep-del: attrs=%@ msg=%@ pk=%@ ivars=[%@]",
+               NSStringFromClass(object_getClass(attrs)),
+               msg ? @"FOUND" : @"none", msg ? max_msgPk(msg) : @"-", layout);
     }
-    return found;
+    return msg;
 }
 
 static void kd_applyDeletedStyle(UICollectionViewCell *cell, BOOL kept) {
@@ -3004,7 +3028,7 @@ static void kd_hook_cellApplyLayout(id self, SEL _cmd, id attrs) {
     @try {
         BOOL kept = NO;
         if (max_modOn(@"mod.del") && g_keptDeletedIds.count) {
-            id msg = max_cellMessage(self);
+            id msg = max_cellMessageFromAttrs(attrs);
             NSString *pk = msg ? max_msgPk(msg) : nil;
             if (pk && [g_keptDeletedIds containsObject:max_msgIdOnly(pk)]) kept = YES;
         }
@@ -4039,5 +4063,5 @@ static void maxmods_init(void) {
 
     // bump version string in log so we know FULL-LOG is active
     maxlog(@"v12.4-FULLLOG loaded OK — log file: %@ (sync/fsync, watchdog stack, crash dump, lifecycle)", max_logPath());
-    maxlog(@"v12.13 loaded OK (keep-deleted persistence + cell-ivar diag) — log file: %@", max_logPath());
+    maxlog(@"v12.14 loaded OK (keep-del visual via attrs) — log file: %@", max_logPath());
 }
