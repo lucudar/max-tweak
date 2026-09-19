@@ -2920,39 +2920,59 @@ static ModEntry max_modEntries[] = {
 };
 static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntries[0]);
 
-@implementation MAXModsViewController
+@implementation MAXModsViewController {
+    UIView *_hdrCard;
+    UIView *_hdrBand;
+    UILabel *_hdrTitle;
+}
 
-// Потужно flag header: blue over yellow bar + wordmark, sits above the table.
+// Потужно flag header: blue top half + yellow bottom half + wordmark. Built
+// once here; sized to the live table width in max_layoutHeader (a fixed-width
+// tableHeaderView does not auto-stretch, which left it cut off on the right).
 - (UIView *)max_makeHeader {
-    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320, 132)];
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320, 136)];
 
-    UIView *card = [[UIView alloc] initWithFrame:CGRectMake(16, 12, 288, 104)];
-    card.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    card.layer.cornerRadius = 18;
-    card.layer.cornerCurve = kCACornerCurveContinuous;
-    card.layer.masksToBounds = YES;
-    card.backgroundColor = max_potuzhnoBlue();
-    [header addSubview:card];
+    _hdrCard = [[UIView alloc] initWithFrame:CGRectZero];
+    _hdrCard.layer.cornerRadius = 18;
+    _hdrCard.layer.cornerCurve = kCACornerCurveContinuous;
+    _hdrCard.layer.masksToBounds = YES;
+    _hdrCard.backgroundColor = max_potuzhnoBlue();
+    [header addSubview:_hdrCard];
 
-    // bottom yellow band = the flag
-    UIView *band = [[UIView alloc] initWithFrame:CGRectMake(0, 52, 288, 52)];
-    band.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
-    band.backgroundColor = max_potuzhnoYellow();
-    [card addSubview:band];
+    _hdrBand = [[UIView alloc] initWithFrame:CGRectZero];   // yellow lower half
+    _hdrBand.backgroundColor = max_potuzhnoYellow();
+    [_hdrCard addSubview:_hdrBand];
 
-    UILabel *title = [[UILabel alloc] initWithFrame:card.bounds];
-    title.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    title.textAlignment = NSTextAlignmentCenter;
-    title.font = [UIFont systemFontOfSize:30 weight:UIFontWeightHeavy];
-    title.text = @"ПОТУЖНО";
-    title.textColor = UIColor.whiteColor;
-    title.layer.shadowColor = [UIColor colorWithWhite:0 alpha:0.35].CGColor;
-    title.layer.shadowOffset = CGSizeMake(0, 1);
-    title.layer.shadowOpacity = 1;
-    title.layer.shadowRadius = 3;
-    [card addSubview:title];
+    _hdrTitle = [[UILabel alloc] initWithFrame:CGRectZero];
+    _hdrTitle.textAlignment = NSTextAlignmentCenter;
+    _hdrTitle.font = [UIFont systemFontOfSize:30 weight:UIFontWeightHeavy];
+    _hdrTitle.text = @"ПОТУЖНО";
+    _hdrTitle.textColor = UIColor.whiteColor;
+    _hdrTitle.layer.shadowColor = [UIColor colorWithWhite:0 alpha:0.35].CGColor;
+    _hdrTitle.layer.shadowOffset = CGSizeMake(0, 1);
+    _hdrTitle.layer.shadowOpacity = 1;
+    _hdrTitle.layer.shadowRadius = 3;
+    [_hdrCard addSubview:_hdrTitle];
 
     return header;
+}
+
+- (void)max_layoutHeader {
+    UIView *header = self.tableView.tableHeaderView;
+    if (!header) return;
+    CGFloat w = self.tableView.bounds.size.width;
+    if (w < 1) return;
+    CGFloat const inset = 16, top = 12, cardH = 104;
+    CGFloat hdrH = top + cardH + 16;
+    // resize the header view itself, then re-assign so the table picks up
+    // the new height (assigning is what forces UITableView to re-measure).
+    if (header.frame.size.width != w || header.frame.size.height != hdrH) {
+        header.frame = CGRectMake(0, 0, w, hdrH);
+        self.tableView.tableHeaderView = header;
+    }
+    _hdrCard.frame = CGRectMake(inset, top, w - inset * 2, cardH);
+    _hdrBand.frame = CGRectMake(0, cardH / 2, _hdrCard.bounds.size.width, cardH / 2);
+    _hdrTitle.frame = _hdrCard.bounds;
 }
 
 - (void)viewDidLoad {
@@ -2961,6 +2981,11 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
     self.tableView.tableHeaderView = [self max_makeHeader];
     if (@available(iOS 13.0, *))
         self.navigationController.navigationBar.tintColor = max_potuzhnoBlue();
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    [self max_layoutHeader];
 }
 
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
@@ -3611,5 +3636,5 @@ static void maxmods_init(void) {
 
     // bump version string in log so we know FULL-LOG is active
     maxlog(@"v12.4-FULLLOG loaded OK — log file: %@ (sync/fsync, watchdog stack, crash dump, lifecycle)", max_logPath());
-    maxlog(@"v12.8 loaded OK (long-press diagnostics + window catch-all) — log file: %@", max_logPath());
+    maxlog(@"v12.9 loaded OK (Моды header aligned + custom home icon) — log file: %@", max_logPath());
 }
