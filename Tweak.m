@@ -2911,110 +2911,122 @@ static void kd_hook_deleteLocally(id self, SEL _cmd, id ids, BOOL updateChat) {
 }
 
 // ---- Visual mark: dim kept-deleted message cells + a trash badge ----------
-// MessageCell (Swift) exposes no message property, so find a message-like
-// object among its object ivars (the view model, or its .message) and read
-// the pk. Only object-typed ivars are dereferenced. Everything guarded.
-static int g_kdCellDumpBudget = 20;   // FULL-LOG: dump attrs ivar layout N times
+// The layout attributes carry NO message (log(8): attrs only hold _indexPath).
+// The message DOES render, so its object lives in the cell's view hierarchy
+// (MessageCell -> contentView -> Body/Bubble view -> view model -> message).
+// We do a bounded breadth-first walk over the cell's subviews AND object
+// ivars, reading a pk off anything that answers primaryKey/messagePk, and
+// match it against the kept set. Fires on every applyLayoutAttributes:, so it
+// refreshes on scroll and chat re-open. All guarded, capped, cheap.
+static int g_kdCellDumpBudget = 12;   // dump cell node layout N times for diag
 
-// Recurse only into app/framework model objects — never UIKit/Foundation
-// containers (avoids huge trees and picking an unrelated message).
-static BOOL max_isModelClass(id v) {
-    const char *n = class_getName(object_getClass(v));
-    if (!n) return NO;
-    if (strncmp(n, "UI", 2) == 0 || strncmp(n, "NS", 2) == 0 ||
-        strncmp(n, "_NS", 3) == 0 || strncmp(n, "__NS", 4) == 0 ||
-        strncmp(n, "CA", 2) == 0 || strncmp(n, "CF", 2) == 0)
-        return NO;
-    return YES;
-}
-
-// Depth-first hunt for a message-like object (responds to primaryKey /
-// messagePk) inside `root` — used on the cell's OWN layout attributes, so
-// whatever it finds belongs to this exact cell.
-static id max_findMsgDeep(id root, int depth, NSMutableSet *seen) {
-    if (!root || depth > 4) return nil;
+// Read a pk-like string off any object that answers primaryKey/messagePk.
+static NSString *max_pkOf(id o) {
+    if (!o) return nil;
     @try {
-        if ([root respondsToSelector:sel_registerName("primaryKey")] ||
-            [root respondsToSelector:sel_registerName("messagePk")])
-            return root;
-    } @catch (NSException *e) { return nil; }
-    NSValue *key = [NSValue valueWithNonretainedObject:root];
-    if ([seen containsObject:key]) return nil;
-    [seen addObject:key];
-    Class c = object_getClass(root);
-    for (int d = 0; c && d < 4; d++, c = class_getSuperclass(c)) {
-        unsigned int n = 0;
-        Ivar *ivars = class_copyIvarList(c, &n);
-        if (!ivars) continue;
-        id found = nil;
-        for (unsigned i = 0; i < n && !found; i++) {
-            const char *enc = ivar_getTypeEncoding(ivars[i]);
-            if (!enc || enc[0] != '@') continue;
-            @try {
-                id val = object_getIvar(root, ivars[i]);
-                if (!val || val == root) continue;
-                if ([val respondsToSelector:sel_registerName("primaryKey")] ||
-                    [val respondsToSelector:sel_registerName("messagePk")]) {
-                    found = val; break;
-                }
-                if (max_isModelClass(val))
-                    found = max_findMsgDeep(val, depth + 1, seen);
-            } @catch (NSException *e) {}
+        SEL s1 = sel_registerName("primaryKey");
+        if ([o respondsToSelector:s1]) {
+            id v = ((id(*)(id,SEL))objc_msgSend)(o, s1);
+            if (v) return [NSString stringWithFormat:@"%@", v];
         }
-        free(ivars);
-        if (found) return found;
-    }
+        SEL s2 = sel_registerName("messagePk");
+        if ([o respondsToSelector:s2]) {
+            id v = ((id(*)(id,SEL))objc_msgSend)(o, s2);
+            if (v) return [NSString stringWithFormat:@"%@", v];
+        }
+    } @catch (NSException *e) {}
     return nil;
 }
 
-// Resolve this cell's message from the layout attributes it was given.
-static id max_cellMessageFromAttrs(id attrs) {
-    if (!attrs) return nil;
-    id msg = max_findMsgDeep(attrs, 0, [NSMutableSet set]);
-    if (g_kdCellDumpBudget > 0) {
-        g_kdCellDumpBudget--;
-        NSMutableString *layout = [NSMutableString string];
-        Class c = object_getClass(attrs);
-        for (int d = 0; c && d < 3; d++, c = class_getSuperclass(c)) {
-            unsigned int n = 0; Ivar *iv = class_copyIvarList(c, &n);
-            if (!iv) continue;
-            for (unsigned i = 0; i < n; i++) {
-                const char *e = ivar_getTypeEncoding(iv[i]);
-                if (!e || e[0] != '@') continue;
-                @try {
-                    id v = object_getIvar(attrs, iv[i]);
-                    [layout appendFormat:@"%s(%@) ", ivar_getName(iv[i]),
-                        v ? NSStringFromClass(object_getClass(v)) : @"nil"];
-                } @catch (NSException *ex) {}
-            }
-            free(iv);
+// BFS the cell's view tree + object ivars for a kept message id. Returns the
+// matching pk (so the caller can log it) or nil. Never recurses into
+// Foundation/CoreAnimation containers; skips already-seen nodes; hard node cap.
+static NSString *max_cellKeptPk(id cell, BOOL wantDump) {
+    if (!cell || g_keptDeletedIds.count == 0) return nil;
+    NSMutableSet *seen = [NSMutableSet set];
+    NSMutableArray *queue = [NSMutableArray arrayWithObject:cell];
+    NSMutableString *dump = wantDump ? [NSMutableString string] : nil;
+    int budget = 400;
+    NSString *hit = nil;
+    while (queue.count && budget-- > 0) {
+        id node = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        if (!node) continue;
+        NSValue *nk = [NSValue valueWithNonretainedObject:node];
+        if ([seen containsObject:nk]) continue;
+        [seen addObject:nk];
+
+        NSString *pk = max_pkOf(node);
+        if (pk) {
+            if (dump) [dump appendFormat:@"<%@ pk=%@> ",
+                       NSStringFromClass(object_getClass(node)), max_msgIdOnly(pk)];
+            if ([g_keptDeletedIds containsObject:max_msgIdOnly(pk)]) { hit = pk; break; }
         }
-        maxlog(@"keep-del: attrs=%@ msg=%@ pk=%@ ivars=[%@]",
-               NSStringFromClass(object_getClass(attrs)),
-               msg ? @"FOUND" : @"none", msg ? max_msgPk(msg) : @"-", layout);
+
+        // Enqueue subviews (descend the render tree).
+        if ([node isKindOfClass:[UIView class]]) {
+            @try { for (UIView *sv in [(UIView *)node subviews]) if (sv) [queue addObject:sv]; }
+            @catch (NSException *e) {}
+        }
+
+        // Enqueue object-typed ivars (view models, message, etc.). Skip
+        // Foundation/CA/CF/CG containers to stay bounded.
+        Class c = object_getClass(node);
+        for (int d = 0; c && d < 5; d++, c = class_getSuperclass(c)) {
+            const char *cn = class_getName(c);
+            if (cn && (strncmp(cn, "UIView", 6) == 0 || strncmp(cn, "UIResponder", 11) == 0 ||
+                       strncmp(cn, "NS", 2) == 0)) break;  // stop at UIKit/NS base ivars
+            unsigned int n = 0;
+            Ivar *ivars = class_copyIvarList(c, &n);
+            if (!ivars) continue;
+            for (unsigned i = 0; i < n; i++) {
+                const char *enc = ivar_getTypeEncoding(ivars[i]);
+                if (!enc || enc[0] != '@') continue;
+                @try {
+                    id val = object_getIvar(node, ivars[i]);
+                    if (!val || val == node) continue;
+                    const char *vn = class_getName(object_getClass(val));
+                    if (!vn) continue;
+                    if (strncmp(vn, "NS", 2) == 0 || strncmp(vn, "__NS", 4) == 0 ||
+                        strncmp(vn, "_NS", 3) == 0 || strncmp(vn, "CA", 2) == 0 ||
+                        strncmp(vn, "CF", 2) == 0 || strncmp(vn, "CG", 2) == 0)
+                        continue;
+                    [queue addObject:val];
+                } @catch (NSException *e) {}
+            }
+            free(ivars);
+        }
     }
-    return msg;
+    if (dump) maxlog(@"keep-del: cell walk hit=%@ nodes<=%d dump=[%@]",
+                     hit ? max_msgIdOnly(hit) : @"none", 400 - budget, dump);
+    return hit;
 }
 
 static void kd_applyDeletedStyle(UICollectionViewCell *cell, BOOL kept) {
     UIView *cv = cell.contentView ?: (UIView *)cell;
-    UIImageView *badge = [cv viewWithTag:kDeletedBadgeTag];
+    // The badge must not be clipped by the bubble/content bounds.
+    @try { cell.clipsToBounds = NO; cv.clipsToBounds = NO; } @catch (NSException *e) {}
+    UIView *host = (UIView *)cell;                   // badge on the cell, above content
+    UIImageView *badge = [host viewWithTag:(NSInteger)kDeletedBadgeTag];
     if (kept) {
-        cv.alpha = max_deletedAlpha();
+        cv.alpha = max_deletedAlpha();               // transparency slider value
         if (!badge) {
             UIImage *img = [UIImage systemImageNamed:@"trash.fill"];
             badge = [[UIImageView alloc] initWithImage:img];
-            badge.tag = kDeletedBadgeTag;
+            badge.tag = (NSInteger)kDeletedBadgeTag;
             badge.tintColor = [UIColor systemRedColor];
+            badge.contentMode = UIViewContentModeScaleAspectFit;
             badge.translatesAutoresizingMaskIntoConstraints = NO;
-            [cv addSubview:badge];
+            [host addSubview:badge];
             [NSLayoutConstraint activateConstraints:@[
-                [badge.topAnchor constraintEqualToAnchor:cv.topAnchor constant:2],
-                [badge.trailingAnchor constraintEqualToAnchor:cv.trailingAnchor constant:-6],
-                [badge.widthAnchor constraintEqualToConstant:15],
-                [badge.heightAnchor constraintEqualToConstant:15],
+                [badge.topAnchor constraintEqualToAnchor:host.topAnchor constant:1],
+                [badge.leadingAnchor constraintEqualToAnchor:host.leadingAnchor constant:4],
+                [badge.widthAnchor constraintEqualToConstant:16],
+                [badge.heightAnchor constraintEqualToConstant:16],
             ]];
         }
+        [host bringSubviewToFront:badge];
+        badge.alpha = 1.0;                           // badge stays opaque over dimmed cell
         badge.hidden = NO;
     } else {
         cv.alpha = 1.0;
@@ -3028,9 +3040,10 @@ static void kd_hook_cellApplyLayout(id self, SEL _cmd, id attrs) {
     @try {
         BOOL kept = NO;
         if (max_modOn(@"mod.del") && g_keptDeletedIds.count) {
-            id msg = max_cellMessageFromAttrs(attrs);
-            NSString *pk = msg ? max_msgPk(msg) : nil;
-            if (pk && [g_keptDeletedIds containsObject:max_msgIdOnly(pk)]) kept = YES;
+            BOOL wantDump = g_kdCellDumpBudget > 0;
+            if (wantDump) g_kdCellDumpBudget--;
+            NSString *pk = max_cellKeptPk(self, wantDump);
+            if (pk) kept = YES;
         }
         kd_applyDeletedStyle((UICollectionViewCell *)self, kept);
     } @catch (NSException *e) {}
@@ -4063,5 +4076,5 @@ static void maxmods_init(void) {
 
     // bump version string in log so we know FULL-LOG is active
     maxlog(@"v12.4-FULLLOG loaded OK — log file: %@ (sync/fsync, watchdog stack, crash dump, lifecycle)", max_logPath());
-    maxlog(@"v12.14 loaded OK (keep-del visual via attrs) — log file: %@", max_logPath());
+    maxlog(@"v12.15 loaded OK (keep-del visual via cell BFS) — log file: %@", max_logPath());
 }
