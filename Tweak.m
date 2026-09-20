@@ -1190,30 +1190,139 @@ static void max_installBrandStrings(void) {
            orig_objectForInfo ? @"OK" : @"MISS");
 }
 
+// ---- Diagnostics: dump a class's ivars / properties / methods -------------
+// Prints everything about a class so we can see exactly what is editable and
+// which accessor feeds a given value. Guarded + capped so it is log-cheap.
+static void max_dumpClass(const char *clsName) {
+    Class c = objc_getClass(clsName);
+    if (!c) { maxlog(@"DUMP %s: <class not found>", clsName); return; }
+    maxlog(@"DUMP ===== %s (super=%s) =====", clsName,
+           class_getSuperclass(c) ? class_getName(class_getSuperclass(c)) : "nil");
+    @try {
+        unsigned int n = 0;
+        Ivar *ivars = class_copyIvarList(c, &n);
+        for (unsigned i = 0; i < n && i < 60; i++)
+            maxlog(@"  ivar  %s : %s", ivar_getName(ivars[i]),
+                   ivar_getTypeEncoding(ivars[i]) ?: "?");
+        free(ivars);
+        n = 0;
+        objc_property_t *props = class_copyPropertyList(c, &n);
+        for (unsigned i = 0; i < n && i < 60; i++)
+            maxlog(@"  prop  %s : %s", property_getName(props[i]),
+                   property_getAttributes(props[i]) ?: "?");
+        free(props);
+        n = 0;
+        Method *ms = class_copyMethodList(c, &n);
+        for (unsigned i = 0; i < n && i < 120; i++)
+            maxlog(@"  meth -%s", sel_getName(method_getName(ms[i])));
+        free(ms);
+        // also dump the metaclass (class methods, e.g. +providerConfiguration)
+        Class meta = object_getClass((id)c);
+        n = 0;
+        Method *cms = class_copyMethodList(meta, &n);
+        for (unsigned i = 0; i < n && i < 60; i++)
+            maxlog(@"  meth +%s", sel_getName(method_getName(cms[i])));
+        free(cms);
+    } @catch (NSException *e) { maxlog(@"DUMP %s err %@", clsName, e); }
+    maxlog(@"DUMP ===== end %s =====", clsName);
+}
+
 // ---- CallKit active-call pill: rename "MAX" -> "Потужно" -------------------
-// The blue call indicator in the Dynamic Island shows
-// CXProviderConfiguration.localizedName. It is readonly, set once via
-// -initWithLocalizedName:. Hook that initializer and rebrand the argument.
-static IMP g_origCXInitName = NULL;
+// The CallKit active-call pill (Dynamic Island) shows
+// CXProviderConfiguration.localizedName. It is readonly (backing ivar
+// _localizedName), and modern Swift may use either -initWithLocalizedName: OR
+// the parameterless -init (iOS 14+ default). Rather than intercept one
+// initializer's argument, hook whichever init the class actually implements and
+// FORCE localizedName to the brand afterwards via KVC (reaches the ivar). This
+// is robust to lowercase "max", to bundle-derived names, and to the empty init.
+static IMP g_origCXInitName = NULL;   // -initWithLocalizedName:
+static IMP g_origCXInit     = NULL;   // -init
+
+// Does class c implement `sel` itself (not inherited)? Guards against grabbing
+// NSObject's -init and hijacking every object's initializer.
+static BOOL max_classHasOwnMethod(Class c, SEL sel) {
+    unsigned int n = 0;
+    Method *ms = class_copyMethodList(c, &n);
+    BOOL found = NO;
+    for (unsigned i = 0; i < n; i++)
+        if (method_getName(ms[i]) == sel) { found = YES; break; }
+    free(ms);
+    return found;
+}
+
+static void max_forceProviderName(id cfg) {
+    if (!cfg) return;
+    @try {
+        NSString *cur = nil;
+        if ([cfg respondsToSelector:@selector(localizedName)])
+            cur = ((id(*)(id,SEL))objc_msgSend)(cfg, @selector(localizedName));
+        if ([cur isEqualToString:@"Потужно"]) return;   // already branded
+        [cfg setValue:@"Потужно" forKey:@"localizedName"];  // KVC -> _localizedName
+        maxlog(@"callkit: provider name \"%@\" -> Потужно", cur);
+    } @catch (NSException *e) { maxlog(@"callkit: force name err %@", e); }
+}
 
 static id hook_cxInitWithName(id self, SEL _cmd, NSString *name) {
+    id cfg = ((id(*)(id,SEL,id))g_origCXInitName)(self, _cmd, name ?: @"");
+    max_forceProviderName(cfg);
+    return cfg;
+}
+
+static id hook_cxInit(id self, SEL _cmd) {
+    id cfg = ((id(*)(id,SEL))g_origCXInit)(self, _cmd);
+    max_forceProviderName(cfg);
+    return cfg;
+}
+
+// CXCallUpdate.localizedCallerName — the per-call name (who is calling). The
+// active-call pill can show this instead of the provider name. Log every set
+// and rebrand any MAX/макс token so it never leaks the old brand.
+static IMP g_origCXSetCaller = NULL;
+static void hook_cxSetCaller(id self, SEL _cmd, NSString *name) {
     NSString *branded = max_rebrandString(name);
-    if (![branded isEqualToString:name])
-        maxlog(@"callkit: provider name \"%@\" -> \"%@\"", name, branded);
-    return ((id(*)(id,SEL,id))g_origCXInitName)(self, _cmd, branded ?: name);
+    maxlog(@"callkit: CXCallUpdate.localizedCallerName set \"%@\"%@", name,
+           [branded isEqualToString:name] ? @"" :
+           [NSString stringWithFormat:@" -> \"%@\"", branded]);
+    ((void(*)(id,SEL,id))g_origCXSetCaller)(self, _cmd, branded ?: name);
 }
 
 static void max_installCallKitBrand(void) {
+    // Full diagnostic dump so the log shows every editable field + accessor.
+    max_dumpClass("CXProviderConfiguration");
+    max_dumpClass("CXCallUpdate");
+    max_dumpClass("CXProvider");
+    max_dumpClass("_TtC7OMCalls17CallKitController");
+    max_dumpClass("_TtC7OMCalls21FakeCallKitController");
+
     Class cx = objc_getClass("CXProviderConfiguration");
     if (!cx) { maxlog(@"callkit: CXProviderConfiguration not found"); return; }
-    SEL sel = @selector(initWithLocalizedName:);
-    Method m = class_getInstanceMethod(cx, sel);
-    if (m) {
+
+    if (max_classHasOwnMethod(cx, @selector(initWithLocalizedName:))) {
+        Method m = class_getInstanceMethod(cx, @selector(initWithLocalizedName:));
         g_origCXInitName = method_getImplementation(m);
         method_setImplementation(m, (IMP)hook_cxInitWithName);
         maxlog(@"callkit: hooked initWithLocalizedName:");
     } else {
-        maxlog(@"callkit: initWithLocalizedName: not found");
+        maxlog(@"callkit: initWithLocalizedName: not own method");
+    }
+
+    if (max_classHasOwnMethod(cx, @selector(init))) {
+        Method m = class_getInstanceMethod(cx, @selector(init));
+        g_origCXInit = method_getImplementation(m);
+        method_setImplementation(m, (IMP)hook_cxInit);
+        maxlog(@"callkit: hooked init");
+    } else {
+        maxlog(@"callkit: init not own method (skipped, avoids NSObject)");
+    }
+
+    Class upd = objc_getClass("CXCallUpdate");
+    if (upd && max_classHasOwnMethod(upd, @selector(setLocalizedCallerName:))) {
+        Method m = class_getInstanceMethod(upd, @selector(setLocalizedCallerName:));
+        g_origCXSetCaller = method_getImplementation(m);
+        method_setImplementation(m, (IMP)hook_cxSetCaller);
+        maxlog(@"callkit: hooked CXCallUpdate setLocalizedCallerName:");
+    } else {
+        maxlog(@"callkit: CXCallUpdate setLocalizedCallerName: not hookable");
     }
 }
 
@@ -3746,7 +3855,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.4-FULLLOG loading (sync flush, crash dump, watchdog stack, lifecycle), overlay polish, Потужно strings)...");
+    maxlog(@"v12.18-DIAG loading (CallKit force-name, class dumps, hook map)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -3887,5 +3996,36 @@ static void maxmods_init(void) {
 
     // bump version string in log so we know FULL-LOG is active
     maxlog(@"v12.4-FULLLOG loaded OK — log file: %@ (sync/fsync, watchdog stack, crash dump, lifecycle)", max_logPath());
-    maxlog(@"v12.17 loaded OK (CallKit pill rebrand + transparency slider removed) — log file: %@", max_logPath());
+
+    // ---- HOOK MAP: one readable block of every hook and whether it took ----
+    maxlog(@"======================= HOOK MAP =======================");
+    maxlog(@"[menu ] UIContextMenuConfiguration.config: %@", orig_configCreate?@"OK":@"MISS");
+    maxlog(@"[menu ] MessageCell.contextMenu:          %@", orig_cellConfig?@"OK":@"MISS");
+    maxlog(@"[menu ] ChatDetail.contextMenu:           %@", orig_cvConfig?@"OK":@"MISS");
+    maxlog(@"[brand] NSBundle.localizedString:         %@", orig_localized?@"OK":@"MISS");
+    maxlog(@"[brand] NSBundle.infoDictionary:          %@", orig_infoDict?@"OK":@"MISS");
+    maxlog(@"[brand] NSBundle.objectForInfoDictKey:    %@", orig_objectForInfo?@"OK":@"MISS");
+    maxlog(@"[call ] CXProviderConfiguration initName: %@", g_origCXInitName?@"OK":@"MISS");
+    maxlog(@"[call ] CXProviderConfiguration init:     %@", g_origCXInit?@"OK":@"MISS");
+    maxlog(@"[call ] CXCallUpdate setLocalizedCaller:  %@", g_origCXSetCaller?@"OK":@"MISS");
+    maxlog(@"[read ] ChatHandler markAsRead orig:      %@", g_origMarkAsRead?@"OK":@"MISS");
+    maxlog(@"[del  ] OKMMsg setStatus:                 %@", g_origSetStatus?@"OK":@"MISS");
+    maxlog(@"[del  ] MessageDeleteListener:            %@", g_origMessagesDeletedInChat?@"OK":@"MISS");
+    maxlog(@"[del  ] ChatService deleteLocally:        %@", g_origDeleteLocally?@"OK":@"MISS");
+    maxlog(@"[del  ] DeleteTask sendDeleteCommand:     %@", g_origSendDeleteCommand?@"OK":@"MISS");
+    maxlog(@"[sess ] Keychain class/init:             %@/%@", orig_kcClass?@"OK":@"MISS", orig_kcInit?@"OK":@"MISS");
+    maxlog(@"[sess ] NSFileManager containerURL:       %@", orig_containerURL?@"OK":@"MISS");
+    maxlog(@"[sess ] NSUserDefaults initSuite:         %@", orig_initSuite?@"OK":@"MISS");
+    maxlog(@"[mods ] tab-bar long-press:               %@", orig_tabBarViewDidLoad?@"OK":@"MISS");
+    maxlog(@"===== toggles: to edit a value, flip its switch in «Моды» =====");
+    {
+        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+        for (NSUInteger i = 0; i < kModCount; i++) {
+            ModEntry e = max_modEntries[i];
+            maxlog(@"  [%@] %@ = %@", max_modOn(e.key)?@"ON ":@"off", e.key, e.title);
+        }
+    }
+    maxlog(@"========================================================");
+
+    maxlog(@"v12.18 loaded OK (CallKit force-name + CallKit/hook DIAGNOSTICS dump) — log file: %@", max_logPath());
 }
