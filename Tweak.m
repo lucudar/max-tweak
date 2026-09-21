@@ -3536,8 +3536,6 @@ typedef struct {
 static ModEntry max_modEntries[] = {
     { .title = @"Не отправлять «прочитано»", .key = @"mod.read",
       .subtitle = @"Выкл = обычные галочки. Вкл = собеседник не видит прочтение" },
-    { .title = @"Видеть удалённые", .key = @"mod.del",
-      .subtitle = @"Экспериментально. Сообщения, удалённые собеседником, остаются у вас" },
     { .title = @"Скрывать «печатает…»", .key = @"mod.typing",
       .subtitle = @"Вкл = собеседник не видит, что вы набираете сообщение" },
 };
@@ -4124,7 +4122,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.28 loading (robust for Business match - normalize whitespace/NBSP)...");
+    maxlog(@"v12.30 loading (remove «Видеть удалённые» mod.del; tracker audit — MyTracker already fully blocked)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4181,14 +4179,17 @@ static void maxmods_init(void) {
         NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
         for (NSUInteger i = 0; i < kModCount; i++) {
             ModEntry e = max_modEntries[i];
-            // mod.del is experimental -> defaults OFF like mod.sysmenu.
-            if ([e.key isEqualToString:@"mod.sysmenu"] ||
-                [e.key isEqualToString:@"mod.del"]) {
+            // mod.sysmenu is experimental -> defaults OFF.
+            if ([e.key isEqualToString:@"mod.sysmenu"]) {
                 if ([d objectForKey:e.key] == nil) [d setBool:NO forKey:e.key];
                 continue;
             }
             if ([d objectForKey:e.key] == nil) [d setBool:YES forKey:e.key];
         }
+        // mod.del ("Видеть удалённые") removed from the UI (v12.30) — force it
+        // OFF so any previously-stored ON value can't keep the delete hooks
+        // active, and the feature is fully inert.
+        [d setBool:NO forKey:@"mod.del"];
         if ([d objectForKey:@"mod.read"] != nil)
             g_blockRead = [d boolForKey:@"mod.read"];
         else
@@ -4200,7 +4201,7 @@ static void maxmods_init(void) {
     // 5) Ghost hooks — v12.3: dedicated orig IMPs so OFF actually sends.
     max_installGhostHooks();
     max_installTypingHook();    // mod.typing — hide "печатает…", default ON
-    max_installKeepDeleted();   // mod.del — experimental, default OFF
+    // mod.del ("Видеть удалённые") removed in v12.30 — hooks not installed.
     max_installSysmenuDiagnostics();
 
     // 6) «Моды» entry points:
@@ -4299,5 +4300,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.28 loaded OK (for Business match: whitespace-normalized) — log file: %@", max_logPath());
+    maxlog(@"v12.30 loaded OK (mod.del removed, trackers verified blocked) — log file: %@", max_logPath());
 }
