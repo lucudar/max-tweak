@@ -2919,6 +2919,39 @@ static void max_installGhostHooks(void) {
 }
 
 // ============================================================================
+#pragma mark - mod.typing — don't broadcast "печатает…"
+//
+// OKMChatTypingSender.startSendingTypingWithType:inChat:key: kicks off the
+// repeating "user is typing" signal (a timer that re-sends). With mod.typing
+// ON we swallow the start entirely, so the other side never sees the indicator.
+// OFF passes through unchanged.
+// ============================================================================
+static IMP g_origStartTyping = NULL;
+
+static id hook_startTyping(id self, SEL _cmd, id type, id chat, id key) {
+    if (max_modOn(@"mod.typing")) {
+        maxlog(@"typing: DROP startSendingTyping (mod.typing ON)");
+        return nil;
+    }
+    return ((id(*)(id,SEL,id,id,id))g_origStartTyping)(self, _cmd, type, chat, key);
+}
+
+static void max_installTypingHook(void) {
+    SEL sel = sel_registerName("startSendingTypingWithType:inChat:key:");
+    Class cls = objc_getClass("OKMChatTypingSender");
+    int hits = max_hookOwnSel(cls, sel, (IMP)hook_startTyping, &g_origStartTyping);
+    if (!hits) {
+        // safety net: scan for whoever owns that selector
+        unsigned int n = 0;
+        Class *classes = objc_copyClassList(&n);
+        for (unsigned i = 0; i < n && !g_origStartTyping; i++)
+            hits += max_hookOwnSel(classes[i], sel, (IMP)hook_startTyping, &g_origStartTyping);
+        free(classes);
+    }
+    maxlog(@"typing: hook %@ orig=%p", hits ? @"OK" : @"MISS", g_origStartTyping);
+}
+
+// ============================================================================
 #pragma mark - Keep-deleted (mod.del) — v12.11, clean self-contained module
 //
 // TG-fork behaviour: when the OTHER side deletes a message you keep seeing it.
@@ -3271,6 +3304,8 @@ static ModEntry max_modEntries[] = {
       .subtitle = @"Выкл = обычные галочки. Вкл = собеседник не видит прочтение" },
     { .title = @"Видеть удалённые", .key = @"mod.del",
       .subtitle = @"Экспериментально. Сообщения, удалённые собеседником, остаются у вас" },
+    { .title = @"Скрывать «печатает…»", .key = @"mod.typing",
+      .subtitle = @"Вкл = собеседник не видит, что вы набираете сообщение" },
 };
 static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntries[0]);
 
@@ -3855,7 +3890,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.18-DIAG loading (CallKit force-name, class dumps, hook map)...");
+    maxlog(@"v12.19 loading (mod.typing, CallKit force-name, class dumps, hook map)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -3929,6 +3964,7 @@ static void maxmods_init(void) {
 
     // 5) Ghost hooks — v12.3: dedicated orig IMPs so OFF actually sends.
     max_installGhostHooks();
+    max_installTypingHook();    // mod.typing — hide "печатает…", default ON
     max_installKeepDeleted();   // mod.del — experimental, default OFF
     max_installSysmenuDiagnostics();
 
@@ -4009,6 +4045,7 @@ static void maxmods_init(void) {
     maxlog(@"[call ] CXProviderConfiguration init:     %@", g_origCXInit?@"OK":@"MISS");
     maxlog(@"[call ] CXCallUpdate setLocalizedCaller:  %@", g_origCXSetCaller?@"OK":@"MISS");
     maxlog(@"[read ] ChatHandler markAsRead orig:      %@", g_origMarkAsRead?@"OK":@"MISS");
+    maxlog(@"[type ] ChatTypingSender startSending:     %@", g_origStartTyping?@"OK":@"MISS");
     maxlog(@"[del  ] OKMMsg setStatus:                 %@", g_origSetStatus?@"OK":@"MISS");
     maxlog(@"[del  ] MessageDeleteListener:            %@", g_origMessagesDeletedInChat?@"OK":@"MISS");
     maxlog(@"[del  ] ChatService deleteLocally:        %@", g_origDeleteLocally?@"OK":@"MISS");
@@ -4027,5 +4064,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.18 loaded OK (CallKit force-name + CallKit/hook DIAGNOSTICS dump) — log file: %@", max_logPath());
+    maxlog(@"v12.19 loaded OK (mod.typing hide-typing + CallKit force-name + diagnostics) — log file: %@", max_logPath());
 }
