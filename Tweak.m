@@ -613,11 +613,86 @@ static UIWindow *max_currentWindow(void) {
     return UIApplication.sharedApplication.keyWindow;
 }
 
+// ---- Accent / banner theme (v12.29) ----------------------------------------
+// A theme = a primary + secondary RGB pair. Index stored in NSUserDefaults
+// (key mod.theme). Index 0 = original Потужно (MAX blue 0x0057B7 + gold
+// 0xFFD700). max_potuzhnoBlue/Yellow read the active theme, so the whole mod
+// UI (accents, header, switches) recolors at once; the app-wide recolor hook
+// (colorWithRGBHex:) also remaps the original MAX blue to the active primary.
+typedef struct { const char *name; uint32_t primary; uint32_t secondary; } MaxTheme;
+static const MaxTheme kMaxThemes[] = {
+    { "Потужно (синьо-жовтий)", 0x0057B7, 0xFFD700 },
+    { "Графіт",                 0x2C2C2E, 0x8E8E93 },
+    { "Смарагд",                0x0E9F6E, 0xA7F3D0 },
+    { "Пурпур",                 0x7C3AED, 0xE9D5FF },
+    { "Кораловий",              0xFF5A5F, 0xFFD6D8 },
+    { "Океан",                  0x0EA5E9, 0xBAE6FD },
+    { "Захід",                  0xF97316, 0xFFE3C2 },
+    { "Рожеве золото",          0xE0245E, 0xFFC7D9 },
+};
+static const NSUInteger kMaxThemeCount = sizeof(kMaxThemes) / sizeof(kMaxThemes[0]);
+#define MAX_BRAND_BLUE 0x0057B7u   // original MAX brand blue (for app-wide remap)
+
+static NSUInteger max_activeThemeIndex(void) {
+    NSInteger i = [[NSUserDefaults standardUserDefaults] integerForKey:@"mod.theme"];
+    if (i < 0 || i >= (NSInteger)kMaxThemeCount) return 0;
+    return (NSUInteger)i;
+}
+static void max_setActiveThemeIndex(NSUInteger i) {
+    if (i >= kMaxThemeCount) i = 0;
+    [[NSUserDefaults standardUserDefaults] setInteger:(NSInteger)i forKey:@"mod.theme"];
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"mod.accent"]; // preset wins
+}
+static UIColor *max_colorFromHex(uint32_t rgb) {
+    return [UIColor colorWithRed:((rgb >> 16) & 0xFF) / 255.0
+                           green:((rgb >>  8) & 0xFF) / 255.0
+                            blue:( rgb        & 0xFF) / 255.0
+                           alpha:1.0];
+}
+// Custom accent: a free RGB value the user picks with UIColorPickerViewController.
+// Stored as an NSNumber (mod.accent). When set, it overrides the preset primary;
+// the secondary (banner lower band) is derived as a light tint of it.
+static BOOL max_hasCustomAccent(void) {
+    return [[NSUserDefaults standardUserDefaults] objectForKey:@"mod.accent"] != nil;
+}
+static uint32_t max_customAccentHex(void) {
+    return (uint32_t)[[NSUserDefaults standardUserDefaults] integerForKey:@"mod.accent"];
+}
+static void max_setCustomAccentHex(uint32_t rgb) {
+    [[NSUserDefaults standardUserDefaults] setInteger:(NSInteger)rgb forKey:@"mod.accent"];
+}
+static void max_clearCustomAccent(void) {
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"mod.accent"];
+}
+// Blend a color toward white by t (0..1) — used to derive the banner's soft band.
+static UIColor *max_tintTowardWhite(UIColor *c, CGFloat t) {
+    CGFloat r = 0, g = 0, b = 0, a = 1;
+    @try { [c getRed:&r green:&g blue:&b alpha:&a]; } @catch (NSException *e) {}
+    return [UIColor colorWithRed:r + (1 - r) * t
+                           green:g + (1 - g) * t
+                            blue:b + (1 - b) * t alpha:1.0];
+}
 static UIColor *max_potuzhnoBlue(void) {
-    return [UIColor colorWithRed:0.0 green:87.0/255.0 blue:183.0/255.0 alpha:1.0];
+    if (max_hasCustomAccent()) return max_colorFromHex(max_customAccentHex());
+    return max_colorFromHex(kMaxThemes[max_activeThemeIndex()].primary);
 }
 static UIColor *max_potuzhnoYellow(void) {
-    return [UIColor colorWithRed:1.0 green:215.0/255.0 blue:0.0 alpha:1.0];
+    if (max_hasCustomAccent())
+        return max_tintTowardWhite(max_colorFromHex(max_customAccentHex()), 0.72);
+    return max_colorFromHex(kMaxThemes[max_activeThemeIndex()].secondary);
+}
+static uint32_t max_hexFromColor(UIColor *c) {
+    CGFloat r = 0, g = 0, b = 0, a = 1;
+    @try { [c getRed:&r green:&g blue:&b alpha:&a]; } @catch (NSException *e) {}
+    uint32_t R = (uint32_t)round(MAX(0, MIN(1, r)) * 255);
+    uint32_t G = (uint32_t)round(MAX(0, MIN(1, g)) * 255);
+    uint32_t B = (uint32_t)round(MAX(0, MIN(1, b)) * 255);
+    return (R << 16) | (G << 8) | B;
+}
+// The active primary as a packed RGB (for the app-wide colorWithRGBHex remap).
+static uint32_t max_activePrimaryHex(void) {
+    if (max_hasCustomAccent()) return max_customAccentHex() & 0xFFFFFF;
+    return kMaxThemes[max_activeThemeIndex()].primary & 0xFFFFFF;
 }
 
 // A menu row: fixed-size leading icon + left-aligned title, laid out by hand.
@@ -1324,6 +1399,55 @@ static void max_installCallKitBrand(void) {
     } else {
         maxlog(@"callkit: CXCallUpdate setLocalizedCallerName: not hookable");
     }
+}
+
+// ---- App-wide accent recolor (v12.29) --------------------------------------
+// The whole app builds its brand colors through +[UIColor colorWithRGBHex:]
+// (and :alpha:). The brand blue is 0x0057B7. Hook both class methods: when the
+// requested value is the brand blue, return the active accent instead. Every
+// button/checkmark/accent that the app tints with the brand blue recolors —
+// no per-view swizzling. Gated on max_modOn(mod.accenton) so it's opt-in and
+// the original look is one toggle away.
+static IMP g_origColorRGBHex = NULL;         // +colorWithRGBHex:
+static IMP g_origColorRGBHexA = NULL;        // +colorWithRGBHex:alpha:
+static int g_accentLogBudget = 60;
+
+static BOOL max_accentActive(void) {
+    // On when the toggle is set AND the chosen primary differs from brand blue.
+    if (!max_modOn(@"mod.accenton")) return NO;
+    return (max_activePrimaryHex() & 0xFFFFFF) != MAX_BRAND_BLUE;
+}
+
+static id hook_colorWithRGBHex(id self, SEL _cmd, unsigned long long hex) {
+    unsigned long long want = hex;
+    if (max_accentActive() && (hex & 0xFFFFFF) == MAX_BRAND_BLUE)
+        want = max_activePrimaryHex();
+    if (g_accentLogBudget > 0 && (hex & 0xFFFFFF) == MAX_BRAND_BLUE) {
+        g_accentLogBudget--;
+        maxlog(@"accent: colorWithRGBHex 0x%06llX -> 0x%06llX", hex & 0xFFFFFF, want & 0xFFFFFF);
+    }
+    return ((id(*)(id,SEL,unsigned long long))g_origColorRGBHex)(self, _cmd, want);
+}
+static id hook_colorWithRGBHexA(id self, SEL _cmd, unsigned long long hex, double alpha) {
+    unsigned long long want = hex;
+    if (max_accentActive() && (hex & 0xFFFFFF) == MAX_BRAND_BLUE)
+        want = max_activePrimaryHex();
+    return ((id(*)(id,SEL,unsigned long long,double))g_origColorRGBHexA)(self, _cmd, want, alpha);
+}
+
+static void max_installAccentRecolor(void) {
+    Class uic = objc_getClass("UIColor");
+    if (!uic) { maxlog(@"accent: UIColor missing"); return; }
+    SEL s1 = NSSelectorFromString(@"om_colorWithRGBHex:");
+    SEL s2 = NSSelectorFromString(@"om_colorWithRGBHex:alpha:");
+    if (class_getClassMethod(uic, s1)) {
+        g_origColorRGBHex = swizzleClassMethod(uic, s1, (IMP)hook_colorWithRGBHex);
+        maxlog(@"accent: om_colorWithRGBHex: %@", g_origColorRGBHex ? @"hooked" : @"MISS");
+    } else maxlog(@"accent: no om_colorWithRGBHex:");
+    if (class_getClassMethod(uic, s2)) {
+        g_origColorRGBHexA = swizzleClassMethod(uic, s2, (IMP)hook_colorWithRGBHexA);
+        maxlog(@"accent: om_colorWithRGBHex:alpha: %@", g_origColorRGBHexA ? @"hooked" : @"MISS");
+    } else maxlog(@"accent: no om_colorWithRGBHex:alpha:");
 }
 
 static void max_installAdBlocker(void) {
@@ -3522,10 +3646,20 @@ static void max_installKeepDeletedHook(void) {
 // ============================================================================
 
 #endif  // end removed block 2 (two-phase + traces)
-@interface MAXModsViewController : UITableViewController
+API_AVAILABLE(ios(14.0))
+@interface MAXModsViewController : UITableViewController <UIColorPickerViewControllerDelegate>
 @end
 
 static NSString *const kModCell = @"maxmodcell";
+
+// Appearance section (index 1) rows.
+enum {
+    kAppRowAccentToggle = 0,   // switch: apply accent app-wide (mod.accenton)
+    kAppRowAccentColor  = 1,   // swatch: pick a custom accent color
+    kAppRowPresets      = 2,   // horizontal preset swatches
+    kAppRowReset        = 3,   // reset to original Потужно
+    kAppRowCount        = 4,
+};
 
 typedef struct {
     NSString *title;
@@ -3613,6 +3747,7 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
 
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
     if (s == 0) return @"Приватность";
+    if (s == 1) return @"Оформлення";
     return @"Отладка";
 }
 
@@ -3627,19 +3762,24 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
     if (s == 0) return @"Тумблеры хранятся на устройстве и работают сразу.";
+    if (s == 1) return @"Колір застосовується до кнопок, галочок та акцентів у застосунку. Прапор угорі теж змінює колір.";
     return @"Лог пишется в Documents/maxmods_log.txt.";
 }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 2; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 3; }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
     if (s == 0) return (NSInteger)kModCount;   // mods
+    if (s == 1) return kAppRowCount;            // appearance
     return 3;                                   // log actions
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv
          cellForRowAtIndexPath:(NSIndexPath *)ip {
     if (ip.section == 1) {
+        return [self max_appearanceCellForRow:ip.row inTable:tv];
+    }
+    if (ip.section == 2) {
         // log actions: view / share / clear
         static NSString *kLogCell = @"maxlogcell";
         UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:kLogCell];
@@ -3689,11 +3829,28 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
 
 - (CGFloat)tableView:(UITableView *)tv heightForRowAtIndexPath:(NSIndexPath *)ip {
     if (ip.section == 0) return 64.0;
+    if (ip.section == 1) {
+        if (ip.row == kAppRowAccentToggle) return 64.0;
+        if (ip.row == kAppRowPresets)      return 46.0;
+        return 52.0;
+    }
     return 48.0;
 }
 
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
-    if (ip.section != 1) return;   // only the log-actions section is tappable
+    if (ip.section == 1) {
+        [tv deselectRowAtIndexPath:ip animated:YES];
+        if (ip.row == kAppRowAccentColor) {
+            [self max_pickAccentColor];
+        } else if (ip.row == kAppRowReset) {
+            max_clearCustomAccent();
+            max_setActiveThemeIndex(0);
+            maxlog(@"appearance: reset to Потужно");
+            [self max_refreshBrandUI];
+        }
+        return;
+    }
+    if (ip.section != 2) return;   // only the log-actions section is tappable
     [tv deselectRowAtIndexPath:ip animated:YES];
 
     if (ip.row == 0) {
@@ -3753,6 +3910,124 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
     }
     maxlog(@"mods: %@ -> %@ (blockRead=%d)", e.key,
            sw.on ? @"ON" : @"OFF", (int)g_blockRead);
+}
+
+// ---- Appearance section (v12.29) -------------------------------------------
+- (UITableViewCell *)max_appearanceCellForRow:(NSInteger)row inTable:(UITableView *)tv {
+    static NSString *kApp = @"maxappcell";
+    UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:kApp];
+    if (!cell)
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
+                                      reuseIdentifier:kApp];
+    // reset reusable state
+    cell.accessoryView = nil;
+    cell.accessoryType = UITableViewCellAccessoryNone;
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    cell.detailTextLabel.text = nil;
+    cell.textLabel.textColor = UIColor.labelColor;
+    for (UIView *v in [cell.contentView.subviews copy])
+        if (v.tag == 7101 || v.tag == 7102) [v removeFromSuperview];
+
+    if (row == kAppRowAccentToggle) {
+        cell.textLabel.text = @"Свій колір у застосунку";
+        cell.detailTextLabel.text = @"Перефарбувати кнопки й акценти у вибраний колір";
+        cell.detailTextLabel.numberOfLines = 0;
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        UISwitch *sw = [UISwitch new];
+        sw.onTintColor = max_potuzhnoBlue();
+        sw.on = max_modOn(@"mod.accenton");
+        [sw addTarget:self action:@selector(accentToggleChanged:)
+             forControlEvents:UIControlEventValueChanged];
+        cell.accessoryView = sw;
+    } else if (row == kAppRowAccentColor) {
+        cell.textLabel.text = @"Вибрати колір";
+        cell.detailTextLabel.text = max_hasCustomAccent()
+            ? [NSString stringWithFormat:@"#%06X", max_customAccentHex() & 0xFFFFFF]
+            : @"Палітра / колесо / повзунки";
+        cell.detailTextLabel.numberOfLines = 0;
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        // trailing color swatch
+        UIView *sw = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 28, 28)];
+        sw.tag = 7101;
+        sw.backgroundColor = max_potuzhnoBlue();
+        sw.layer.cornerRadius = 14;
+        sw.layer.borderWidth = 1;
+        sw.layer.borderColor = [UIColor colorWithWhite:0 alpha:0.15].CGColor;
+        cell.accessoryView = sw;
+    } else if (row == kAppRowPresets) {
+        cell.textLabel.text = @"Пресети";
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        // a strip of tappable preset swatches
+        CGFloat d = 30, gap = 10, x = 0;
+        UIView *strip = [[UIView alloc] initWithFrame:CGRectZero];
+        strip.tag = 7102;
+        for (NSUInteger i = 0; i < kMaxThemeCount; i++) {
+            UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+            b.frame = CGRectMake(x, 0, d, d);
+            b.backgroundColor = max_colorFromHex(kMaxThemes[i].primary);
+            b.layer.cornerRadius = d / 2;
+            b.layer.borderWidth = (!max_hasCustomAccent() && max_activeThemeIndex() == i) ? 3 : 1;
+            b.layer.borderColor = (!max_hasCustomAccent() && max_activeThemeIndex() == i)
+                ? max_colorFromHex(kMaxThemes[i].secondary).CGColor
+                : [UIColor colorWithWhite:0 alpha:0.15].CGColor;
+            b.tag = (NSInteger)i;
+            [b addTarget:self action:@selector(presetTapped:)
+                forControlEvents:UIControlEventTouchUpInside];
+            [strip addSubview:b];
+            x += d + gap;
+        }
+        strip.frame = CGRectMake(16, 8, x - gap, d);
+        [cell.contentView addSubview:strip];
+    } else if (row == kAppRowReset) {
+        cell.textLabel.text = @"Скинути до Потужно";
+        cell.textLabel.textColor = max_potuzhnoBlue();
+    }
+    return cell;
+}
+
+- (void)accentToggleChanged:(UISwitch *)sw {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setBool:sw.on forKey:@"mod.accenton"];
+    [d synchronize];
+    maxlog(@"appearance: mod.accenton -> %@", sw.on ? @"ON" : @"OFF");
+    [self max_refreshBrandUI];
+}
+
+- (void)presetTapped:(UIButton *)b {
+    max_setActiveThemeIndex((NSUInteger)b.tag);   // also clears custom accent
+    maxlog(@"appearance: preset -> %ld (%s)", (long)b.tag, kMaxThemes[b.tag].name);
+    [self max_refreshBrandUI];
+    [self.tableView reloadData];
+}
+
+- (void)max_pickAccentColor {
+    if (@available(iOS 14.0, *)) {
+        UIColorPickerViewController *p = [UIColorPickerViewController new];
+        p.delegate = self;
+        p.selectedColor = max_potuzhnoBlue();
+        p.supportsAlpha = NO;
+        [self presentViewController:p animated:YES completion:nil];
+    }
+}
+
+- (void)colorPickerViewControllerDidSelectColor:(UIColorPickerViewController *)vc API_AVAILABLE(ios(14.0)) {
+    uint32_t hex = max_hexFromColor(vc.selectedColor);
+    max_setCustomAccentHex(hex);
+    maxlog(@"appearance: custom accent -> #%06X", hex);
+    [self max_refreshBrandUI];
+}
+
+- (void)colorPickerViewControllerDidFinish:(UIColorPickerViewController *)vc API_AVAILABLE(ios(14.0)) {
+    [self.tableView reloadData];
+}
+
+// Repaint the mod UI (header flag, nav tint) so the new accent shows at once.
+- (void)max_refreshBrandUI {
+    self.tableView.tableHeaderView = [self max_makeHeader];
+    [self max_layoutHeader];
+    if (@available(iOS 13.0, *))
+        self.navigationController.navigationBar.tintColor = max_potuzhnoBlue();
+    [self.tableView reloadData];
 }
 
 @end
@@ -4124,7 +4399,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.28 loading (robust for Business match - normalize whitespace/NBSP)...");
+    maxlog(@"v12.29 loading (Оформлення: accent color picker + presets + app-wide recolor)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4168,6 +4443,7 @@ static void maxmods_init(void) {
     max_installBrandStrings();
     max_installCallKitBrand();   // rename the CallKit active-call pill
     max_installAdBlocker();
+    max_installAccentRecolor();  // app-wide accent recolor via om_colorWithRGBHex: (v12.29)
 
     // 4) Feature pruning: stories / Digital ID / mini-apps / channels,
     //    plus junk rows on the settings screens.
@@ -4299,5 +4575,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.28 loaded OK (for Business match: whitespace-normalized) — log file: %@", max_logPath());
+    maxlog(@"v12.29 loaded OK (accent theme + om_colorWithRGBHex remap) — log file: %@", max_logPath());
 }
