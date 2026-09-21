@@ -1734,8 +1734,37 @@ static NSString *max_anyText(id v) {
             if (a.length) return a.string;
             return nil;
         }
+        // Some Swift form cells draw the title in a CATextLayer, not a UILabel.
+        if ([v isKindOfClass:objc_getClass("CATextLayer")]) {
+            id s = [(CALayer *)v valueForKey:@"string"];
+            if ([s isKindOfClass:[NSString class]] && ((NSString *)s).length) return s;
+            if ([s isKindOfClass:[NSAttributedString class]]) return [(NSAttributedString *)s string];
+        }
     } @catch (NSException *e) {}
     return nil;
+}
+
+// All human text a view carries: its own text, its accessibilityLabel (cells
+// set this to the row title for VoiceOver — the most reliable source), and any
+// CATextLayer strings in its layer tree.
+static void max_collectViewText(id v, NSMutableArray *out) {
+    @try {
+        NSString *t = max_anyText(v);
+        if (t.length) [out addObject:t];
+        if ([v isKindOfClass:[UIView class]]) {
+            NSString *ax = [(UIView *)v accessibilityLabel];
+            if (ax.length) [out addObject:ax];
+            CALayer *layer = [(UIView *)v layer];
+            NSMutableArray *lq = layer ? [NSMutableArray arrayWithObject:layer] : [NSMutableArray array];
+            int lb = 60;
+            while (lq.count && lb-- > 0) {
+                CALayer *l = lq.firstObject; [lq removeObjectAtIndex:0];
+                NSString *ls = max_anyText(l);
+                if (ls.length) [out addObject:ls];
+                @try { for (CALayer *sl in l.sublayers) if (sl) [lq addObject:sl]; } @catch (NSException *e) {}
+            }
+        }
+    } @catch (NSException *e) {}
 }
 
 static int g_settingsRowDumpBudget = 8;   // dump the tree for the first N screens
@@ -1748,8 +1777,7 @@ static NSString *max_cellAllText(UIView *cell) {
     int budget = 200;
     while (q.count && budget-- > 0) {
         UIView *v = q.firstObject; [q removeObjectAtIndex:0];
-        NSString *t = max_anyText(v);
-        if (t.length) [parts addObject:t];
+        max_collectViewText(v, parts);
         @try { for (UIView *sv in v.subviews) [q addObject:sv]; } @catch (NSException *e) {}
     }
     return parts.count ? [parts componentsJoinedByString:@" · "] : @"<no text>";
@@ -1857,11 +1885,14 @@ static BOOL max_cellIsHiddenRow(id cell) {
     // text) — collapse it by class.
     if ([cell isKindOfClass:NSClassFromString(@"OMFormKit.LogoFormCell")]) return YES;
     NSMutableArray *q = [NSMutableArray arrayWithObject:cell];
+    NSMutableArray *texts = [NSMutableArray array];
     int budget = 200;
     while (q.count && budget-- > 0) {
         UIView *v = q.firstObject; [q removeObjectAtIndex:0];
-        NSString *t = max_anyText(v);   // reads .text AND attributedText
-        if (t.length && max_rowTextIsHidden(t)) return YES;
+        [texts removeAllObjects];
+        max_collectViewText(v, texts);   // text + attributedText + a11yLabel + CATextLayer
+        for (NSString *t in texts)
+            if (t.length && max_rowTextIsHidden(t)) return YES;
         @try { for (UIView *sv in v.subviews) [q addObject:sv]; } @catch (NSException *e) {}
     }
     return NO;
@@ -4092,7 +4123,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.25 loading (collapse via attributedText + LogoFormCell Госуслуги)...");
+    maxlog(@"v12.26 loading (collapse via a11yLabel + CATextLayer text)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4267,5 +4298,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.25 loaded OK (collapse via attributedText + LogoFormCell Госуслуги) — log file: %@", max_logPath());
+    maxlog(@"v12.26 loaded OK (collapse via a11yLabel + CATextLayer text) — log file: %@", max_logPath());
 }
