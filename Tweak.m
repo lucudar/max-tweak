@@ -1331,6 +1331,93 @@ static void max_installCallKitBrand(void) {
     }
 }
 
+// ============================================================================
+// v12.32 DIAGNOSTIC: privacy "nobody" investigation
+//  (A) dump ObjC surface of the (Swift) privacy option builders + presence
+//  (B) log every outgoing server command via sendCommand:withData:retry:ack:
+//      so we can see EXACTLY what the phone-number privacy change sends.
+// This build only OBSERVES — no substitution yet. Read the log, then decide.
+// ============================================================================
+static IMP g_origSendCmd4 = NULL;   // sendCommand:withData:retry:ack:
+static IMP g_origSendCmd3 = NULL;   // sendCommand:withData:ack:
+static int g_netLogBudget = 4000;
+
+// Best-effort stringify of the command arg (NSString opcode) and data payload.
+static NSString *max_desc(id v) {
+    @try {
+        if (!v) return @"nil";
+        if ([v isKindOfClass:[NSString class]]) return v;
+        if ([v isKindOfClass:[NSData class]]) {
+            NSData *d = v;
+            NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+            if (s.length) return [NSString stringWithFormat:@"<data %lu: %@>",
+                                  (unsigned long)d.length, s.length > 400 ? [s substringToIndex:400] : s];
+            return [NSString stringWithFormat:@"<data %lu bytes>", (unsigned long)d.length];
+        }
+        if ([v isKindOfClass:[NSDictionary class]] || [v isKindOfClass:[NSArray class]])
+            return [v description];
+        return [NSString stringWithFormat:@"%@(%@)", NSStringFromClass([v class]), [v description]];
+    } @catch (NSException *e) { return @"<desc err>"; }
+}
+
+static id hook_sendCmd4(id self, SEL _cmd, id cmd, id data, BOOL retry, id ack) {
+    if (g_netLogBudget > 0) {
+        NSString *c = max_desc(cmd);
+        // Highlight privacy/settings/profile-related commands.
+        BOOL interesting = [c rangeOfString:@"priv" options:NSCaseInsensitiveSearch].location != NSNotFound
+            || [c rangeOfString:@"setting" options:NSCaseInsensitiveSearch].location != NSNotFound
+            || [c rangeOfString:@"profile" options:NSCaseInsensitiveSearch].location != NSNotFound
+            || [c rangeOfString:@"config" options:NSCaseInsensitiveSearch].location != NSNotFound
+            || [c rangeOfString:@"phone" options:NSCaseInsensitiveSearch].location != NSNotFound;
+        g_netLogBudget--;
+        maxlog(@"NET%@ cmd=%@ data=%@", interesting ? @"*" : @"", c, max_desc(data));
+    }
+    return ((id(*)(id,SEL,id,id,BOOL,id))g_origSendCmd4)(self, _cmd, cmd, data, retry, ack);
+}
+static id hook_sendCmd3(id self, SEL _cmd, id cmd, id data, id ack) {
+    if (g_netLogBudget > 0) {
+        g_netLogBudget--;
+        maxlog(@"NET3 cmd=%@ data=%@", max_desc(cmd), max_desc(data));
+    }
+    return ((id(*)(id,SEL,id,id,id))g_origSendCmd3)(self, _cmd, cmd, data, ack);
+}
+
+static void max_installPrivacyDiag(void) {
+    // (A) dump the Swift privacy builders' ObjC surface (may be empty if pure Swift)
+    const char *dumps[] = {
+        "_TtC10SettingsUI32PrivacyOptionSettingsSourceModel",
+        "OMPrivacyOptionSettingsFactory", "PrivacyOptionSettingsFactory",
+        "OMPrivacySettingsFactory", "PrivacySettingsFactory",
+        "OMPresenceService", "OMChatPresenter",
+    };
+    for (NSUInteger i = 0; i < sizeof(dumps)/sizeof(dumps[0]); i++)
+        max_dumpClass(dumps[i]);
+
+    // (B) hook the server command chokepoint on whichever messenger client
+    //     implements it (own method only, so we don't grab a super's).
+    const char *clients[] = {
+        "OKMMessengerClient", "OKMCoreMessengerClient", "OKMAppMessengerClient",
+    };
+    SEL s4 = NSSelectorFromString(@"sendCommand:withData:retry:ack:");
+    SEL s3 = NSSelectorFromString(@"sendCommand:withData:ack:");
+    for (NSUInteger i = 0; i < sizeof(clients)/sizeof(clients[0]); i++) {
+        Class c = objc_getClass(clients[i]);
+        if (!c) continue;
+        if (!g_origSendCmd4 && max_classHasOwnMethod(c, s4)) {
+            g_origSendCmd4 = swizzle(c, s4, (IMP)hook_sendCmd4);
+            maxlog(@"netdiag: hooked %s sendCommand:withData:retry:ack: %@",
+                   clients[i], g_origSendCmd4 ? @"OK" : @"MISS");
+        }
+        if (!g_origSendCmd3 && max_classHasOwnMethod(c, s3)) {
+            g_origSendCmd3 = swizzle(c, s3, (IMP)hook_sendCmd3);
+            maxlog(@"netdiag: hooked %s sendCommand:withData:ack: %@",
+                   clients[i], g_origSendCmd3 ? @"OK" : @"MISS");
+        }
+    }
+    if (!g_origSendCmd4 && !g_origSendCmd3)
+        maxlog(@"netdiag: sendCommand not found on known client classes");
+}
+
 static void max_installAdBlocker(void) {
     // direct class hooks — each of these exists in the app binary
     struct {
@@ -4182,7 +4269,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.31 loading (cut DigitalId/Госуслуги + Семейная защита + Уведомления rows; logs toggle)...");
+    maxlog(@"v12.32 loading (DIAG: privacy surface dump + server-command log for «Никто» research)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4226,6 +4313,7 @@ static void maxmods_init(void) {
     max_installBrandStrings();
     max_installCallKitBrand();   // rename the CallKit active-call pill
     max_installAdBlocker();
+    max_installPrivacyDiag();   // v12.32: dump privacy surface + log server commands
 
     // 4) Feature pruning: stories / Digital ID / mini-apps / channels,
     //    plus junk rows on the settings screens.
@@ -4365,5 +4453,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.31 loaded OK (DigitalId killed, family+notif rows hidden, mod.logs toggle) — log: %@", max_logPath());
+    maxlog(@"v12.32 loaded OK (privacy+net diagnostics active) — log: %@", max_logPath());
 }
