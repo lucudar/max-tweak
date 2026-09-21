@@ -1791,6 +1791,55 @@ static void max_installSettingsPruner(void) {
     maxlog(@"settings-prune: %@", orig_setSections ? @"installed" : @"swizzle failed");
 }
 
+// ---- Collapse the "Цифровой ID" row (v12.22) -------------------------------
+// Diagnosed (log 13): the row is a self-sizing OMFormKit.URLImageActionFormCell
+// inside a UICollectionView with UICollectionViewCompositionalLayout. Self-
+// sizing cells report their height via -preferredLayoutAttributesFittingAttributes:.
+// Swizzle it on that cell class: when the cell currently shows "Цифровой ID",
+// return height 0 (+ hide the cell) so the layout collapses the row and every
+// row below moves up — no empty gap. Checked every layout pass, so reuse-safe.
+static IMP g_origFormCellPreferred = NULL;
+
+static BOOL max_cellShowsDigitalId(id cell) {
+    NSMutableArray *q = [NSMutableArray arrayWithObject:cell];
+    int budget = 150;
+    while (q.count && budget-- > 0) {
+        UIView *v = q.firstObject; [q removeObjectAtIndex:0];
+        if ([v isKindOfClass:[UILabel class]]) {
+            NSString *t = [(UILabel *)v text];
+            if (t.length && ([t rangeOfString:@"Цифровой ID"].location != NSNotFound ||
+                             [t rangeOfString:@"Digital ID"].location != NSNotFound))
+                return YES;
+        }
+        @try { for (UIView *sv in v.subviews) [q addObject:sv]; } @catch (NSException *e) {}
+    }
+    return NO;
+}
+
+static id hook_formCellPreferred(id self, SEL _cmd, id attrs) {
+    id r = ((id(*)(id,SEL,id))g_origFormCellPreferred)(self, _cmd, attrs);
+    @try {
+        if (max_cellShowsDigitalId(self)) {
+            CGRect f = [(id)r frame];
+            f.size.height = 0;
+            [(id)r setFrame:f];
+            [(UIView *)self setHidden:YES];
+        } else if ([(UIView *)self isHidden]) {
+            [(UIView *)self setHidden:NO];   // reused for a normal row
+        }
+    } @catch (NSException *e) {}
+    return r;
+}
+
+static void max_installDigitalIdCollapse(void) {
+    Class cell = NSClassFromString(@"OMFormKit.URLImageActionFormCell");
+    if (!cell) { maxlog(@"digitalid-collapse: URLImageActionFormCell not found"); return; }
+    g_origFormCellPreferred = swizzle(cell,
+        @selector(preferredLayoutAttributesFittingAttributes:),
+        (IMP)hook_formCellPreferred);
+    maxlog(@"digitalid-collapse: %@", g_origFormCellPreferred ? @"installed" : @"swizzle failed");
+}
+
 // ============================================================================
 #if 0  // v11.0: view-level settings pruning + layout surgery REMOVED (user decision: cut features, not rows)
 #pragma mark - Settings junk: view-level pruning + title dump
@@ -3960,7 +4009,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.21 loading (settings-row DIAG for Цифровой ID, mod.typing, CallKit)...");
+    maxlog(@"v12.22 loading (collapse Цифровой ID row, mod.typing, CallKit)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4009,6 +4058,7 @@ static void maxmods_init(void) {
     //    plus junk rows on the settings screens.
     max_installFeaturePruner();
     max_installSettingsPruner();
+    max_installDigitalIdCollapse();   // collapse the «Цифровой ID» row (v12.22)
 
     // defaults FIRST — g_blockRead must match the stored switch before any
     // markAsRead call can race the constructor. Missing key => ON (privacy).
@@ -4134,5 +4184,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.21 loaded OK (settings-row DIAG + mod.typing + CallKit) — log file: %@", max_logPath());
+    maxlog(@"v12.22 loaded OK (collapse Цифровой ID row + mod.typing + CallKit) — log file: %@", max_logPath());
 }
