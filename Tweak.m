@@ -1736,8 +1736,12 @@ static void max_dumpSettingsRow(UIView *root) {
         UIView *v = queue.firstObject;
         [queue removeObjectAtIndex:0];
         NSString *t = max_anyText(v);
-        if (t.length && ([t rangeOfString:@"Цифровой ID"].location != NSNotFound ||
-                         [t rangeOfString:@"Digital ID"].location != NSNotFound)) {
+        if (t.length && (
+                [t rangeOfString:@"Цифровой ID"].location != NSNotFound ||
+                [t rangeOfString:@"Госуслуг" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                [t rangeOfString:@"for Business"].location != NSNotFound ||
+                [t rangeOfString:@"Invite Friends"].location != NSNotFound ||
+                [t rangeOfString:@"Вернуть уведомл"].location != NSNotFound)) {
             // climb to the hosting cell + scroll container
             UIView *cell = nil, *host = nil;
             for (UIView *c = v; c; c = c.superview) {
@@ -1756,7 +1760,7 @@ static void max_dumpSettingsRow(UIView *root) {
                    cell ? NSStringFromClass(cell.class) : @"<none>",
                    host ? NSStringFromClass(host.class) : @"<none>", layoutCls);
             g_settingsRowDumpBudget--;
-            return;
+            // keep walking — log every target row on this screen, not just one
         }
         for (UIView *sv in v.subviews) [queue addObject:sv];
     }
@@ -1791,35 +1795,62 @@ static void max_installSettingsPruner(void) {
     maxlog(@"settings-prune: %@", orig_setSections ? @"installed" : @"swizzle failed");
 }
 
-// ---- Collapse the "Цифровой ID" row (v12.22) -------------------------------
-// Diagnosed (log 13): the row is a self-sizing OMFormKit.URLImageActionFormCell
-// inside a UICollectionView with UICollectionViewCompositionalLayout. Self-
-// sizing cells report their height via -preferredLayoutAttributesFittingAttributes:.
-// Swizzle it on that cell class: when the cell currently shows "Цифровой ID",
-// return height 0 (+ hide the cell) so the layout collapses the row and every
-// row below moves up — no empty gap. Checked every layout pass, so reuse-safe.
-static IMP g_origFormCellPreferred = NULL;
+// ---- Collapse unwanted settings rows (v12.23) ------------------------------
+// Diagnosed (log 13): rows are self-sizing OMFormKit cells inside a
+// UICollectionView (UICollectionViewCompositionalLayout). Self-sizing cells
+// report height via -preferredLayoutAttributesFittingAttributes:. Swizzle it on
+// the OMFormKit cell classes: when a cell currently renders a blacklisted title
+// (Цифровой ID / Госуслуги / for Business / Invite Friends / Вернуть
+// уведомления), return height 0 and hide it — the layout collapses the row and
+// the rows below move up (no gap). Text-gated + checked every layout pass, so
+// non-target cells are untouched and cell reuse is handled.
+static NSMutableDictionary<NSString *, NSValue *> *g_formCellOrigs = nil; // clsName -> IMP
 
-static BOOL max_cellShowsDigitalId(id cell) {
+static BOOL max_rowTextIsHidden(NSString *t) {
+    if (t.length < 3) return NO;
+    static NSArray<NSString *> *bad = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        bad = @[
+            @"Цифровой ID", @"Digital ID",
+            @"Госуслуг", @"ГОСУСЛУГ", @"Gosuslugi",   // banner (styled caps)
+            @"for Business", @"для бизнеса",           // Потужно/MAX for Business
+            @"Invite Friends", @"Пригласить друзей",
+            @"Вернуть уведомл", @"Return notification",
+        ];
+    });
+    for (NSString *b in bad)
+        if ([t rangeOfString:b options:NSCaseInsensitiveSearch].location != NSNotFound)
+            return YES;
+    return NO;
+}
+
+static BOOL max_cellIsHiddenRow(id cell) {
     NSMutableArray *q = [NSMutableArray arrayWithObject:cell];
-    int budget = 150;
+    int budget = 200;
     while (q.count && budget-- > 0) {
         UIView *v = q.firstObject; [q removeObjectAtIndex:0];
-        if ([v isKindOfClass:[UILabel class]]) {
-            NSString *t = [(UILabel *)v text];
-            if (t.length && ([t rangeOfString:@"Цифровой ID"].location != NSNotFound ||
-                             [t rangeOfString:@"Digital ID"].location != NSNotFound))
-                return YES;
-        }
+        NSString *t = nil;
+        @try {
+            if ([v isKindOfClass:[UILabel class]]) t = [(UILabel *)v text];
+            else if ([v isKindOfClass:[UITextView class]]) t = [(UITextView *)v text];
+        } @catch (NSException *e) {}
+        if (t.length && max_rowTextIsHidden(t)) return YES;
         @try { for (UIView *sv in v.subviews) [q addObject:sv]; } @catch (NSException *e) {}
     }
     return NO;
 }
 
 static id hook_formCellPreferred(id self, SEL _cmd, id attrs) {
-    id r = ((id(*)(id,SEL,id))g_origFormCellPreferred)(self, _cmd, attrs);
+    // find the original IMP for this instance's class (walk up if inherited)
+    IMP orig = NULL;
+    for (Class c = object_getClass(self); c && !orig; c = class_getSuperclass(c)) {
+        NSValue *v = g_formCellOrigs[NSStringFromClass(c)];
+        if (v) orig = (IMP)[v pointerValue];
+    }
+    id r = orig ? ((id(*)(id,SEL,id))orig)(self, _cmd, attrs) : attrs;
     @try {
-        if (max_cellShowsDigitalId(self)) {
+        if (max_cellIsHiddenRow(self)) {
             CGRect f = [(id)r frame];
             f.size.height = 0;
             [(id)r setFrame:f];
@@ -1832,12 +1863,29 @@ static id hook_formCellPreferred(id self, SEL _cmd, id attrs) {
 }
 
 static void max_installDigitalIdCollapse(void) {
-    Class cell = NSClassFromString(@"OMFormKit.URLImageActionFormCell");
-    if (!cell) { maxlog(@"digitalid-collapse: URLImageActionFormCell not found"); return; }
-    g_origFormCellPreferred = swizzle(cell,
-        @selector(preferredLayoutAttributesFittingAttributes:),
-        (IMP)hook_formCellPreferred);
-    maxlog(@"digitalid-collapse: %@", g_origFormCellPreferred ? @"installed" : @"swizzle failed");
+    if (!g_formCellOrigs) g_formCellOrigs = [NSMutableDictionary dictionary];
+    // Every self-sizing OMFormKit cell class that could host a blacklisted row.
+    NSArray<NSString *> *names = @[
+        @"OMFormKit.URLImageActionFormCell",  // standard icon+title rows
+        @"OMFormKit.LogoFormCell",            // Госуслуги logo banner
+        @"OMFormKit.GenericFormCell",
+        @"OMFormKit.ButtonFormCell",
+        @"OMFormKit.BadgeButtonFormCell",
+        @"OMFormKit.DescriptionFormCell",
+    ];
+    int ok = 0;
+    for (NSString *n in names) {
+        Class cell = NSClassFromString(n);
+        if (!cell) { maxlog(@"rows-collapse: %@ not found", n); continue; }
+        IMP orig = swizzle(cell,
+            @selector(preferredLayoutAttributesFittingAttributes:),
+            (IMP)hook_formCellPreferred);
+        if (orig) {
+            g_formCellOrigs[n] = [NSValue valueWithPointer:orig];
+            ok++;
+        }
+    }
+    maxlog(@"rows-collapse: hooked %d OMFormKit cell class(es)", ok);
 }
 
 // ============================================================================
@@ -4009,7 +4057,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.22 loading (collapse Цифровой ID row, mod.typing, CallKit)...");
+    maxlog(@"v12.23 loading (collapse Госуслуги/Business/Invite/Вернуть+Цифровой ID rows)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4184,5 +4232,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.22 loaded OK (collapse Цифровой ID row + mod.typing + CallKit) — log file: %@", max_logPath());
+    maxlog(@"v12.23 loaded OK (collapse Госуслуги/Business/Invite/Вернуть+Цифровой ID rows) — log file: %@", max_logPath());
 }
