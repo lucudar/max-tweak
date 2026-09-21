@@ -1744,9 +1744,8 @@ static NSString *max_anyText(id v) {
     return nil;
 }
 
-// All human text a view carries: its own text, its accessibilityLabel (cells
-// set this to the row title for VoiceOver — the most reliable source), and any
-// CATextLayer strings in its layer tree.
+// Row title text: the view's own text/attributedText, plus its
+// accessibilityLabel (cells set it to the row title). Light — no layer walk.
 static void max_collectViewText(id v, NSMutableArray *out) {
     @try {
         NSString *t = max_anyText(v);
@@ -1754,15 +1753,6 @@ static void max_collectViewText(id v, NSMutableArray *out) {
         if ([v isKindOfClass:[UIView class]]) {
             NSString *ax = [(UIView *)v accessibilityLabel];
             if (ax.length) [out addObject:ax];
-            CALayer *layer = [(UIView *)v layer];
-            NSMutableArray *lq = layer ? [NSMutableArray arrayWithObject:layer] : [NSMutableArray array];
-            int lb = 60;
-            while (lq.count && lb-- > 0) {
-                CALayer *l = lq.firstObject; [lq removeObjectAtIndex:0];
-                NSString *ls = max_anyText(l);
-                if (ls.length) [out addObject:ls];
-                @try { for (CALayer *sl in l.sublayers) if (sl) [lq addObject:sl]; } @catch (NSException *e) {}
-            }
         }
     } @catch (NSException *e) {}
 }
@@ -1930,46 +1920,26 @@ static id hook_formCellPreferred(id self, SEL _cmd, id attrs) {
 
 static void max_installDigitalIdCollapse(void) {
     if (!g_formCellOrigs) g_formCellOrigs = [NSMutableDictionary dictionary];
-    // Dynamically enumerate EVERY loaded class whose name marks it as a
-    // self-sizing settings cell — any *FormCell (OMFormKit) plus SettingsUI /
-    // OMUIKit banner-carousel cells — and swizzle
-    // -preferredLayoutAttributesFittingAttributes: on each that implements it
-    // (directly or inherited). A fixed name list missed the "for Business"
-    // banner, which uses a cell class we hadn't listed. This catches all of
-    // them without guessing names.
-    unsigned int n = 0;
-    Class *all = objc_copyClassList(&n);
+    // Explicit, safe list — only the self-sizing OMFormKit cell classes the
+    // settings rows actually use (confirmed by the ROWDUMP logs). A global
+    // class sweep (v12.26) hooked far too many cells and broke the settings
+    // screen; this is the known-good set.
+    NSArray<NSString *> *names = @[
+        @"OMFormKit.URLImageActionFormCell",  // Цифровой ID / Вернуть уведомления
+        @"OMFormKit.GenericFormCell",         // Invite Friends / for Business (attributed title)
+        @"OMFormKit.LogoFormCell",            // Госуслуги banner (no text — matched by class)
+    ];
     SEL sel = @selector(preferredLayoutAttributesFittingAttributes:);
-    int ok = 0, seen = 0;
-    for (unsigned int i = 0; i < n; i++) {
-        Class c = all[i];
-        const char *cn = class_getName(c);
-        if (!cn) continue;
-        NSString *name = [NSString stringWithUTF8String:cn];
-        BOOL isFormCell   = ([name rangeOfString:@"FormCell"].location != NSNotFound);
-        BOOL isBannerCell = ([name rangeOfString:@"Banner"].location != NSNotFound &&
-                             [name rangeOfString:@"Cell"].location   != NSNotFound);
-        BOOL isSettingsCell = ([name rangeOfString:@"SettingsUI"].location != NSNotFound &&
-                               [name rangeOfString:@"Cell"].location       != NSNotFound);
-        if (!isFormCell && !isBannerCell && !isSettingsCell) continue;
-        @try {
-            // must be a UIView subclass that actually responds to the layout selector
-            if (class_isMetaClass(c)) continue;
-            if (!class_respondsToSelector(object_getClass(c), @selector(isSubclassOfClass:))) continue;
-            if (![c isSubclassOfClass:[UIView class]]) continue;
-            if (!class_getInstanceMethod(c, sel)) continue;
-            seen++;
-            if (g_formCellOrigs[name]) continue;   // already hooked
-            IMP orig = swizzle(c, sel, (IMP)hook_formCellPreferred);
-            if (orig) {
-                g_formCellOrigs[name] = [NSValue valueWithPointer:orig];
-                ok++;
-                maxlog(@"rows-collapse: hooked %@", name);
-            }
-        } @catch (NSException *e) {}
+    int ok = 0;
+    for (NSString *name in names) {
+        Class c = NSClassFromString(name);
+        if (!c) { maxlog(@"rows-collapse: %@ not found", name); continue; }
+        if (!class_getInstanceMethod(c, sel)) { maxlog(@"rows-collapse: %@ no layout sel", name); continue; }
+        if (g_formCellOrigs[name]) continue;
+        IMP orig = swizzle(c, sel, (IMP)hook_formCellPreferred);
+        if (orig) { g_formCellOrigs[name] = [NSValue valueWithPointer:orig]; ok++; }
     }
-    free(all);
-    maxlog(@"rows-collapse: hooked %d/%d settings cell class(es)", ok, seen);
+    maxlog(@"rows-collapse: hooked %d OMFormKit cell class(es)", ok);
 }
 
 // ============================================================================
@@ -4141,7 +4111,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.26 loading (collapse via a11yLabel + CATextLayer text)...");
+    maxlog(@"v12.27 loading (revert global sweep - explicit cell list, fixes Settings)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4316,5 +4286,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.26 loaded OK (collapse via a11yLabel + CATextLayer text) — log file: %@", max_logPath());
+    maxlog(@"v12.27 loaded OK (explicit cell list - Settings works, rows still collapse) — log file: %@", max_logPath());
 }
