@@ -660,7 +660,7 @@ static UIColor *max_potuzhnoYellow(void) {
                     ? [UIColor colorWithWhite:1 alpha:0.10]
                     : [UIColor colorWithWhite:0 alpha:0.06];
             }];
-        _highlightView.layer.cornerRadius = 10;
+        _highlightView.layer.cornerRadius = 12;
         _highlightView.hidden = YES;
         [self addSubview:_highlightView];
 
@@ -730,7 +730,7 @@ static MAXMenuOverlay *g_overlay = nil;
 
 @implementation MAXMenuOverlay {
     UIControl *_background;        // tap-outside to dismiss
-    UIImageView *_snapshotView;    // Telegram-style "lifted" message
+    UIView *_snapshotView;         // Telegram-style "lifted" message (wrapper: shadow + rounded image)
     UIView *_panel;                // shadow wrapper around the blur card
     BOOL _itemFired;
 }
@@ -836,15 +836,28 @@ static MAXMenuOverlay *g_overlay = nil;
         snapshot = nil;
     }
     if (snapshot) {
-        UIImageView *snapView = [[UIImageView alloc] initWithFrame:cellFrame];
+        // v12.33: prettier lifted bubble — rounded corners with a soft shadow.
+        // masksToBounds clips a layer's own shadow, so split it: an outer
+        // container carries the shadow (no clip), the inner image view clips to
+        // rounded corners.
+        UIView *snapWrap = [[UIView alloc] initWithFrame:cellFrame];
+        snapWrap.userInteractionEnabled = NO;
+        snapWrap.layer.shadowColor = [UIColor blackColor].CGColor;
+        snapWrap.layer.shadowOpacity = 0.28;
+        snapWrap.layer.shadowRadius = 18;
+        snapWrap.layer.shadowOffset = CGSizeMake(0, 6);
+
+        UIImageView *snapView = [[UIImageView alloc] initWithFrame:snapWrap.bounds];
         snapView.image = snapshot;
         snapView.userInteractionEnabled = NO;
-        snapView.layer.shadowColor = [UIColor blackColor].CGColor;
-        snapView.layer.shadowOpacity = 0.30;
-        snapView.layer.shadowRadius = 16;
-        snapView.layer.shadowOffset = CGSizeZero;
-        [ov addSubview:snapView];
-        ov->_snapshotView = snapView;
+        snapView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        snapView.layer.cornerRadius = 20;
+        snapView.layer.cornerCurve = kCACornerCurveContinuous;
+        snapView.layer.masksToBounds = YES;
+        [snapWrap addSubview:snapView];
+
+        [ov addSubview:snapWrap];
+        ov->_snapshotView = snapWrap;   // animations transform the wrapper
     }
 
     // Card: shadow wrapper + material blur. Solid fill previously looked
@@ -852,7 +865,8 @@ static MAXMenuOverlay *g_overlay = nil;
     // replacement chrome for MAX's system menu.
     BOOL dark = window.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark;
     UIView *panel = [[UIView alloc] initWithFrame:CGRectZero];
-    panel.layer.cornerRadius = 16;
+    panel.layer.cornerRadius = 20;
+    panel.layer.cornerCurve = kCACornerCurveContinuous;
     panel.layer.shadowColor = max_potuzhnoBlue().CGColor;
     panel.layer.shadowOpacity = dark ? 0.45 : 0.22;
     panel.layer.shadowRadius = 18;
@@ -866,7 +880,7 @@ static MAXMenuOverlay *g_overlay = nil;
     UIVisualEffectView *blur =
         [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:style]];
     blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    blur.layer.cornerRadius = 16;
+    blur.layer.cornerRadius = 20;
     blur.layer.cornerCurve = kCACornerCurveContinuous;
     blur.layer.masksToBounds = YES;
     blur.layer.borderWidth = 0.5;
@@ -1329,109 +1343,6 @@ static void max_installCallKitBrand(void) {
     } else {
         maxlog(@"callkit: CXCallUpdate setLocalizedCallerName: not hookable");
     }
-}
-
-// ============================================================================
-// v12.32 DIAGNOSTIC: privacy "nobody" investigation
-//  (A) dump ObjC surface of the (Swift) privacy option builders + presence
-//  (B) log every outgoing server command via sendCommand:withData:retry:ack:
-//      so we can see EXACTLY what the phone-number privacy change sends.
-// This build only OBSERVES — no substitution yet. Read the log, then decide.
-// ============================================================================
-static IMP g_origSendCmd4 = NULL;   // sendCommand:withData:retry:ack:
-static IMP g_origSendCmd3 = NULL;   // sendCommand:withData:ack:
-static int g_netLogBudget = 4000;
-
-// Best-effort stringify of the command arg (NSString opcode) and data payload.
-static NSString *max_cmdDesc(id v) {
-    @try {
-        if (!v) return @"nil";
-        if ([v isKindOfClass:[NSString class]]) return v;
-        if ([v isKindOfClass:[NSData class]]) {
-            NSData *d = v;
-            NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-            if (s.length) return [NSString stringWithFormat:@"<data %lu: %@>",
-                                  (unsigned long)d.length, s.length > 400 ? [s substringToIndex:400] : s];
-            return [NSString stringWithFormat:@"<data %lu bytes>", (unsigned long)d.length];
-        }
-        if ([v isKindOfClass:[NSDictionary class]] || [v isKindOfClass:[NSArray class]])
-            return [v description];
-        return [NSString stringWithFormat:@"%@(%@)", NSStringFromClass([v class]), [v description]];
-    } @catch (NSException *e) { return @"<desc err>"; }
-}
-
-static id hook_sendCmd4(id self, SEL _cmd, id cmd, id data, BOOL retry, id ack) {
-    if (g_netLogBudget > 0) {
-        NSString *c = max_cmdDesc(cmd);
-        // Highlight privacy/settings/profile-related commands.
-        BOOL interesting = [c rangeOfString:@"priv" options:NSCaseInsensitiveSearch].location != NSNotFound
-            || [c rangeOfString:@"setting" options:NSCaseInsensitiveSearch].location != NSNotFound
-            || [c rangeOfString:@"profile" options:NSCaseInsensitiveSearch].location != NSNotFound
-            || [c rangeOfString:@"config" options:NSCaseInsensitiveSearch].location != NSNotFound
-            || [c rangeOfString:@"phone" options:NSCaseInsensitiveSearch].location != NSNotFound;
-        g_netLogBudget--;
-        maxlog(@"NET%@ cmd=%@ data=%@", interesting ? @"*" : @"", c, max_cmdDesc(data));
-    }
-    return ((id(*)(id,SEL,id,id,BOOL,id))g_origSendCmd4)(self, _cmd, cmd, data, retry, ack);
-}
-static id hook_sendCmd3(id self, SEL _cmd, id cmd, id data, id ack) {
-    if (g_netLogBudget > 0) {
-        g_netLogBudget--;
-        maxlog(@"NET3 cmd=%@ data=%@", max_cmdDesc(cmd), max_cmdDesc(data));
-    }
-    return ((id(*)(id,SEL,id,id,id))g_origSendCmd3)(self, _cmd, cmd, data, ack);
-}
-
-static void max_installPrivacyDiag(void) {
-    // (A) dump the Swift privacy builders' ObjC surface (may be empty if pure Swift)
-    const char *dumps[] = {
-        "_TtC10SettingsUI32PrivacyOptionSettingsSourceModel",
-        "OMPrivacyOptionSettingsFactory", "PrivacyOptionSettingsFactory",
-        "OMPrivacySettingsFactory", "PrivacySettingsFactory",
-        "OMPresenceService", "OMChatPresenter",
-    };
-    for (NSUInteger i = 0; i < sizeof(dumps)/sizeof(dumps[0]); i++)
-        max_dumpClass(dumps[i]);
-
-    // (B) the send chokepoint isn't on the obvious client classes, so SCAN
-    //     every registered class for a class that implements it as its OWN
-    //     method, log the class name, and hook it. (v12.32.1)
-    SEL s4 = NSSelectorFromString(@"sendCommand:withData:retry:ack:");
-    SEL s3 = NSSelectorFromString(@"sendCommand:withData:ack:");
-    unsigned int n = 0;
-    Class *all = objc_copyClassList(&n);
-    int found4 = 0, found3 = 0;
-    for (unsigned int i = 0; i < n; i++) {
-        Class c = all[i];
-        @try {
-            // Log EVERY implementer so we see the class name; hook only the
-            // first of each (single orig-IMP global stays correct).
-            if (max_classHasOwnMethod(c, s4)) {
-                const char *nm = class_getName(c);
-                found4++;
-                if (!g_origSendCmd4) {
-                    g_origSendCmd4 = swizzle(c, s4, (IMP)hook_sendCmd4);
-                    maxlog(@"netdiag: FOUND+hooked %s sendCommand:withData:retry:ack:", nm);
-                } else {
-                    maxlog(@"netdiag: also-implements(retry) %s (not hooked)", nm);
-                }
-            }
-            if (max_classHasOwnMethod(c, s3)) {
-                const char *nm = class_getName(c);
-                found3++;
-                if (!g_origSendCmd3) {
-                    g_origSendCmd3 = swizzle(c, s3, (IMP)hook_sendCmd3);
-                    maxlog(@"netdiag: FOUND+hooked %s sendCommand:withData:ack:", nm);
-                } else {
-                    maxlog(@"netdiag: also-implements(3) %s (not hooked)", nm);
-                }
-            }
-        } @catch (NSException *e) {}
-    }
-    if (all) free(all);
-    maxlog(@"netdiag: scan done — retry-impls=%d, 3arg-impls=%d", found4, found3);
-    if (!found4 && !found3)
-        maxlog(@"netdiag: NO class implements sendCommand — send path is deeper/Swift");
 }
 
 static void max_installAdBlocker(void) {
@@ -3728,14 +3639,15 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"Моды";
-    self.tableView.tableHeaderView = [self max_makeHeader];
+    // v12.33: Потужно flag banner removed — cleaner list, title stays in navbar.
+    self.tableView.tableHeaderView = nil;
     if (@available(iOS 13.0, *))
         self.navigationController.navigationBar.tintColor = max_potuzhnoBlue();
 }
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    [self max_layoutHeader];
+    // header removed (v12.33) — nothing to lay out
 }
 
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
@@ -4285,7 +4197,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.32 loading (DIAG: privacy surface dump + server-command log for «Никто» research)...");
+    maxlog(@"v12.33 loading (remove Потужно banner in Моды; rounder message menu)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4329,7 +4241,6 @@ static void maxmods_init(void) {
     max_installBrandStrings();
     max_installCallKitBrand();   // rename the CallKit active-call pill
     max_installAdBlocker();
-    max_installPrivacyDiag();   // v12.32: dump privacy surface + log server commands
 
     // 4) Feature pruning: stories / Digital ID / mini-apps / channels,
     //    plus junk rows on the settings screens.
@@ -4469,5 +4380,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.32.1 loaded OK (netdiag: full class scan for sendCommand) — log: %@", max_logPath());
+    maxlog(@"v12.33 loaded OK (banner removed, menu rounded) — log: %@", max_logPath());
 }
