@@ -1343,7 +1343,7 @@ static IMP g_origSendCmd3 = NULL;   // sendCommand:withData:ack:
 static int g_netLogBudget = 4000;
 
 // Best-effort stringify of the command arg (NSString opcode) and data payload.
-static NSString *max_desc(id v) {
+static NSString *max_cmdDesc(id v) {
     @try {
         if (!v) return @"nil";
         if ([v isKindOfClass:[NSString class]]) return v;
@@ -1362,7 +1362,7 @@ static NSString *max_desc(id v) {
 
 static id hook_sendCmd4(id self, SEL _cmd, id cmd, id data, BOOL retry, id ack) {
     if (g_netLogBudget > 0) {
-        NSString *c = max_desc(cmd);
+        NSString *c = max_cmdDesc(cmd);
         // Highlight privacy/settings/profile-related commands.
         BOOL interesting = [c rangeOfString:@"priv" options:NSCaseInsensitiveSearch].location != NSNotFound
             || [c rangeOfString:@"setting" options:NSCaseInsensitiveSearch].location != NSNotFound
@@ -1370,14 +1370,14 @@ static id hook_sendCmd4(id self, SEL _cmd, id cmd, id data, BOOL retry, id ack) 
             || [c rangeOfString:@"config" options:NSCaseInsensitiveSearch].location != NSNotFound
             || [c rangeOfString:@"phone" options:NSCaseInsensitiveSearch].location != NSNotFound;
         g_netLogBudget--;
-        maxlog(@"NET%@ cmd=%@ data=%@", interesting ? @"*" : @"", c, max_desc(data));
+        maxlog(@"NET%@ cmd=%@ data=%@", interesting ? @"*" : @"", c, max_cmdDesc(data));
     }
     return ((id(*)(id,SEL,id,id,BOOL,id))g_origSendCmd4)(self, _cmd, cmd, data, retry, ack);
 }
 static id hook_sendCmd3(id self, SEL _cmd, id cmd, id data, id ack) {
     if (g_netLogBudget > 0) {
         g_netLogBudget--;
-        maxlog(@"NET3 cmd=%@ data=%@", max_desc(cmd), max_desc(data));
+        maxlog(@"NET3 cmd=%@ data=%@", max_cmdDesc(cmd), max_cmdDesc(data));
     }
     return ((id(*)(id,SEL,id,id,id))g_origSendCmd3)(self, _cmd, cmd, data, ack);
 }
