@@ -147,7 +147,12 @@ static dispatch_queue_t max_logQueue(void) {
 // Every line is written with open/write/fsync immediately on the caller thread,
 // so a SIGSEGV right after the line still leaves it on disk. The serial queue
 // is kept only for truncation — the data path no longer depends on it.
+// v12.31: file logging can be switched off from the Моды screen (mod.logs).
+// Default ON. Gated here so the whole app honors it with zero call-site churn.
+static BOOL g_logsEnabled = YES;
+
 static void maxlog(NSString *fmt, ...) {
+    if (!g_logsEnabled) return;
     va_list args;
     va_start(args, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
@@ -1575,6 +1580,14 @@ static void max_installFeaturePruner(void) {
         { "_TtC8OMCamera15OMCameraFactory",
           "makeQRCodeScannerCameraWithDescriptionMessage:isTorchEnabled:screenStatsType:screenStatsEventSource:scannerType:delegate:requestPermissionInSettingsAction:openGalleryAction:detectedValueHandler:",
           (IMP)max_hookIdRetNil },
+        // v12.31: cut Госуслуги / Цифровой ID entirely. It's a standalone
+        // web-app tab (goskey.gosuslugi.ru via a bot) — NOT part of login
+        // (phone+SMS / 2FA are separate). Kill the native entry points so the
+        // tab never opens and no web container is built; verification bridge
+        // (handleVerifyMobileID) is unreachable without the tab.
+        { "OKMRouter", "_openDigitalIdTabWithReload:cancelSignal:completion:", (IMP)max_hookVoid3 },
+        { "OKMRouter", "_digitalIdWebAppContainerController", (IMP)max_hookIdRetNil },
+        { "OKMRouter", "_showDigitalidTooltipIfNeeded:", (IMP)max_hookVoid1 },
     };
     for (NSUInteger i = 0; i < sizeof(hooks)/sizeof(hooks[0]); i++) {
         Class cls = objc_getClass(hooks[i].cls);
@@ -1863,6 +1876,7 @@ static BOOL max_rowTextIsHidden(NSString *t) {
             @"Business", @"бизнес",                    // robust: bare token (NBSP/lang variants)
             @"Invite Friends", @"Пригласить друзей",
             @"Вернуть уведомл", @"Return notification",
+            @"Семейная защита", @"Family Control", @"Family Protection", // v12.31
         ];
     });
     // Normalize: collapse every whitespace run (incl. NBSP   / narrow NBSP
@@ -1879,6 +1893,18 @@ static BOOL max_rowTextIsHidden(NSString *t) {
     } @catch (NSException *e) {}
     for (NSString *b in bad)
         if ([norm rangeOfString:b options:NSCaseInsensitiveSearch].location != NSNotFound)
+            return YES;
+    // Exact-title matches (v12.31): substrings too common to blacklist loosely.
+    // "Уведомления" is the Settings row that opens the (non-working, cert-gated)
+    // notifications screen; match only the standalone title so we don't catch
+    // "Отключить уведомления" etc. inside chats.
+    static NSArray<NSString *> *exact = nil;
+    static dispatch_once_t eonce;
+    dispatch_once(&eonce, ^{ exact = @[ @"Уведомления", @"Notifications" ]; });
+    NSString *trimmed = [norm stringByTrimmingCharactersInSet:
+        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    for (NSString *e in exact)
+        if ([trimmed caseInsensitiveCompare:e] == NSOrderedSame)
             return YES;
     return NO;
 }
@@ -3632,13 +3658,34 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
     if (s == 0) return (NSInteger)kModCount;   // mods
-    return 3;                                   // log actions
+    return 4;                                   // row 0 = logs toggle, 1..3 = actions
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv
          cellForRowAtIndexPath:(NSIndexPath *)ip {
     if (ip.section == 1) {
-        // log actions: view / share / clear
+        // row 0: master "write logs" switch (v12.31)
+        if (ip.row == 0) {
+            static NSString *kLogTgl = @"maxlogtoggle";
+            UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:kLogTgl];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
+                                        reuseIdentifier:kLogTgl];
+                cell.selectionStyle = UITableViewCellSelectionStyleNone;
+                UISwitch *sw = [UISwitch new];
+                sw.onTintColor = max_potuzhnoBlue();
+                [sw addTarget:self action:@selector(logsToggleChanged:)
+                     forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = sw;
+            }
+            cell.textLabel.text = @"Запись логов";
+            cell.detailTextLabel.text = @"Выкл = ничего не пишется в файл лога";
+            cell.detailTextLabel.numberOfLines = 0;
+            cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+            [(UISwitch *)cell.accessoryView setOn:g_logsEnabled];
+            return cell;
+        }
+        // log actions: view / share / clear (rows 1..3)
         static NSString *kLogCell = @"maxlogcell";
         UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:kLogCell];
         if (!cell) {
@@ -3646,11 +3693,12 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
                                     reuseIdentifier:kLogCell];
             cell.selectionStyle = UITableViewCellSelectionStyleDefault;
         }
+        NSInteger a = ip.row - 1;
         NSArray *titles = @[ @"Посмотреть логи", @"Отправить логи", @"Очистить логи" ];
         NSArray *icons = @[ @"doc.text", @"square.and.arrow.up", @"trash" ];
-        cell.textLabel.text = titles[ip.row];
-        cell.imageView.image = [UIImage systemImageNamed:icons[ip.row]];
-        cell.imageView.tintColor = (ip.row == 2)
+        cell.textLabel.text = titles[a];
+        cell.imageView.image = [UIImage systemImageNamed:icons[a]];
+        cell.imageView.tintColor = (a == 2)
             ? [UIColor systemRedColor] : max_potuzhnoBlue();
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         return cell;
@@ -3691,10 +3739,12 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
 }
 
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
-    if (ip.section != 1) return;   // only the log-actions section is tappable
+    if (ip.section != 1) return;   // only the log section is tappable
     [tv deselectRowAtIndexPath:ip animated:YES];
+    if (ip.row == 0) return;       // row 0 is the toggle (switch handles it)
+    NSInteger act = ip.row - 1;    // 0=view 1=share 2=clear
 
-    if (ip.row == 0) {
+    if (act == 0) {
         // viewer: last 800 lines of the log in a read-only text screen
         UITextView *tv2 = [[UITextView alloc] initWithFrame:CGRectZero];
         tv2.editable = NO;
@@ -3718,13 +3768,13 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
                                | UIViewAutoresizingFlexibleHeight;
         [vc.view addSubview:tv2];
         [self.navigationController pushViewController:vc animated:YES];
-    } else if (ip.row == 1) {
+    } else if (act == 1) {
         // share sheet with the log file
         NSURL *url = [NSURL fileURLWithPath:max_logPath()];
         UIActivityViewController *av = [[UIActivityViewController alloc]
             initWithActivityItems:@[url] applicationActivities:nil];
         [self presentViewController:av animated:YES completion:nil];
-    } else if (ip.row == 2) {
+    } else if (act == 2) {
         // truncate in place (atomically:NO): an atomic write swaps
         // the inode and detaches the cached crash fd
         [@"" writeToFile:max_logPath() atomically:NO
@@ -3751,6 +3801,16 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
     }
     maxlog(@"mods: %@ -> %@ (blockRead=%d)", e.key,
            sw.on ? @"ON" : @"OFF", (int)g_blockRead);
+}
+
+- (void)logsToggleChanged:(UISwitch *)sw {
+    g_logsEnabled = sw.on;
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setBool:sw.on forKey:@"mod.logs"];
+    [d synchronize];
+    // Log the change only when turning ON (so the OFF state stays truly silent).
+    if (sw.on) maxlog(@"logs: enabled by user");
+    else NSLog(@"[MAXMods] logs: disabled by user");
 }
 
 @end
@@ -4122,7 +4182,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.30 loading (remove «Видеть удалённые» mod.del; tracker audit — MyTracker already fully blocked)...");
+    maxlog(@"v12.31 loading (cut DigitalId/Госуслуги + Семейная защита + Уведомления rows; logs toggle)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4194,8 +4254,13 @@ static void maxmods_init(void) {
             g_blockRead = [d boolForKey:@"mod.read"];
         else
             g_blockRead = YES;
+        // mod.logs: file logging toggle (v12.31). Default ON (missing key).
+        if ([d objectForKey:@"mod.logs"] != nil)
+            g_logsEnabled = [d boolForKey:@"mod.logs"];
+        else
+            g_logsEnabled = YES;
         [d synchronize];
-        maxlog(@"mods: restored mod.read=%d", (int)g_blockRead);
+        maxlog(@"mods: restored mod.read=%d logs=%d", (int)g_blockRead, (int)g_logsEnabled);
     }
 
     // 5) Ghost hooks — v12.3: dedicated orig IMPs so OFF actually sends.
@@ -4300,5 +4365,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.30 loaded OK (mod.del removed, trackers verified blocked) — log file: %@", max_logPath());
+    maxlog(@"v12.31 loaded OK (DigitalId killed, family+notif rows hidden, mod.logs toggle) — log: %@", max_logPath());
 }
