@@ -969,7 +969,7 @@ static MAXMenuOverlay *g_overlay = nil;
            (unsigned long)actions.count, [titles componentsJoinedByString:@", "]);
 
     // entrance animation
-    UIImageView *snapView = ov->_snapshotView;
+    UIView *snapView = ov->_snapshotView;
     panel.transform = CGAffineTransformMakeScale(0.96, 0.96);
     panel.alpha = 0;
     if (snapView) {
