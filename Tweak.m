@@ -1393,29 +1393,45 @@ static void max_installPrivacyDiag(void) {
     for (NSUInteger i = 0; i < sizeof(dumps)/sizeof(dumps[0]); i++)
         max_dumpClass(dumps[i]);
 
-    // (B) hook the server command chokepoint on whichever messenger client
-    //     implements it (own method only, so we don't grab a super's).
-    const char *clients[] = {
-        "OKMMessengerClient", "OKMCoreMessengerClient", "OKMAppMessengerClient",
-    };
+    // (B) the send chokepoint isn't on the obvious client classes, so SCAN
+    //     every registered class for a class that implements it as its OWN
+    //     method, log the class name, and hook it. (v12.32.1)
     SEL s4 = NSSelectorFromString(@"sendCommand:withData:retry:ack:");
     SEL s3 = NSSelectorFromString(@"sendCommand:withData:ack:");
-    for (NSUInteger i = 0; i < sizeof(clients)/sizeof(clients[0]); i++) {
-        Class c = objc_getClass(clients[i]);
-        if (!c) continue;
-        if (!g_origSendCmd4 && max_classHasOwnMethod(c, s4)) {
-            g_origSendCmd4 = swizzle(c, s4, (IMP)hook_sendCmd4);
-            maxlog(@"netdiag: hooked %s sendCommand:withData:retry:ack: %@",
-                   clients[i], g_origSendCmd4 ? @"OK" : @"MISS");
-        }
-        if (!g_origSendCmd3 && max_classHasOwnMethod(c, s3)) {
-            g_origSendCmd3 = swizzle(c, s3, (IMP)hook_sendCmd3);
-            maxlog(@"netdiag: hooked %s sendCommand:withData:ack: %@",
-                   clients[i], g_origSendCmd3 ? @"OK" : @"MISS");
-        }
+    unsigned int n = 0;
+    Class *all = objc_copyClassList(&n);
+    int found4 = 0, found3 = 0;
+    for (unsigned int i = 0; i < n; i++) {
+        Class c = all[i];
+        @try {
+            // Log EVERY implementer so we see the class name; hook only the
+            // first of each (single orig-IMP global stays correct).
+            if (max_classHasOwnMethod(c, s4)) {
+                const char *nm = class_getName(c);
+                found4++;
+                if (!g_origSendCmd4) {
+                    g_origSendCmd4 = swizzle(c, s4, (IMP)hook_sendCmd4);
+                    maxlog(@"netdiag: FOUND+hooked %s sendCommand:withData:retry:ack:", nm);
+                } else {
+                    maxlog(@"netdiag: also-implements(retry) %s (not hooked)", nm);
+                }
+            }
+            if (max_classHasOwnMethod(c, s3)) {
+                const char *nm = class_getName(c);
+                found3++;
+                if (!g_origSendCmd3) {
+                    g_origSendCmd3 = swizzle(c, s3, (IMP)hook_sendCmd3);
+                    maxlog(@"netdiag: FOUND+hooked %s sendCommand:withData:ack:", nm);
+                } else {
+                    maxlog(@"netdiag: also-implements(3) %s (not hooked)", nm);
+                }
+            }
+        } @catch (NSException *e) {}
     }
-    if (!g_origSendCmd4 && !g_origSendCmd3)
-        maxlog(@"netdiag: sendCommand not found on known client classes");
+    if (all) free(all);
+    maxlog(@"netdiag: scan done — retry-impls=%d, 3arg-impls=%d", found4, found3);
+    if (!found4 && !found3)
+        maxlog(@"netdiag: NO class implements sendCommand — send path is deeper/Swift");
 }
 
 static void max_installAdBlocker(void) {
@@ -4453,5 +4469,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.32 loaded OK (privacy+net diagnostics active) — log: %@", max_logPath());
+    maxlog(@"v12.32.1 loaded OK (netdiag: full class scan for sendCommand) — log: %@", max_logPath());
 }
