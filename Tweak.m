@@ -1720,8 +1720,20 @@ static void hook_setSections(id self, SEL _cmd, NSArray *sections) {
 // when a screen containing the target label appears.
 static NSString *max_anyText(id v) {
     @try {
-        if ([v isKindOfClass:[UILabel class]]) return [(UILabel *)v text];
-        if ([v isKindOfClass:[UITextView class]]) return [(UITextView *)v text];
+        if ([v isKindOfClass:[UILabel class]]) {
+            NSString *t = [(UILabel *)v text];
+            if (t.length) return t;
+            NSAttributedString *a = [(UILabel *)v attributedText];   // Swift cells often use this
+            if (a.length) return a.string;
+            return nil;
+        }
+        if ([v isKindOfClass:[UITextView class]]) {
+            NSString *t = [(UITextView *)v text];
+            if (t.length) return t;
+            NSAttributedString *a = [(UITextView *)v attributedText];
+            if (a.length) return a.string;
+            return nil;
+        }
     } @catch (NSException *e) {}
     return nil;
 }
@@ -1841,15 +1853,14 @@ static BOOL max_rowTextIsHidden(NSString *t) {
 }
 
 static BOOL max_cellIsHiddenRow(id cell) {
+    // LogoFormCell is the Госуслуги promo banner (a logo image, no readable
+    // text) — collapse it by class.
+    if ([cell isKindOfClass:NSClassFromString(@"OMFormKit.LogoFormCell")]) return YES;
     NSMutableArray *q = [NSMutableArray arrayWithObject:cell];
     int budget = 200;
     while (q.count && budget-- > 0) {
         UIView *v = q.firstObject; [q removeObjectAtIndex:0];
-        NSString *t = nil;
-        @try {
-            if ([v isKindOfClass:[UILabel class]]) t = [(UILabel *)v text];
-            else if ([v isKindOfClass:[UITextView class]]) t = [(UITextView *)v text];
-        } @catch (NSException *e) {}
+        NSString *t = max_anyText(v);   // reads .text AND attributedText
         if (t.length && max_rowTextIsHidden(t)) return YES;
         @try { for (UIView *sv in v.subviews) [q addObject:sv]; } @catch (NSException *e) {}
     }
@@ -4081,7 +4092,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.24 loading (FULL row dump + collapse-hook logging)...");
+    maxlog(@"v12.25 loading (collapse via attributedText + LogoFormCell Госуслуги)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4256,5 +4267,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.24 loaded OK (FULL row dump + collapse-hook logging) — log file: %@", max_logPath());
+    maxlog(@"v12.25 loaded OK (collapse via attributedText + LogoFormCell Госуслуги) — log file: %@", max_logPath());
 }
