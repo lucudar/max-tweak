@@ -1623,6 +1623,8 @@ static BOOL max_titleIsPruned(NSString *title) {
     NSArray<NSString *> *pruned = @[
         @"Госуслуг",           // Госуслуги block + Войти по Госуслугам
         @"Gosuslugi",          // latin server variant
+        @"Цифровой ID",        // Digital ID settings row (TAB_DigitalID)
+        @"Digital ID",         // latin variant
         @"Вернуть уведомления",
         @"Единый вход",
         @"Пригласить друзей",  // Invite Friends
@@ -3890,7 +3892,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.19 loading (mod.typing, CallKit force-name, class dumps, hook map)...");
+    maxlog(@"v12.20 loading (prune Цифровой ID row, mod.typing, CallKit, diagnostics)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4064,5 +4066,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.19 loaded OK (mod.typing hide-typing + CallKit force-name + diagnostics) — log file: %@", max_logPath());
+    maxlog(@"v12.20 loaded OK (prune Цифровой ID + mod.typing + CallKit + diagnostics) — log file: %@", max_logPath());
 }
