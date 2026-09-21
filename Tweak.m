@@ -4197,7 +4197,14 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.33 loading (remove Потужно banner in Моды; rounder message menu)...");
+    // v12.34: honor the logs toggle from the very first line. Previously
+    // g_logsEnabled defaulted YES and was only read from defaults ~70 lines
+    // later, so a launch still wrote the whole startup burst to the file even
+    // with logging turned OFF. Read it here, before any maxlog.
+    if ([[NSUserDefaults standardUserDefaults] objectForKey:@"mod.logs"] != nil)
+        g_logsEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"mod.logs"];
+
+    maxlog(@"v12.34 loading (logs toggle honored from first line; banner off; rounded menu)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4380,5 +4387,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.33 loaded OK (banner removed, menu rounded) — log: %@", max_logPath());
+    maxlog(@"v12.34 loaded OK (logs toggle honored at startup) — log: %@", max_logPath());
 }
