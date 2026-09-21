@@ -3305,7 +3305,7 @@ static void kd_hook_deleteLocally(id self, SEL _cmd, id ids, BOOL updateChat) {
         ((void(*)(id,SEL,id,BOOL))g_origDeleteLocally)(self, _cmd, ids, updateChat);
 }
 
-static void max_installKeepDeleted(void) {
+__attribute__((unused)) static void max_installKeepDeleted(void) {
     g_ownDeletedPks = [NSMutableSet set];
     g_ownDeletedIds = [NSMutableSet set];
     g_keptDeletedIds = [NSMutableSet set];
