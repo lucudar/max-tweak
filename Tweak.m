@@ -1726,44 +1726,59 @@ static NSString *max_anyText(id v) {
     return nil;
 }
 
-static int g_settingsRowDumpBudget = 6;
+static int g_settingsRowDumpBudget = 8;   // dump the tree for the first N screens
 
+// Collect all label/textview texts inside a cell (so we see EXACTLY what row it
+// is), joined with " · ".
+static NSString *max_cellAllText(UIView *cell) {
+    NSMutableArray *parts = [NSMutableArray array];
+    NSMutableArray *q = [NSMutableArray arrayWithObject:cell];
+    int budget = 200;
+    while (q.count && budget-- > 0) {
+        UIView *v = q.firstObject; [q removeObjectAtIndex:0];
+        NSString *t = max_anyText(v);
+        if (t.length) [parts addObject:t];
+        @try { for (UIView *sv in v.subviews) [q addObject:sv]; } @catch (NSException *e) {}
+    }
+    return parts.count ? [parts componentsJoinedByString:@" · "] : @"<no text>";
+}
+
+// FULL DUMP: log EVERY cell on the screen — its class, all text, frame height,
+// and (once) the host list + layout. This is the "read every row" diagnostic.
 static void max_dumpSettingsRow(UIView *root) {
     if (!root || g_settingsRowDumpBudget <= 0) return;
+    g_settingsRowDumpBudget--;
     NSMutableArray *queue = [NSMutableArray arrayWithObject:root];
-    int budget = 1500;
+    int budget = 4000;
+    BOOL loggedHost = NO;
+    int cellIdx = 0;
     while (queue.count && budget-- > 0) {
         UIView *v = queue.firstObject;
         [queue removeObjectAtIndex:0];
-        NSString *t = max_anyText(v);
-        if (t.length && (
-                [t rangeOfString:@"Цифровой ID"].location != NSNotFound ||
-                [t rangeOfString:@"Госуслуг" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                [t rangeOfString:@"for Business"].location != NSNotFound ||
-                [t rangeOfString:@"Invite Friends"].location != NSNotFound ||
-                [t rangeOfString:@"Вернуть уведомл"].location != NSNotFound)) {
-            // climb to the hosting cell + scroll container
-            UIView *cell = nil, *host = nil;
-            for (UIView *c = v; c; c = c.superview) {
-                if (!cell && ([c isKindOfClass:[UICollectionViewCell class]] ||
-                              [c isKindOfClass:[UITableViewCell class]])) cell = c;
-                if ([c isKindOfClass:[UICollectionView class]] ||
-                    [c isKindOfClass:[UITableView class]]) { host = c; break; }
+        if ([v isKindOfClass:[UICollectionViewCell class]] ||
+            [v isKindOfClass:[UITableViewCell class]]) {
+            if (!loggedHost) {
+                UIView *host = nil;
+                for (UIView *c = v; c; c = c.superview)
+                    if ([c isKindOfClass:[UICollectionView class]] ||
+                        [c isKindOfClass:[UITableView class]]) { host = c; break; }
+                NSString *layoutCls = @"-";
+                @try {
+                    if ([host isKindOfClass:[UICollectionView class]])
+                        layoutCls = NSStringFromClass([[(UICollectionView *)host collectionViewLayout] class]);
+                } @catch (NSException *e) {}
+                maxlog(@"ROWDUMP host=%@ layout=%@ vc=%@",
+                       host ? NSStringFromClass(host.class) : @"<none>", layoutCls,
+                       NSStringFromClass(root.class));
+                loggedHost = YES;
             }
-            NSString *layoutCls = @"-";
-            @try {
-                if ([host isKindOfClass:[UICollectionView class]])
-                    layoutCls = NSStringFromClass([[(UICollectionView *)host collectionViewLayout] class]);
-            } @catch (NSException *e) {}
-            maxlog(@"SETROW: label='%@' labelCls=%@ cellCls=%@ hostCls=%@ layout=%@",
-                   t, NSStringFromClass(v.class),
-                   cell ? NSStringFromClass(cell.class) : @"<none>",
-                   host ? NSStringFromClass(host.class) : @"<none>", layoutCls);
-            g_settingsRowDumpBudget--;
-            // keep walking — log every target row on this screen, not just one
+            maxlog(@"ROWDUMP [%d] cls=%@ h=%.0f hidden=%d text='%@'",
+                   cellIdx++, NSStringFromClass(v.class), v.bounds.size.height,
+                   (int)v.hidden, max_cellAllText(v));
         }
         for (UIView *sv in v.subviews) [queue addObject:sv];
     }
+    maxlog(@"ROWDUMP end vc=%@ cells=%d", NSStringFromClass(root.class), cellIdx);
 }
 
 static IMP g_origVCDidAppear = NULL;
@@ -1841,6 +1856,8 @@ static BOOL max_cellIsHiddenRow(id cell) {
     return NO;
 }
 
+static int g_collapseLogBudget = 40;   // log the first N hook fires
+
 static id hook_formCellPreferred(id self, SEL _cmd, id attrs) {
     // find the original IMP for this instance's class (walk up if inherited)
     IMP orig = NULL;
@@ -1850,7 +1867,14 @@ static id hook_formCellPreferred(id self, SEL _cmd, id attrs) {
     }
     id r = orig ? ((id(*)(id,SEL,id))orig)(self, _cmd, attrs) : attrs;
     @try {
-        if (max_cellIsHiddenRow(self)) {
+        BOOL hide = max_cellIsHiddenRow(self);
+        if (g_collapseLogBudget > 0) {
+            g_collapseLogBudget--;
+            maxlog(@"collapse-hook: cls=%@ origFound=%d match=%d h=%.0f text='%@'",
+                   NSStringFromClass(object_getClass(self)), (int)(orig != NULL),
+                   (int)hide, [(id)r frame].size.height, max_cellAllText(self));
+        }
+        if (hide) {
             CGRect f = [(id)r frame];
             f.size.height = 0;
             [(id)r setFrame:f];
@@ -4057,7 +4081,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.23 loading (collapse Госуслуги/Business/Invite/Вернуть+Цифровой ID rows)...");
+    maxlog(@"v12.24 loading (FULL row dump + collapse-hook logging)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4232,5 +4256,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.23 loaded OK (collapse Госуслуги/Business/Invite/Вернуть+Цифровой ID rows) — log file: %@", max_logPath());
+    maxlog(@"v12.24 loaded OK (FULL row dump + collapse-hook logging) — log file: %@", max_logPath());
 }
