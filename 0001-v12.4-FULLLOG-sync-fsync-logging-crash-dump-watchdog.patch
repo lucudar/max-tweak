@@ -1,0 +1,429 @@
+From 82c615a8f5b04566fa4dd65cd9b2ccac7a24b735 Mon Sep 17 00:00:00 2001
+From: lucudar <lucudar@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 00:13:33 +0300
+Subject: [PATCH] v12.4-FULLLOG: sync fsync logging, crash dump, watchdog
+ stack, lifecycle trace
+
+- maxlog now does sync open/write/fsync on caller thread (no async loss on crash)
+- file truncation keeps last 1500 lines
+- crash handler: 96 frames, tid, g_blockRead, fsync, raw fallback
+- signal handler: code+addr, O_SYNC fd
+- uncaught exception: sync write + fsync both fds
+- watchdog: dumps main thread callStackSymbols (40 frames) on stuck
+- ghost hook verbose: logs class/args/block flag every call
+- lifecycle observers: memory warning + stack, terminate, background
+- bump pack_ipa output to Potuzhno_v12_4_FULLLOG.ipa
+---
+ Tweak.m     | 230 ++++++++++++++++++++++++++++++++++++----------------
+ pack_ipa.py |   2 +-
+ 2 files changed, 160 insertions(+), 72 deletions(-)
+
+diff --git a/Tweak.m b/Tweak.m
+index 762f703..31c955d 100644
+--- a/Tweak.m
++++ b/Tweak.m
+@@ -56,6 +56,7 @@
+ #import <string.h>
+ #import <stdio.h>
+ #import <stdlib.h>
++#import <pthread.h>
+ 
+ 
+ // ============================================================================
+@@ -142,6 +143,10 @@ static dispatch_queue_t max_logQueue(void) {
+     return q;
+ }
+ 
++// v12.4 FULL-LOG: synchronous crash-safe logger.
++// Every line is written with open/write/fsync immediately on the caller thread,
++// so a SIGSEGV right after the line still leaves it on disk. The serial queue
++// is kept only for truncation — the data path no longer depends on it.
+ static void maxlog(NSString *fmt, ...) {
+     va_list args;
+     va_start(args, fmt);
+@@ -152,25 +157,58 @@ static void maxlog(NSString *fmt, ...) {
+ 
+     NSString *path = max_logPath();
+     NSString *line = [NSString stringWithFormat:@"%@ | %@\n", [NSDate date], msg];
++    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
++    // SYNC write: open-append-fsync-close on the caller thread
++    @try {
++        const char *cpath = path.fileSystemRepresentation;
++        int fd = open(cpath, O_WRONLY | O_CREAT | O_APPEND, 0644);
++        if (fd >= 0) {
++            const void *bytes = data.bytes;
++            size_t len = data.length;
++            // handle partial writes
++            size_t off = 0;
++            while (off < len) {
++                ssize_t w = write(fd, (const char *)bytes + off, len - off);
++                if (w <= 0) break;
++                off += (size_t)w;
++            }
++            fsync(fd);
++            close(fd);
++        }
++    } @catch (NSException *e) { (void)e; }
++
++    // keep the file bounded (async, best-effort)
+     dispatch_async(max_logQueue(), ^{
+         NSFileManager *fm = [NSFileManager defaultManager];
+-        if (![fm fileExistsAtPath:path])
+-            [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+         NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
+-        if ([attrs fileSize] > 2 * 1024 * 1024)
+-            [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+-
+-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+-        if (!fh) return;
+-        [fh seekToEndOfFile];
+-        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+-        [fh closeFile];
++        if ([attrs fileSize] > 3 * 1024 * 1024) {
++            NSString *full = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
++            if (full.length > 0) {
++                NSArray *lines = [full componentsSeparatedByString:@"\n"];
++                if (lines.count > 1500) {
++                    lines = [lines subarrayWithRange:NSMakeRange(lines.count - 1500, 1500)];
++                    NSString *trimmed = [lines componentsJoinedByString:@"\n"];
++                    [trimmed writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
++                    // re-log truncation marker synchronously
++                    NSString *marker = [NSString stringWithFormat:@"%@ | log: truncated to last 1500 lines\n", [NSDate date]];
++                    NSData *md = [marker dataUsingEncoding:NSUTF8StringEncoding];
++                    int fd2 = open(path.fileSystemRepresentation, O_WRONLY|O_CREAT|O_APPEND, 0644);
++                    if (fd2 >= 0) { write(fd2, md.bytes, md.length); fsync(fd2); close(fd2); }
++                }
++            }
++        }
+     });
+ }
+ 
+-// Every 5s check that the main thread services its queue within 2s.
+-// A frozen app keeps logging "MAIN THREAD STUCK" lines with timestamps —
+-// the last lines before the hang pinpoint where it stopped.
++// Verbose helper: logs selector + object descriptions, safe for nil
++static NSString *max_desc(id obj) {
++    if (!obj) return @"nil";
++    @try { return [obj description] ?: @"<no desc>"; }
++    @catch (NSException *e) { return [NSString stringWithFormat:@"<exc %@>", e.name]; }
++}
++
++// v12.4 FULL-LOG watchdog: every 5s checks main thread. On stuck it dumps
++// the main thread's call stack via NSThread + backtrace so we see WHERE it hung.
+ static void max_scheduleWatchdog(void) {
+     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
+                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+@@ -178,7 +216,11 @@ static void max_scheduleWatchdog(void) {
+         dispatch_async(dispatch_get_main_queue(), ^{ dispatch_semaphore_signal(sem); });
+         if (dispatch_semaphore_wait(sem,
+                 dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC))) != 0) {
+-            maxlog(@"WATCHDOG: MAIN THREAD STUCK >2s — app frozen");
++            // main stuck — dump its stack
++            NSArray *stack = [NSThread callStackSymbols];
++            // keep it short: first 40 frames
++            if (stack.count > 40) stack = [stack subarrayWithRange:NSMakeRange(0, 40)];
++            maxlog(@"WATCHDOG: MAIN THREAD STUCK >2s — app frozen — main stack:\n%@", [stack componentsJoinedByString:@"\n"]);
+         }
+         max_scheduleWatchdog();
+     });
+@@ -199,21 +241,17 @@ static volatile sig_atomic_t g_inCrashHandler = 0;
+ static int g_crashFd = -1;   // cached at install time: no ObjC in the handler
+ 
+ static void max_crashLog(const char *reason) {
+-    if (g_inCrashHandler) return;   // crash inside the crash handler: give up
++    if (g_inCrashHandler) return;
+     g_inCrashHandler = 1;
+-
+-    // open()/write() directly — async-signal-safe; the fd is pre-opened
+     int fd = g_crashFd;
+     if (fd < 0) return;
+-
+-    void *frames[64];
+-    int n = backtrace(frames, 64);
+-    char header[256];
++    void *frames[96];
++    int n = backtrace(frames, 96);
++    char header[512];
+     int len = snprintf(header, sizeof(header),
+-        "CRASH: %s (pid %d) — backtrace %d frames:\n", reason, (int)getpid(), n);
+-    if (len > 0) write(fd, header, (size_t)len);
+-    // backtrace_symbols uses malloc; inside a signal handler it can technically
+-    // deadlock, but we are crashing anyway — a chance at symbols beats none
++        "\n========== CRASH ==========\n%s (pid %d, tid %lu) — backtrace %d frames:\n",
++        reason, (int)getpid(), (unsigned long)pthread_self(), n);
++    if (len > 0) { write(fd, header, (size_t)len); }
+     if (n > 0) {
+         char **syms = backtrace_symbols(frames, (size_t)n);
+         if (syms) {
+@@ -224,34 +262,55 @@ static void max_crashLog(const char *reason) {
+                 write(fd, "\n", 1);
+             }
+             free(syms);
++        } else {
++            for (int i = 0; i < n; i++) {
++                char line[64];
++                int ll = snprintf(line, sizeof(line), "  [%d] %p\n", i, frames[i]);
++                if (ll > 0) write(fd, line, (size_t)ll);
++            }
+         }
+     }
+-    write(fd, "\n", 1);
++    {
++        char extra[256];
++        int el = snprintf(extra, sizeof(extra),
++            "g_blockRead=%d  g_inCrashHandler=%d\n===========================\n\n",
++            (int)g_blockRead, (int)g_inCrashHandler);
++        if (el > 0) write(fd, extra, (size_t)el);
++    }
++    fsync(fd);
+ }
+ 
+ static void max_signalHandler(int sig, siginfo_t *info, void *ctx) {
+-    char buf[64];
+-    snprintf(buf, sizeof(buf), "signal %d at %p", sig, info ? info->si_addr : NULL);
++    (void)ctx;
++    char buf[128];
++    snprintf(buf, sizeof(buf), "signal %d code=%d addr=%p", sig, info ? info->si_code : 0, info ? info->si_addr : NULL);
+     max_crashLog(buf);
+-    // restore default and re-raise so the system still produces its report
+     signal(sig, SIG_DFL);
+     raise(sig);
+ }
+ 
+ static void max_uncaughtException(NSException *e) {
+-    maxlog(@"CRASH: UNCAUGHT EXCEPTION %@ — %@\n%@",
+-           e.name, e.reason, e.callStackSymbols);
++    // synchronous: must hit disk before the runtime kills us
++    NSString *msg = [NSString stringWithFormat:@"CRASH: UNCAUGHT EXCEPTION %@ — %@\n%@", e.name, e.reason, e.callStackSymbols];
++    NSLog(@"[MAXMods] %@", msg);
++    @try {
++        NSString *path = max_logPath();
++        NSString *line = [NSString stringWithFormat:@"%@ | %@\n", [NSDate date], msg];
++        NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
++        int fd = open(path.fileSystemRepresentation, O_WRONLY|O_CREAT|O_APPEND, 0644);
++        if (fd >= 0) { write(fd, data.bytes, data.length); fsync(fd); close(fd); }
++        if (g_crashFd >= 0) { write(g_crashFd, data.bytes, data.length); fsync(g_crashFd); }
++    } @catch (NSException *ee) { (void)ee; }
++    // also call normal path for truncation logic
++    maxlog(@"CRASH: UNCAUGHT EXCEPTION %@ — %@", e.name, e.reason);
+ }
+ 
+ static void max_installCrashCatcher(void) {
+-    // pre-open the log fd: the handler must not touch Objective-C.
+-    // Create the file first — open() on a missing path still works with O_CREAT,
+-    // but max_logPath() must run here (not inside the signal handler).
+     NSString *path = max_logPath();
+     if (![[NSFileManager defaultManager] fileExistsAtPath:path])
+         [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+     g_crashFd = open(path.fileSystemRepresentation,
+-                     O_WRONLY | O_CREAT | O_APPEND, 0644);
++                     O_WRONLY | O_CREAT | O_APPEND | O_SYNC, 0644);
+     struct sigaction sa;
+     memset(&sa, 0, sizeof(sa));
+     sa.sa_sigaction = max_signalHandler;
+@@ -1010,13 +1069,14 @@ static void max_installBrandIcons(void) {
+ static IMP orig_localized = NULL;
+ static IMP orig_infoDict = NULL;
+ static IMP orig_objectForInfo = NULL;
++static NSBundle *g_mainBundle = nil;   // captured BEFORE any NSBundle swizzle
++static BOOL g_inBrandHook = NO;
+ 
+ static NSString *max_rebrandString(NSString *s) {
+     if (![s isKindOfClass:[NSString class]] || s.length < 3) return s;
+     if ([s rangeOfString:@"MAX" options:NSCaseInsensitiveSearch].location == NSNotFound &&
+         [s rangeOfString:@"макс" options:NSCaseInsensitiveSearch].location == NSNotFound)
+         return s;
+-    // Whole-token only: "MAX" / "макс" / "Макс", not "maximum" / "max_logo".
+     static NSRegularExpression *re = nil;
+     static dispatch_once_t once;
+     dispatch_once(&once, ^{
+@@ -1030,56 +1090,58 @@ static NSString *max_rebrandString(NSString *s) {
+                                    withTemplate:@"Потужно"];
+ }
+ 
+-static BOOL max_isAppBundle(NSBundle *b) {
+-    if (!b) return NO;
+-    NSBundle *main = [NSBundle mainBundle];
+-    if (b == main) return YES;
+-    NSString *ident = b.bundleIdentifier ?: @"";
+-    if ([ident hasPrefix:@"ru.oneme"] || [ident containsString:@"MAX"]) return YES;
+-    NSString *path = b.bundlePath ?: @"";
+-    return [path containsString:@".app/"];
++static BOOL max_isDisplayInfoKey(NSString *key) {
++    if (![key isKindOfClass:[NSString class]]) return NO;
++    return [key isEqualToString:@"CFBundleDisplayName"]
++        || [key isEqualToString:@"NSCameraUsageDescription"]
++        || [key isEqualToString:@"NSContactsUsageDescription"]
++        || [key isEqualToString:@"NSLocalNetworkUsageDescription"]
++        || [key isEqualToString:@"NSPhotoLibraryAddUsageDescription"]
++        || [key isEqualToString:@"NSPhotoLibraryUsageDescription"];
+ }
+ 
+ static id hook_localized(id self, SEL _cmd, NSString *key, NSString *value, NSString *table) {
+     id r = orig_localized
+         ? ((id(*)(id,SEL,id,id,id))orig_localized)(self, _cmd, key, value, table)
+         : value;
+-    if (!max_isAppBundle((NSBundle *)self)) return r;
++    if (g_inBrandHook) return r;
++    if (self != g_mainBundle) return r;
++    g_inBrandHook = YES;
+     id branded = max_rebrandString(r);
++    g_inBrandHook = NO;
+     return branded ?: r;
+ }
+ 
+-static NSMutableDictionary *g_brandedInfoCache = nil;
++static NSDictionary *g_brandedMainInfo = nil;
+ 
+ static id hook_infoDict(id self, SEL _cmd) {
+     NSDictionary *d = orig_infoDict
+         ? ((id(*)(id,SEL))orig_infoDict)(self, _cmd)
+         : nil;
+-    if (!max_isAppBundle((NSBundle *)self)) return d;
++    if (g_inBrandHook) return d;
++    if (self != g_mainBundle) return d;
+     if (![d isKindOfClass:[NSDictionary class]]) return d;
+-    if (!g_brandedInfoCache) g_brandedInfoCache = [NSMutableDictionary new];
+-    NSString *cacheKey = ((NSBundle *)self).bundlePath ?: @"main";
+-    NSDictionary *cached = g_brandedInfoCache[cacheKey];
+-    if (cached) return cached;
+-    static NSSet *keys = nil;
++    if (g_brandedMainInfo) return g_brandedMainInfo;
++
++    g_inBrandHook = YES;
++    NSMutableDictionary *m = [d mutableCopy];
++    id dn = m[@"CFBundleDisplayName"];
++    if ([dn isKindOfClass:[NSString class]]) m[@"CFBundleDisplayName"] = @"Потужно";
++    // CFBundleName / CFBundleExecutable stay MAX — dyld and codesign look them up.
++    static NSArray *usageKeys = nil;
+     static dispatch_once_t once;
+     dispatch_once(&once, ^{
+-        keys = [NSSet setWithArray:@[
+-            @"CFBundleDisplayName", @"CFBundleName",
++        usageKeys = @[
+             @"NSCameraUsageDescription", @"NSContactsUsageDescription",
+             @"NSLocalNetworkUsageDescription",
+             @"NSPhotoLibraryAddUsageDescription",
+             @"NSPhotoLibraryUsageDescription",
+-        ]];
++        ];
+     });
+-    NSMutableDictionary *m = [d mutableCopy];
+-    BOOL changed = NO;
+-    for (NSString *k in keys) {
++    for (NSString *k in usageKeys) {
+         id v = m[k];
+         NSString *b = max_rebrandString(v);
+-        if ([k isEqualToString:@"CFBundleDisplayName"] || [k isEqualToString:@"CFBundleName"])
+-            b = @"Потужно";
+-        if (b && ![b isEqual:v]) { m[k] = b; changed = YES; }
++        if (b && ![b isEqual:v]) m[k] = b;
+     }
+     id alt = m[@"INAlternativeAppNames"];
+     if ([alt isKindOfClass:[NSArray class]]) {
+@@ -1087,30 +1149,35 @@ static id hook_infoDict(id self, SEL _cmd) {
+         for (id item in alt) {
+             if ([item isKindOfClass:[NSDictionary class]]) {
+                 NSMutableDictionary *im = [item mutableCopy];
+-                NSString *n = max_rebrandString(im[@"INAlternativeAppName"]);
+-                if (n) im[@"INAlternativeAppName"] = n;
++                im[@"INAlternativeAppName"] = @"Потужно";
+                 [na addObject:im];
+             } else {
+                 [na addObject:item];
+             }
+         }
+         m[@"INAlternativeAppNames"] = na;
+-        changed = YES;
+     }
+-    NSDictionary *result = changed ? [m copy] : d;
+-    g_brandedInfoCache[cacheKey] = result;
+-    return result;
++    g_brandedMainInfo = [m copy];
++    g_inBrandHook = NO;
++    return g_brandedMainInfo;
+ }
+ 
+ static id hook_objectForInfo(id self, SEL _cmd, NSString *key) {
+     id v = orig_objectForInfo
+         ? ((id(*)(id,SEL,id))orig_objectForInfo)(self, _cmd, key)
+         : nil;
+-    if (!max_isAppBundle((NSBundle *)self)) return v;
+-    return max_rebrandString(v) ?: v;
++    if (g_inBrandHook) return v;
++    if (self != g_mainBundle) return v;
++    if ([key isEqualToString:@"CFBundleDisplayName"]) return @"Потужно";
++    if (!max_isDisplayInfoKey(key)) return v;   // NEVER rewrite Executable/Name/id
++    g_inBrandHook = YES;
++    id branded = max_rebrandString(v);
++    g_inBrandHook = NO;
++    return branded ?: v;
+ }
+ 
+ static void max_installBrandStrings(void) {
++    g_mainBundle = [NSBundle mainBundle];
+     orig_localized = swizzle([NSBundle class],
+         @selector(localizedStringForKey:value:table:), (IMP)hook_localized);
+     orig_infoDict = swizzle([NSBundle class],
+@@ -1936,8 +2003,10 @@ static IMP g_origMarkAsRead = NULL;
+ static IMP g_origMarkReactionAsRead = NULL;
+ 
+ static id max_hook_read2(id self, SEL _cmd, id a, id b) {
++    // FULL-LOG: every invocation, with class + args
++    maxlog(@"ghost: IN %@ self=%@(%p) a=%@ b=%@ block=%d", NSStringFromSelector(_cmd), NSStringFromClass(object_getClass(self)), self, max_desc(a), max_desc(b), (int)g_blockRead);
+     if (g_blockRead) {
+-        maxlog(@"ghost: drop %@ (mod.read ON)", NSStringFromSelector(_cmd));
++        maxlog(@"ghost: DROP %@ (mod.read ON)", NSStringFromSelector(_cmd));
+         return nil;
+     }
+     IMP o = NULL;
+@@ -3217,7 +3286,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
+ 
+ __attribute__((constructor))
+ static void maxmods_init(void) {
+-    maxlog(@"v12.3 loading (read-off fix, overlay polish, Потужно strings)...");
++    maxlog(@"v12.4-FULLLOG loading (sync flush, crash dump, watchdog stack, lifecycle), overlay polish, Потужно strings)...");
+ 
+     // 0) Crash catcher first: if anything below (or the async server response
+     //    handling) kills the process, the backtrace lands in this log.
+@@ -3335,5 +3404,24 @@ static void maxmods_init(void) {
+ 
+     max_scheduleWatchdog();
+ 
++    // FULL-LOG: lifecycle + memory warnings
++    @try {
++        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidReceiveMemoryWarningNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){
++            maxlog(@"LIFECYCLE: didReceiveMemoryWarning");
++            NSArray *st = [NSThread callStackSymbols];
++            if (st.count > 30) st = [st subarrayWithRange:NSMakeRange(0,30)];
++            maxlog(@"LIFECYCLE: stack at warning:\n%@", [st componentsJoinedByString:@"\n"]);
++        }];
++        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillTerminateNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){
++            maxlog(@"LIFECYCLE: willTerminate");
++        }];
++        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){
++            maxlog(@"LIFECYCLE: didEnterBackground");
++        }];
++        maxlog(@"LIFECYCLE: observers installed (memory/terminate/background)");
++    } @catch (NSException *e) { maxlog(@"LIFECYCLE: observer install failed %@", e); }
++
++    // bump version string in log so we know FULL-LOG is active
++    maxlog(@"v12.4-FULLLOG loaded OK — log file: %@ (sync/fsync, watchdog stack, crash dump, lifecycle)", max_logPath());
+     maxlog(@"v12.3 loaded OK — log file: %@", max_logPath());
+ }
+diff --git a/pack_ipa.py b/pack_ipa.py
+index d43ed2d..da54156 100644
+--- a/pack_ipa.py
++++ b/pack_ipa.py
+@@ -17,7 +17,7 @@ from pathlib import Path
+ 
+ IPA_SRC = Path(r"C:\rev\rev\Potuzhno_v12_1_FINAL.ipa")
+ DYLIB_SRC = Path(r"C:\Users\ll\Desktop\max-tweak\MAXMods.dylib")
+-IPA_OUT = Path(r"C:\Users\ll\Desktop\max-tweak\Potuzhno_v12_3.ipa")
++IPA_OUT = Path(r"C:\Users\ll\Desktop\max-tweak\Potuzhno_v12_4_FULLLOG.ipa")
+ MEMBER = "Payload/MAX.app/Frameworks/Mods.dylib"
+ MH_MAGIC_64 = 0xFEEDFACF
+ 
+-- 
+2.55.0.windows.3
+

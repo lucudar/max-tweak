@@ -1898,7 +1898,7 @@ static BOOL max_cellIsHiddenRow(id cell) {
     return NO;
 }
 
-static int g_collapseLogBudget = 40;   // log the first N hook fires
+static int g_collapseLogBudget = 150;   // log the first N hook fires
 
 static id hook_formCellPreferred(id self, SEL _cmd, id attrs) {
     // find the original IMP for this instance's class (walk up if inherited)
@@ -1930,28 +1930,46 @@ static id hook_formCellPreferred(id self, SEL _cmd, id attrs) {
 
 static void max_installDigitalIdCollapse(void) {
     if (!g_formCellOrigs) g_formCellOrigs = [NSMutableDictionary dictionary];
-    // Every self-sizing OMFormKit cell class that could host a blacklisted row.
-    NSArray<NSString *> *names = @[
-        @"OMFormKit.URLImageActionFormCell",  // standard icon+title rows
-        @"OMFormKit.LogoFormCell",            // Госуслуги logo banner
-        @"OMFormKit.GenericFormCell",
-        @"OMFormKit.ButtonFormCell",
-        @"OMFormKit.BadgeButtonFormCell",
-        @"OMFormKit.DescriptionFormCell",
-    ];
-    int ok = 0;
-    for (NSString *n in names) {
-        Class cell = NSClassFromString(n);
-        if (!cell) { maxlog(@"rows-collapse: %@ not found", n); continue; }
-        IMP orig = swizzle(cell,
-            @selector(preferredLayoutAttributesFittingAttributes:),
-            (IMP)hook_formCellPreferred);
-        if (orig) {
-            g_formCellOrigs[n] = [NSValue valueWithPointer:orig];
-            ok++;
-        }
+    // Dynamically enumerate EVERY loaded class whose name marks it as a
+    // self-sizing settings cell — any *FormCell (OMFormKit) plus SettingsUI /
+    // OMUIKit banner-carousel cells — and swizzle
+    // -preferredLayoutAttributesFittingAttributes: on each that implements it
+    // (directly or inherited). A fixed name list missed the "for Business"
+    // banner, which uses a cell class we hadn't listed. This catches all of
+    // them without guessing names.
+    unsigned int n = 0;
+    Class *all = objc_copyClassList(&n);
+    SEL sel = @selector(preferredLayoutAttributesFittingAttributes:);
+    int ok = 0, seen = 0;
+    for (unsigned int i = 0; i < n; i++) {
+        Class c = all[i];
+        const char *cn = class_getName(c);
+        if (!cn) continue;
+        NSString *name = [NSString stringWithUTF8String:cn];
+        BOOL isFormCell   = ([name rangeOfString:@"FormCell"].location != NSNotFound);
+        BOOL isBannerCell = ([name rangeOfString:@"Banner"].location != NSNotFound &&
+                             [name rangeOfString:@"Cell"].location   != NSNotFound);
+        BOOL isSettingsCell = ([name rangeOfString:@"SettingsUI"].location != NSNotFound &&
+                               [name rangeOfString:@"Cell"].location       != NSNotFound);
+        if (!isFormCell && !isBannerCell && !isSettingsCell) continue;
+        @try {
+            // must be a UIView subclass that actually responds to the layout selector
+            if (class_isMetaClass(c)) continue;
+            if (!class_respondsToSelector(object_getClass(c), @selector(isSubclassOfClass:))) continue;
+            if (![c isSubclassOfClass:[UIView class]]) continue;
+            if (!class_getInstanceMethod(c, sel)) continue;
+            seen++;
+            if (g_formCellOrigs[name]) continue;   // already hooked
+            IMP orig = swizzle(c, sel, (IMP)hook_formCellPreferred);
+            if (orig) {
+                g_formCellOrigs[name] = [NSValue valueWithPointer:orig];
+                ok++;
+                maxlog(@"rows-collapse: hooked %@", name);
+            }
+        } @catch (NSException *e) {}
     }
-    maxlog(@"rows-collapse: hooked %d OMFormKit cell class(es)", ok);
+    free(all);
+    maxlog(@"rows-collapse: hooked %d/%d settings cell class(es)", ok, seen);
 }
 
 // ============================================================================
