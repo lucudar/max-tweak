@@ -1713,7 +1713,75 @@ static void hook_setSections(id self, SEL _cmd, NSArray *sections) {
         ((void(*)(id,SEL,id))orig_setSections)(self, _cmd, sections);
 }
 
+// ---- Settings row DIAGNOSTIC: find who hosts "Цифровой ID" ----------------
+// The setSections: pruner is dead for the main Settings screen (log 12: 0
+// sections-dump lines). That screen is pure-Swift SettingsUI. To collapse the
+// row cleanly we need the exact cell class + list/layout, so dump them once
+// when a screen containing the target label appears.
+static NSString *max_anyText(id v) {
+    @try {
+        if ([v isKindOfClass:[UILabel class]]) return [(UILabel *)v text];
+        if ([v isKindOfClass:[UITextView class]]) return [(UITextView *)v text];
+    } @catch (NSException *e) {}
+    return nil;
+}
+
+static int g_settingsRowDumpBudget = 6;
+
+static void max_dumpSettingsRow(UIView *root) {
+    if (!root || g_settingsRowDumpBudget <= 0) return;
+    NSMutableArray *queue = [NSMutableArray arrayWithObject:root];
+    int budget = 1500;
+    while (queue.count && budget-- > 0) {
+        UIView *v = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        NSString *t = max_anyText(v);
+        if (t.length && ([t rangeOfString:@"Цифровой ID"].location != NSNotFound ||
+                         [t rangeOfString:@"Digital ID"].location != NSNotFound)) {
+            // climb to the hosting cell + scroll container
+            UIView *cell = nil, *host = nil;
+            for (UIView *c = v; c; c = c.superview) {
+                if (!cell && ([c isKindOfClass:[UICollectionViewCell class]] ||
+                              [c isKindOfClass:[UITableViewCell class]])) cell = c;
+                if ([c isKindOfClass:[UICollectionView class]] ||
+                    [c isKindOfClass:[UITableView class]]) { host = c; break; }
+            }
+            NSString *layoutCls = @"-";
+            @try {
+                if ([host isKindOfClass:[UICollectionView class]])
+                    layoutCls = NSStringFromClass([[(UICollectionView *)host collectionViewLayout] class]);
+            } @catch (NSException *e) {}
+            maxlog(@"SETROW: label='%@' labelCls=%@ cellCls=%@ hostCls=%@ layout=%@",
+                   t, NSStringFromClass(v.class),
+                   cell ? NSStringFromClass(cell.class) : @"<none>",
+                   host ? NSStringFromClass(host.class) : @"<none>", layoutCls);
+            g_settingsRowDumpBudget--;
+            return;
+        }
+        for (UIView *sv in v.subviews) [queue addObject:sv];
+    }
+}
+
+static IMP g_origVCDidAppear = NULL;
+static void hook_vcDidAppear(id self, SEL _cmd, BOOL animated) {
+    if (g_origVCDidAppear)
+        ((void(*)(id,SEL,BOOL))g_origVCDidAppear)(self, _cmd, animated);
+    if (g_settingsRowDumpBudget > 0) {
+        UIView *root = nil;
+        @try { root = [(UIViewController *)self view]; } @catch (NSException *e) {}
+        if (root) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                dispatch_get_main_queue(), ^{ @try { max_dumpSettingsRow(root); } @catch (NSException *e) {} });
+        }
+    }
+}
+
 static void max_installSettingsPruner(void) {
+    // Diagnostic: dump the cell class that renders "Цифровой ID".
+    g_origVCDidAppear = swizzle([UIViewController class], @selector(viewDidAppear:),
+                                (IMP)hook_vcDidAppear);
+    maxlog(@"setrow-diag: viewDidAppear hook %@", g_origVCDidAppear ? @"OK" : @"MISS");
+
     Class cls = objc_getClass("OKMActionsViewModel");
     if (!cls) {
         maxlog(@"settings-prune: OKMActionsViewModel not found");
@@ -3892,7 +3960,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.20 loading (prune Цифровой ID row, mod.typing, CallKit, diagnostics)...");
+    maxlog(@"v12.21 loading (settings-row DIAG for Цифровой ID, mod.typing, CallKit)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4066,5 +4134,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.20 loaded OK (prune Цифровой ID + mod.typing + CallKit + diagnostics) — log file: %@", max_logPath());
+    maxlog(@"v12.21 loaded OK (settings-row DIAG + mod.typing + CallKit) — log file: %@", max_logPath());
 }
