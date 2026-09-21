@@ -1,52 +1,101 @@
-# MAXMods
+# MAXMods — «Потужно»
 
-Tweak for MAX messenger (ru.oneme.app) — session persistence fixes + custom
-Telegram-style context menu for chat messages.
+A [Theos](https://theos.dev/) tweak that rebrands and privacy-hardens the **MAX**
+messenger (`ru.oneme.app`), shipped as `MAXMods.dylib` and injected into a
+re-signed IPA. The rebranded build is called **Потужно**.
 
-## Why
+> Personal app-modding project. Everything runs client-side via Objective-C
+> runtime swizzling of the app's own `@objc` methods; no server component.
 
-Long-press → «Удалить» froze the whole app on iOS 26/27: the stock system
-context menu (`UIContextMenuInteraction` on every `MessageCell`) deadlocks when
-the message is removed from the collection while the menu dismissal transition
-is still running (old-SDK binary vs new iOS).
+## Features
 
-## What v4.0 does
+### Privacy (the «Моды» screen)
+Long-press the tab bar to open **Моды**. Toggles are stored on-device and take
+effect immediately:
 
-- Replaces the **system** context menu for chat messages with a custom
-  Telegram-style overlay (blur panel, icons, lifted message snapshot, haptics):
-  iOS never starts a system context menu for message cells, so the deadlock
-  path is gone entirely.
-- Menu items and their handlers are the app's own actions (`provideActionsForMessage:`),
-  so delete/edit/reply/pin/forward — including confirmation alerts — work
-  unchanged.
-- Any interception failure falls back to the stock system menu.
-- Session persistence fixes for re-signed builds (keychain team group,
-  app-group container, `NSUserDefaults` suite).
+- **Не отправлять «прочитано»** (`mod.read`) — the other side never sees your
+  read receipts (dedicated original-IMP hooks on `OKMChatHandler` so turning it
+  OFF actually sends them again).
+- **Скрывать «печатает…»** (`mod.typing`) — swallow the typing indicator so the
+  other side doesn't see you composing.
+
+### Anti-tracking / anonymity
+- **All telemetry blocked.** Every MyTracker path (`MRMainTracker`,
+  `MREventTracker`, `MRMyTrackerService`) and the central `OKMStatisticsService`
+  aggregator that every `*StatService` feeds are hooked to no-ops. Ad/promo
+  banners, suggested chats, advertising identifier, install/launch/update
+  events, push stats and location writes are all neutralized. (Audit: the app
+  bundles **no** third-party analytics SDK — MyTracker is the only family.)
+- **Госуслуги / Цифровой ID removed.** The native entry points on `OKMRouter`
+  (`_openDigitalIdTabWithReload:…`, `_digitalIdWebAppContainerController`,
+  `_showDigitalidTooltipIfNeeded:`) are killed, so the tab never opens and the
+  Госуслуги web-app (`goskey.gosuslugi.ru`) is never built. Login (phone+SMS /
+  2FA) is a separate flow and is untouched.
+- **Calls tab, microphone and camera** are disabled (chat-only messenger); the
+  mic/camera usage keys are stripped at repack time so iOS auto-denies access.
+
+### Settings cleanup
+Junk / unwanted rows are collapsed to zero height (self-sizing `OMFormKit`
+cells via `-preferredLayoutAttributesFittingAttributes:`), so rows below shift
+up with no gap: **Цифровой ID**, **Госуслуги** banner, **Потужно for Business**,
+**Invite Friends**, **Вернуть уведомления**, **Семейная защита**, **Уведомления**.
+
+### UI / branding
+- In-app `MAX`/`Макс` strings rebranded to **Потужно** at runtime (word-boundary
+  regex), incl. the CallKit active-call pill.
+- Custom **Telegram-style context menu** for chat messages (blur panel, icons,
+  haptics, a lifted rounded-corner message snapshot) — replaces the stock
+  `UIContextMenuInteraction`, which deadlocked the whole app on delete under
+  iOS 26/27 (old-SDK binary vs new iOS). Any interception failure falls back to
+  the system menu.
+- Session-persistence fixes for re-signed builds (keychain team group, app-group
+  container, `NSUserDefaults` suite).
+
+### Debug
+- **Отладка** section: view / share / clear the log, plus a **Запись логов**
+  switch (`mod.logs`) that gates all file logging (honored from the first line
+  of the constructor — OFF is truly silent).
+
+## Repository layout
+
+| File | Purpose |
+|------|---------|
+| `Tweak.m` | The entire tweak (single translation unit). |
+| `control` | Debian package metadata / version. |
+| `Makefile` | Theos build (`ARCHS=arm64`, ARC). |
+| `.github/workflows/build.yml` | CI: builds `MAXMods.dylib` on push, publishes a Release. |
+| `pack_ipa.py` | Swap the dylib into a base IPA, rebrand display/usage plist keys, inject opaque icons. Produces the final `Potuzhno_*.ipa`. |
+
+> `pack_ipa.py` never touches `CFBundleExecutable` or bundle identifiers — only
+> user-visible display / usage-description keys are rebranded.
 
 ## Build
 
-Builds automatically via GitHub Actions on push to `master`.
-Download `MAXMods.dylib` from the latest Release.
+Pushing to `master` triggers GitHub Actions (`macos-14` + Theos), which builds
+`MAXMods.dylib` and attaches it to a new Release.
 
-Latest version: **v12.3** (2026-09-17)
+```bash
+# local Theos build (if you have the toolchain)
+make package
+```
 
-v12.3:
-- `mod.read` OFF actually sends read receipts (dedicated orig IMP on
-  `OKMChatHandler`, plus `markReactionAsReadTo:messageId:`).
-- Custom Telegram overlay: material blur, Потужно blue/yellow strip, hit-testing
-  that no longer swallows row taps.
-- Runtime rebrand of in-app MAX strings → «Потужно».
+## Pack the IPA
+
+```bash
+python pack_ipa.py <base.ipa> <MAXMods.dylib> <out.ipa>
+```
+
+This replaces `Frameworks/Mods.dylib` with the built dylib, rebrands the
+display/usage plist keys to «Потужно», and writes opaque-RGB home-screen icons.
 
 ## Install
 
-1. Download `MAXMods.dylib` from [Releases](../../releases)
-2. Inject it into the app binary with a local `inject_dylib.py` helper
-   (kept outside this repo; it copies the dylib to `Frameworks/` and adds
-   `LC_LOAD_DYLIB` to the Mach-O header — or just replace
-   `Frameworks/MAXMods.dylib` if already injected)
-3. Re-sign IPA with ESign
-4. Install via AltStore/SideStore
+1. Download `MAXMods.dylib` from [Releases](../../releases).
+2. Pack it into an IPA with `pack_ipa.py` (or replace `Frameworks/Mods.dylib`
+   in an already-injected IPA).
+3. Re-sign and install via ESign / AltStore / SideStore.
 
-> **Important:** do not ship this together with the old `Mods.dylib` (v6) —
-> its mass-swizzle hooks `_deleteMessage:context:` across all classes and
-> blocks deletion by default.
+> **Note:** push notifications cannot work on a re-signed build — APNS requires
+> the original App Store provisioning profile's `aps-environment` entitlement
+> for `ru.oneme.app`, which is stripped on re-sign. This is a code-signing
+> limitation, not a bug.

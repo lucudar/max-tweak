@@ -8,3 +8,6 @@ inject_dylib.py
 .gh_token.tmp
 output/
 *.ipa
+
+*.dylib.*.bak
+*.bak
