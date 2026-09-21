@@ -1860,12 +1860,25 @@ static BOOL max_rowTextIsHidden(NSString *t) {
             @"Цифровой ID", @"Digital ID",
             @"Госуслуг", @"ГОСУСЛУГ", @"Gosuslugi",   // banner (styled caps)
             @"for Business", @"для бизнеса",           // Потужно/MAX for Business
+            @"Business", @"бизнес",                    // robust: bare token (NBSP/lang variants)
             @"Invite Friends", @"Пригласить друзей",
             @"Вернуть уведомл", @"Return notification",
         ];
     });
+    // Normalize: collapse every whitespace run (incl. NBSP   / narrow NBSP
+    //  ) to a single ASCII space, so "for Business" matches "for Business".
+    NSString *norm = t;
+    @try {
+        static NSRegularExpression *ws = nil;
+        static dispatch_once_t wonce;
+        dispatch_once(&wonce, ^{
+            ws = [NSRegularExpression regularExpressionWithPattern:@"[\\s\\p{Z}\\x{00a0}\\x{202f}\\x{2009}]+" options:0 error:nil];
+        });
+        norm = [ws stringByReplacingMatchesInString:t options:0
+                                              range:NSMakeRange(0, t.length) withTemplate:@" "];
+    } @catch (NSException *e) {}
     for (NSString *b in bad)
-        if ([t rangeOfString:b options:NSCaseInsensitiveSearch].location != NSNotFound)
+        if ([norm rangeOfString:b options:NSCaseInsensitiveSearch].location != NSNotFound)
             return YES;
     return NO;
 }
@@ -4111,7 +4124,7 @@ static id hook_initSuite(id self, SEL _cmd, NSString *name) {
 
 __attribute__((constructor))
 static void maxmods_init(void) {
-    maxlog(@"v12.27 loading (revert global sweep - explicit cell list, fixes Settings)...");
+    maxlog(@"v12.28 loading (robust for Business match - normalize whitespace/NBSP)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4286,5 +4299,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.27 loaded OK (explicit cell list - Settings works, rows still collapse) — log file: %@", max_logPath());
+    maxlog(@"v12.28 loaded OK (for Business match: whitespace-normalized) — log file: %@", max_logPath());
 }
