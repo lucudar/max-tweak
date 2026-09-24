@@ -1,5 +1,7 @@
 /**
  * MAXMods v12.3 — «Потужно Мессенджер»
+ * v12.35: releasing the long press that opened the menu no longer taps the
+ * message under it (photo viewer used to open behind the menu).
  * v12.3: mod.read OFF actually sends receipts (dedicated orig IMP, no nil
  * fallback); reaction-read hooked too; Telegram overlay gets blur +
  * Потужно blue/yellow; in-app MAX strings swapped at runtime.
@@ -728,6 +730,66 @@ static UIColor *max_potuzhnoYellow(void) {
 
 static MAXMenuOverlay *g_overlay = nil;
 
+// ============================================================================
+#pragma mark - Stale-touch guard (v12.35)
+//
+// The config hooks return nil, so iOS treats the long press as FAILED and the
+// finger that opened our overlay still belongs to the message cell. Releasing
+// it (= "changed my mind") then fired the cell's tap / collection selection and
+// opened the photo behind the menu. While the overlay is up, every recognizer
+// still tracking a pre-overlay touch is cancelled and cell selection is dropped.
+// ============================================================================
+
+static IMP orig_appSendEvent = NULL;
+static IMP orig_cvDidSelect = NULL;
+static NSHashTable<UITouch *> *g_cancelledTouches = nil;
+
+static void max_cancelStaleTouches(UIEvent *event) {
+    UIView *ov = g_overlay;
+    if (!ov || !ov.window || event.type != UIEventTypeTouches) return;
+    if (!g_cancelledTouches) g_cancelledTouches = [NSHashTable weakObjectsHashTable];
+    for (UITouch *t in event.allTouches) {
+        // new touches hit the full-screen overlay; anything else in its window
+        // began before the menu opened
+        if (t.window != ov.window) continue;
+        if (t.view && [t.view isDescendantOfView:ov]) continue;
+        if ([g_cancelledTouches containsObject:t]) continue;
+        [g_cancelledTouches addObject:t];
+        NSUInteger n = 0;
+        for (UIGestureRecognizer *gr in [t.gestureRecognizers copy]) {
+            if (!gr.enabled) continue;
+            if (gr.view && [gr.view isDescendantOfView:ov]) continue;
+            // disabling cancels (or fails) an in-flight recognizer
+            gr.enabled = NO;
+            gr.enabled = YES;
+            n++;
+        }
+        maxlog(@"overlay: cancelled %lu recognizer(s) on the menu-opening touch",
+               (unsigned long)n);
+    }
+}
+
+static void hook_appSendEvent(id self, SEL _cmd, UIEvent *event) {
+    if (g_overlay) {
+        @try { max_cancelStaleTouches(event); }
+        @catch (NSException *e) { maxlog(@"overlay: stale-touch guard threw: %@", e); }
+    }
+    ((void(*)(id,SEL,UIEvent *))orig_appSendEvent)(self, _cmd, event);
+}
+
+// Selection is touch-based in UICollectionView, not a recognizer — guard it
+// separately. Nothing but the menu-opening touch can reach the cells while
+// the overlay covers the window.
+static void hook_cvDidSelect(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *ip) {
+    if (g_overlay) {
+        maxlog(@"overlay: swallowed didSelect %ld/%ld from the menu-opening touch",
+               (long)ip.section, (long)ip.item);
+        [cv deselectItemAtIndexPath:ip animated:NO];
+        return;
+    }
+    ((void(*)(id,SEL,id,id))orig_cvDidSelect)(self, _cmd, cv, ip);
+}
+
 @implementation MAXMenuOverlay {
     UIControl *_background;        // tap-outside to dismiss
     UIView *_snapshotView;         // Telegram-style "lifted" message (wrapper: shadow + rounded image)
@@ -804,6 +866,7 @@ static MAXMenuOverlay *g_overlay = nil;
     if (!window || !cell.superview) return NO;
 
     if (g_overlay) [(MAXMenuOverlay *)g_overlay dismissAnimated:NO];
+    [g_cancelledTouches removeAllObjects];
 
     CGRect cellFrame = [cell convertRect:cell.bounds toView:window];
 
@@ -4204,7 +4267,7 @@ static void maxmods_init(void) {
     if ([[NSUserDefaults standardUserDefaults] objectForKey:@"mod.logs"] != nil)
         g_logsEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"mod.logs"];
 
-    maxlog(@"v12.34 loading (logs toggle honored from first line; banner off; rounded menu)...");
+    maxlog(@"v12.35 loading (menu release no longer opens the message)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4238,9 +4301,19 @@ static void maxmods_init(void) {
             (IMP)hook_cvConfig);
         maxlog(@"ChatDetailController menu hook: %@",
                orig_cvConfig ? @"OK" : @"MISS");
+        orig_cvDidSelect = swizzle(chatDetail,
+            @selector(collectionView:didSelectItemAtIndexPath:),
+            (IMP)hook_cvDidSelect);
+        maxlog(@"ChatDetailController didSelect guard: %@",
+               orig_cvDidSelect ? @"OK" : @"MISS");
     } else {
         maxlog(@"WARNING: ChatDetailController class not found");
     }
+
+    // 2b) Releasing the long press must not "tap" the message under the menu.
+    orig_appSendEvent = swizzle([UIApplication class], @selector(sendEvent:),
+                                (IMP)hook_appSendEvent);
+    maxlog(@"menu stale-touch guard: %@", orig_appSendEvent ? @"OK" : @"MISS");
 
     // 3) Ads & junk blocker: promo banners, informer banners, suggested
     //    chats, myTarget ad id — all neutralized.
@@ -4387,5 +4460,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.34 loaded OK (logs toggle honored at startup) — log: %@", max_logPath());
+    maxlog(@"v12.35 loaded OK (menu stale-touch guard) — log: %@", max_logPath());
 }
