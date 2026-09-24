@@ -48,6 +48,8 @@ up with no gap: **Цифровой ID**, **Госуслуги** banner, **Пот
   `UIContextMenuInteraction`, which deadlocked the whole app on delete under
   iOS 26/27 (old-SDK binary vs new iOS). Any interception failure falls back to
   the system menu.
+  Lifting the finger that opened the menu is swallowed, so it never "taps" the
+  message underneath (e.g. opening the photo viewer).
 - Session-persistence fixes for re-signed builds (keychain team group, app-group
   container, `NSUserDefaults` suite).
 
