@@ -1,5 +1,5 @@
 /**
- * MAXMods v12.36 — MAX (privacy build)
+ * MAXMods v12.37 — MAX (privacy build)
  * v12.3: mod.read OFF actually sends receipts (dedicated orig IMP, no nil
  * fallback); reaction-read hooked too; Telegram overlay gets blur +
  * Потужно blue/yellow; in-app MAX strings swapped at runtime.
@@ -1092,9 +1092,30 @@ static BOOL max_isMediaViewerVC(UIViewController *vc) {
     return NO;
 }
 
+// v12.37: camera / mic are gone (no usage keys in Info.plist) — a capture
+// screen would make iOS kill the app the moment it touches the device.
+static BOOL max_isCaptureVC(UIViewController *vc) {
+    if (!vc) return NO;
+    NSString *n = NSStringFromClass(vc.class);
+    if ([n containsString:@"Camera"] || [n containsString:@"VideoRecorder"]
+        || [n containsString:@"AudioRecorder"] || [n containsString:@"QRCodeScanner"])
+        return YES;
+    if ([vc isKindOfClass:[UIImagePickerController class]]) {
+        @try {
+            if (((UIImagePickerController *)vc).sourceType
+                    == UIImagePickerControllerSourceTypeCamera) return YES;
+        } @catch (NSException *e) {}
+    }
+    return NO;
+}
+
 static IMP orig_presentVC = NULL;
 static void hook_presentVC(UIViewController *self, SEL _cmd, UIViewController *vc,
                            BOOL animated, void (^completion)(void)) {
+    if (max_isCaptureVC(vc)) {
+        maxlog(@"capture-guard: blocked present %@", NSStringFromClass(vc.class));
+        return;
+    }
     if ([MAXMenuOverlay isShowing] && max_isMediaViewerVC(vc)) {
         maxlog(@"photo-guard: blocked present %@ under menu", NSStringFromClass(vc.class));
         return;
@@ -1105,6 +1126,10 @@ static void hook_presentVC(UIViewController *self, SEL _cmd, UIViewController *v
 static IMP orig_pushVC = NULL;
 static void hook_pushVC(UINavigationController *self, SEL _cmd, UIViewController *vc,
                         BOOL animated) {
+    if (max_isCaptureVC(vc)) {
+        maxlog(@"capture-guard: blocked push %@", NSStringFromClass(vc.class));
+        return;
+    }
     if ([MAXMenuOverlay isShowing] && max_isMediaViewerVC(vc)) {
         maxlog(@"photo-guard: blocked push %@ under menu", NSStringFromClass(vc.class));
         return;
@@ -1136,6 +1161,247 @@ static void max_installPhotoGuard(void) {
     maxlog(@"photo-guard: present=%@ push=%@ didSelect=%@",
            orig_presentVC ? @"OK" : @"MISS", orig_pushVC ? @"OK" : @"MISS",
            orig_cvDidSelect ? @"OK" : @"-");
+}
+
+// ============================================================================
+#pragma mark - Camera / mic hard-off + composer without the voice button (v12.37)
+//
+// The IPA ships without NSCameraUsageDescription / NSMicrophoneUsageDescription.
+// Any real capture access then makes iOS terminate the app — which is what
+// happened in the attach (photo) picker: its first grid cell is a live camera
+// preview (OMPhotosPicker.OMLiveCameraCell). Report camera + mic as DENIED at
+// the AVFoundation level so every consumer takes its "no access" path without
+// ever asking TCC; the gallery (PhotoLibrary keys are present) keeps working.
+// AVFoundation is looked up at runtime — no link-time dependency.
+// ============================================================================
+
+static BOOL max_isCaptureMediaType(id type) {
+    return [type isKindOfClass:[NSString class]]
+        && ([type isEqualToString:@"vide"] || [type isEqualToString:@"soun"]
+            || [type isEqualToString:@"muxx"]);
+}
+
+static IMP orig_avAuthStatus = NULL;
+static NSInteger hook_avAuthStatus(id self, SEL _cmd, NSString *type) {
+    if (max_isCaptureMediaType(type)) return 2;   // AVAuthorizationStatusDenied
+    return ((NSInteger(*)(id,SEL,id))orig_avAuthStatus)(self, _cmd, type);
+}
+
+static IMP orig_avRequestAccess = NULL;
+static void hook_avRequestAccess(id self, SEL _cmd, NSString *type, void (^handler)(BOOL)) {
+    if (max_isCaptureMediaType(type)) {
+        maxlog(@"capture-guard: denied requestAccess(%@)", type);
+        if (handler) dispatch_async(dispatch_get_main_queue(), ^{ handler(NO); });
+        return;
+    }
+    ((void(*)(id,SEL,id,id))orig_avRequestAccess)(self, _cmd, type, handler);
+}
+
+static IMP orig_avDefaultDevice = NULL;
+static id hook_avDefaultDevice(id self, SEL _cmd, NSString *type) {
+    if (max_isCaptureMediaType(type)) return nil;
+    return ((id(*)(id,SEL,id))orig_avDefaultDevice)(self, _cmd, type);
+}
+
+static IMP orig_avDefaultDevice3 = NULL;
+static id hook_avDefaultDevice3(id self, SEL _cmd, id deviceType, NSString *type,
+                                NSInteger position) {
+    if (!type || max_isCaptureMediaType(type)) return nil;
+    return ((id(*)(id,SEL,id,id,NSInteger))orig_avDefaultDevice3)(self, _cmd,
+                                                                 deviceType, type, position);
+}
+
+static NSError *max_captureDeniedError(void) {
+    return [NSError errorWithDomain:@"MAXMods.capture" code:-11852
+                           userInfo:@{NSLocalizedDescriptionKey: @"Camera and microphone are disabled"}];
+}
+
+static IMP orig_avInputClass = NULL;
+static id hook_avInputClass(id self, SEL _cmd, id device, NSError **err) {
+    maxlog(@"capture-guard: refused AVCaptureDeviceInput");
+    if (err) *err = max_captureDeniedError();
+    return nil;
+}
+
+static IMP orig_avInputInit = NULL;
+static id hook_avInputInit(id self, SEL _cmd, id device, NSError **err) {
+    maxlog(@"capture-guard: refused -[AVCaptureDeviceInput init]");
+    if (err) *err = max_captureDeniedError();
+    return nil;
+}
+
+static IMP orig_avSessionStart = NULL;
+static void hook_avSessionStart(id self, SEL _cmd) {
+    maxlog(@"capture-guard: refused AVCaptureSession startRunning");
+}
+
+static IMP orig_audioReqPerm = NULL;
+static void hook_audioReqPerm(id self, SEL _cmd, void (^handler)(BOOL)) {
+    maxlog(@"capture-guard: denied record permission");
+    if (handler) dispatch_async(dispatch_get_main_queue(), ^{ handler(NO); });
+}
+
+static IMP orig_audioRecordPerm = NULL;
+static NSUInteger hook_audioRecordPerm(id self, SEL _cmd) {
+    return 1684369017;   // 'deny' (AVAudioSessionRecordPermissionDenied)
+}
+
+// ---- composer: the mic / round-video button is removed ---------------------
+// OKTTInputBar.OKTTInputView keeps them in separate stored properties
+// (sendButton / attachmentButton / micButton / videoButton ...), so only these
+// two are hidden — send and attach are untouched. The app flips `isHidden`
+// when the text becomes empty, so the tagged instances also get a sticky
+// setHidden:/setAlpha: override (per-instance flag, class hook installed once).
+static char kMaxNoVoiceKey;
+static NSMutableSet<NSString *> *g_noVoiceHookedClasses;
+static NSMutableDictionary<NSString *, NSValue *> *g_noVoiceOrigHidden;
+static NSMutableDictionary<NSString *, NSValue *> *g_noVoiceOrigAlpha;
+
+static IMP max_noVoiceOrig(NSDictionary<NSString *, NSValue *> *map, id obj) {
+    for (Class c = object_getClass(obj); c; c = class_getSuperclass(c)) {
+        NSValue *v = map[NSStringFromClass(c)];
+        if (v) return (IMP)v.pointerValue;
+    }
+    return NULL;
+}
+
+static void hook_noVoiceSetHidden(UIView *self, SEL _cmd, BOOL hidden) {
+    if (objc_getAssociatedObject(self, &kMaxNoVoiceKey)) hidden = YES;
+    IMP o = max_noVoiceOrig(g_noVoiceOrigHidden, self);
+    if (o) ((void(*)(id,SEL,BOOL))o)(self, _cmd, hidden);
+}
+
+static void hook_noVoiceSetAlpha(UIView *self, SEL _cmd, CGFloat alpha) {
+    if (objc_getAssociatedObject(self, &kMaxNoVoiceKey)) alpha = 0;
+    IMP o = max_noVoiceOrig(g_noVoiceOrigAlpha, self);
+    if (o) ((void(*)(id,SEL,CGFloat))o)(self, _cmd, alpha);
+}
+
+static void max_collectViews(UIView *v, NSMutableSet<NSValue *> *out, int depth) {
+    if (!v || depth > 10) return;
+    [out addObject:[NSValue valueWithPointer:(__bridge void *)v]];
+    for (UIView *sub in v.subviews) max_collectViews(sub, out, depth + 1);
+}
+
+// Read a Swift stored property by name as a raw pointer; only trust it if it is
+// one of the input view's own subviews (never message an unverified pointer).
+static UIView *max_inputSubviewIvar(UIView *host, const char *name,
+                                    NSSet<NSValue *> *known) {
+    Ivar iv = class_getInstanceVariable(object_getClass(host), name);
+    if (!iv) return nil;
+    void *raw = *(void **)((uint8_t *)(__bridge void *)host + ivar_getOffset(iv));
+    if (!raw || ![known containsObject:[NSValue valueWithPointer:raw]]) return nil;
+    return (__bridge UIView *)raw;
+}
+
+static void max_killVoiceButton(UIView *btn) {
+    if (!btn || objc_getAssociatedObject(btn, &kMaxNoVoiceKey)) return;
+    objc_setAssociatedObject(btn, &kMaxNoVoiceKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    Class c = object_getClass(btn);
+    NSString *cn = NSStringFromClass(c);
+    if (![g_noVoiceHookedClasses containsObject:cn]) {
+        [g_noVoiceHookedClasses addObject:cn];
+        // a subclass of an already-hooked class inherits the hook: don't
+        // wrap it again (its "orig" would be the hook itself -> recursion)
+        IMP h = class_getMethodImplementation(c, @selector(setHidden:))
+                    == (IMP)hook_noVoiceSetHidden ? NULL
+              : swizzle(c, @selector(setHidden:), (IMP)hook_noVoiceSetHidden);
+        IMP a = class_getMethodImplementation(c, @selector(setAlpha:))
+                    == (IMP)hook_noVoiceSetAlpha ? NULL
+              : swizzle(c, @selector(setAlpha:), (IMP)hook_noVoiceSetAlpha);
+        if (h) g_noVoiceOrigHidden[cn] = [NSValue valueWithPointer:(void *)h];
+        if (a) g_noVoiceOrigAlpha[cn] = [NSValue valueWithPointer:(void *)a];
+        maxlog(@"composer: sticky-hide hooked on %@", cn);
+    }
+    btn.hidden = YES;
+    btn.alpha = 0;
+    btn.userInteractionEnabled = NO;
+    btn.accessibilityElementsHidden = YES;
+    for (UIGestureRecognizer *g in btn.gestureRecognizers) g.enabled = NO;
+    maxlog(@"composer: voice button %@ removed", cn);
+}
+
+static IMP orig_inputLayout = NULL;
+static void hook_inputLayout(UIView *self, SEL _cmd) {
+    ((void(*)(id,SEL))orig_inputLayout)(self, _cmd);
+    @try {
+        NSMutableSet<NSValue *> *known = [NSMutableSet set];
+        max_collectViews(self, known, 0);
+        static const char *names[] = { "micButton", "videoButton" };
+        for (unsigned i = 0; i < 2; i++)
+            max_killVoiceButton(max_inputSubviewIvar(self, names[i], known));
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            if (!class_getInstanceVariable(object_getClass(self), "micButton")) {
+                unsigned n = 0;
+                Ivar *ivs = class_copyIvarList(object_getClass(self), &n);
+                NSMutableArray *names = [NSMutableArray array];
+                for (unsigned k = 0; k < n; k++)
+                    [names addObject:@(ivar_getName(ivs[k]) ?: "?")];
+                free(ivs);
+                maxlog(@"composer: micButton ivar MISSING; ivars=%@",
+                       [names componentsJoinedByString:@","]);
+            }
+        });
+    } @catch (NSException *e) {
+        maxlog(@"composer: hide failed %@", e);
+    }
+}
+
+static void max_installCaptureGuard(void) {
+    Class dev = objc_getClass("AVCaptureDevice");
+    if (dev) {
+        orig_avAuthStatus = swizzleClassMethod(dev,
+            NSSelectorFromString(@"authorizationStatusForMediaType:"), (IMP)hook_avAuthStatus);
+        orig_avRequestAccess = swizzleClassMethod(dev,
+            NSSelectorFromString(@"requestAccessForMediaType:completionHandler:"),
+            (IMP)hook_avRequestAccess);
+        orig_avDefaultDevice = swizzleClassMethod(dev,
+            NSSelectorFromString(@"defaultDeviceWithMediaType:"), (IMP)hook_avDefaultDevice);
+        orig_avDefaultDevice3 = swizzleClassMethod(dev,
+            NSSelectorFromString(@"defaultDeviceWithDeviceType:mediaType:position:"),
+            (IMP)hook_avDefaultDevice3);
+    }
+    Class input = objc_getClass("AVCaptureDeviceInput");
+    if (input) {
+        orig_avInputClass = swizzleClassMethod(input,
+            NSSelectorFromString(@"deviceInputWithDevice:error:"), (IMP)hook_avInputClass);
+        orig_avInputInit = swizzle(input,
+            NSSelectorFromString(@"initWithDevice:error:"), (IMP)hook_avInputInit);
+    }
+    Class session = objc_getClass("AVCaptureSession");
+    if (session)
+        orig_avSessionStart = swizzle(session,
+            NSSelectorFromString(@"startRunning"), (IMP)hook_avSessionStart);
+    Class as = objc_getClass("AVAudioSession");
+    if (as) {
+        orig_audioReqPerm = swizzle(as,
+            NSSelectorFromString(@"requestRecordPermission:"), (IMP)hook_audioReqPerm);
+        orig_audioRecordPerm = swizzle(as,
+            NSSelectorFromString(@"recordPermission"), (IMP)hook_audioRecordPerm);
+    }
+    Class aa = objc_getClass("AVAudioApplication");
+    if (aa) {
+        swizzleClassMethod(aa,
+            NSSelectorFromString(@"requestRecordPermissionWithCompletionHandler:"),
+            (IMP)hook_audioReqPerm);
+        swizzle(aa, NSSelectorFromString(@"recordPermission"), (IMP)hook_audioRecordPerm);
+    }
+    maxlog(@"capture-guard: status=%@ request=%@ device=%@ input=%@/%@ session=%@ audio=%@",
+           orig_avAuthStatus ? @"OK" : @"MISS", orig_avRequestAccess ? @"OK" : @"MISS",
+           orig_avDefaultDevice ? @"OK" : @"MISS", orig_avInputClass ? @"OK" : @"MISS",
+           orig_avInputInit ? @"OK" : @"MISS", orig_avSessionStart ? @"OK" : @"MISS",
+           orig_audioReqPerm ? @"OK" : @"MISS");
+
+    g_noVoiceHookedClasses = [NSMutableSet set];
+    g_noVoiceOrigHidden = [NSMutableDictionary dictionary];
+    g_noVoiceOrigAlpha = [NSMutableDictionary dictionary];
+    Class inputView = objc_getClass("_TtC12OKTTInputBar13OKTTInputView");
+    if (inputView)
+        orig_inputLayout = swizzle(inputView, @selector(layoutSubviews),
+                                   (IMP)hook_inputLayout);
+    maxlog(@"composer: OKTTInputView %@, layout hook %@",
+           inputView ? @"found" : @"MISSING", orig_inputLayout ? @"OK" : @"MISS");
 }
 
 // ============================================================================
@@ -4285,7 +4551,7 @@ static void maxmods_init(void) {
     if ([[NSUserDefaults standardUserDefaults] objectForKey:@"mod.logs"] != nil)
         g_logsEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"mod.logs"];
 
-    maxlog(@"v12.36 loading (name MAX; new icon; side-anchored menu)...");
+    maxlog(@"v12.37 loading (camera/mic hard-off; no voice button)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4324,6 +4590,7 @@ static void maxmods_init(void) {
     }
 
     max_installPhotoGuard();   // v12.35: long-press on a photo doesn't open it
+    max_installCaptureGuard(); // v12.37: no camera/mic access, no voice button
 
     // 3) Ads & junk blocker: promo banners, informer banners, suggested
     //    chats, myTarget ad id — all neutralized.
@@ -4469,5 +4736,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.36 loaded OK — log: %@", max_logPath());
+    maxlog(@"v12.37 loaded OK — log: %@", max_logPath());
 }

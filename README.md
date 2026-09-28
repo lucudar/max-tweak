@@ -33,7 +33,11 @@ effect immediately:
   Госуслуги web-app (`goskey.gosuslugi.ru`) is never built. Login (phone+SMS /
   2FA) is a separate flow and is untouched.
 - **Calls tab, microphone and camera** are disabled (chat-only messenger); the
-  mic/camera usage keys are stripped at repack time so iOS auto-denies access.
+  mic/camera usage keys are stripped at repack time. AVFoundation reports
+  camera/mic as *denied* (capture inputs/sessions are refused, camera/recorder
+  screens never open), so nothing ever trips the missing-usage-key kill — the
+  photo picker works from the gallery. The composer's **voice / round-video
+  button is removed**; send and attach stay.
 
 ### Settings cleanup
 Junk / unwanted rows are collapsed to zero height (self-sizing `OMFormKit`
