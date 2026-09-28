@@ -1,5 +1,5 @@
 /**
- * MAXMods v12.37 — MAX (privacy build)
+ * MAXMods v12.38 — MAX (privacy build)
  * v12.3: mod.read OFF actually sends receipts (dedicated orig IMP, no nil
  * fallback); reaction-read hooked too; Telegram overlay gets blur +
  * Потужно blue/yellow; in-app MAX strings swapped at runtime.
@@ -3609,12 +3609,16 @@ static void max_installGhostHooks(void) {
 // ============================================================================
 static IMP g_origStartTyping = NULL;
 
-static id hook_startTyping(id self, SEL _cmd, id type, id chat, id key) {
+// v12.38: `type` is an integer enum (3 = "sending photo"), not an object —
+// declaring it `id` made ARC objc_retain(0x3) -> SIGSEGV on every photo send.
+// All args/return are passed through as raw words: ARC never touches them.
+static void *hook_startTyping(id self, SEL _cmd, void *type, void *chat, void *key) {
     if (max_modOn(@"mod.typing")) {
-        maxlog(@"typing: DROP startSendingTyping (mod.typing ON)");
-        return nil;
+        maxlog(@"typing: DROP startSendingTyping type=%ld (mod.typing ON)", (long)type);
+        return NULL;
     }
-    return ((id(*)(id,SEL,id,id,id))g_origStartTyping)(self, _cmd, type, chat, key);
+    return ((void *(*)(id,SEL,void *,void *,void *))g_origStartTyping)(self, _cmd,
+                                                                       type, chat, key);
 }
 
 static void max_installTypingHook(void) {
@@ -4551,7 +4555,7 @@ static void maxmods_init(void) {
     if ([[NSUserDefaults standardUserDefaults] objectForKey:@"mod.logs"] != nil)
         g_logsEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"mod.logs"];
 
-    maxlog(@"v12.37 loading (camera/mic hard-off; no voice button)...");
+    maxlog(@"v12.38 loading (fix photo-send crash in typing hook)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4736,5 +4740,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.37 loaded OK — log: %@", max_logPath());
+    maxlog(@"v12.38 loaded OK — log: %@", max_logPath());
 }
