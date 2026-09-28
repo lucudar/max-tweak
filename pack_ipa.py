@@ -32,8 +32,10 @@ LOOSE_ICONS = {
     "AppIcon76x76@2x~ipad.png": "AppIcon83.5x83.5@2x~ipad.png",
 }
 
+BRAND = "MAX"  # v12.36: plain "MAX" (was «Потужно»)
 TOKEN_RE = re.compile(
-    r"(?<![A-Za-zА-Яа-яЁё0-9_])(MAX|Max|макс|Макс|МАКС)(?![A-Za-zА-Яа-яЁё0-9_])"
+    r"(?<![A-Za-zА-Яа-яЁё0-9_])(Потужно Мессенджер|Потужно|MAX|Max|макс|Макс|МАКС)"
+    r"(?![A-Za-zА-Яа-яЁё0-9_])"
 )
 
 # Keys we may rewrite on the MAIN app / localization files only.
@@ -66,7 +68,7 @@ def assert_arm64_dylib(path: Path) -> None:
 def rebrand_text(s: str) -> str:
     if not isinstance(s, str) or len(s) < 3:
         return s
-    return TOKEN_RE.sub("Потужно", s)
+    return TOKEN_RE.sub(BRAND, s)
 
 
 def _png_chunks(data: bytes):
@@ -202,8 +204,8 @@ def mutate_plist(name: str, plist):
     if is_main_app_plist(name) or is_app_lproj_strings(name):
         for k in DISPLAY_KEYS:
             if k in out and isinstance(out[k], str):
-                if out[k] != "Потужно":
-                    out[k] = "Потужно"
+                if out[k] != BRAND:
+                    out[k] = BRAND
                     changed = True
         for k in USAGE_KEYS:
             if k in out and isinstance(out[k], str):
@@ -218,7 +220,7 @@ def mutate_plist(name: str, plist):
                 if isinstance(item, dict):
                     im = dict(item)
                     if isinstance(im.get("INAlternativeAppName"), str):
-                        im["INAlternativeAppName"] = "Потужно"
+                        im["INAlternativeAppName"] = BRAND
                     na.append(im)
                 else:
                     na.append(item)
@@ -254,7 +256,7 @@ def mutate_plist(name: str, plist):
                     out[k] = branded
                     changed = True
             elif k in DISPLAY_KEYS and isinstance(v, str) and TOKEN_RE.search(v):
-                out[k] = TOKEN_RE.sub("Потужно", v)
+                out[k] = TOKEN_RE.sub(BRAND, v)
                 changed = True
         return out if changed else plist
 

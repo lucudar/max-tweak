@@ -1,8 +1,9 @@
-# MAXMods — «Потужно»
+# MAXMods — MAX (privacy build)
 
 A [Theos](https://theos.dev/) tweak that rebrands and privacy-hardens the **MAX**
 messenger (`ru.oneme.app`), shipped as `MAXMods.dylib` and injected into a
-re-signed IPA. The rebranded build is called **Потужно**.
+re-signed IPA. The app keeps the plain name **MAX** with a custom icon
+(white speech bubble on a blue→violet gradient).
 
 > Personal app-modding project. Everything runs client-side via Objective-C
 > runtime swizzling of the app's own `@objc` methods; no server component.
@@ -37,14 +38,15 @@ effect immediately:
 ### Settings cleanup
 Junk / unwanted rows are collapsed to zero height (self-sizing `OMFormKit`
 cells via `-preferredLayoutAttributesFittingAttributes:`), so rows below shift
-up with no gap: **Цифровой ID**, **Госуслуги** banner, **Потужно for Business**,
+up with no gap: **Цифровой ID**, **Госуслуги** banner, **MAX for Business**,
 **Invite Friends**, **Вернуть уведомления**, **Семейная защита**, **Уведомления**.
 
 ### UI / branding
-- In-app `MAX`/`Макс` strings rebranded to **Потужно** at runtime (word-boundary
-  regex), incl. the CallKit active-call pill.
+- Home-screen / Siri / CallKit name is plain **MAX**; custom icon (no flag).
 - Custom **Telegram-style context menu** for chat messages (blur panel, icons,
-  haptics, a lifted rounded-corner message snapshot) — replaces the stock
+  haptics, a lifted rounded-corner bubble snapshot). The panel hugs the
+  bubble's side — right-aligned under your own messages, left-aligned under
+  incoming ones; tall photos slide/shrink up so the menu fits — replaces the stock
   `UIContextMenuInteraction`, which deadlocked the whole app on delete under
   iOS 26/27 (old-SDK binary vs new iOS). Any interception failure falls back to
   the system menu.
@@ -64,7 +66,7 @@ up with no gap: **Цифровой ID**, **Госуслуги** banner, **Пот
 | `control` | Debian package metadata / version. |
 | `Makefile` | Theos build (`ARCHS=arm64`, ARC). |
 | `.github/workflows/build.yml` | CI: builds `MAXMods.dylib` on push, publishes a Release. |
-| `pack_ipa.py` | Swap the dylib into a base IPA, rebrand display/usage plist keys, inject opaque icons. Produces the final `Potuzhno_*.ipa`. |
+| `pack_ipa.py` | Swap the dylib into a base IPA, rebrand display/usage plist keys, inject opaque icons. Produces the final `MAX_*.ipa`. |
 
 > `pack_ipa.py` never touches `CFBundleExecutable` or bundle identifiers — only
 > user-visible display / usage-description keys are rebranded.
@@ -86,7 +88,8 @@ python pack_ipa.py <base.ipa> <MAXMods.dylib> <out.ipa>
 ```
 
 This replaces `Frameworks/Mods.dylib` with the built dylib, rebrands the
-display/usage plist keys to «Потужно», and writes opaque-RGB home-screen icons.
+display/usage plist keys to **MAX**, and writes opaque-RGB home-screen icons
+(from `icons/`).
 
 ## Install
 

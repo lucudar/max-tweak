@@ -1,5 +1,5 @@
 /**
- * MAXMods v12.3 — «Потужно Мессенджер»
+ * MAXMods v12.36 — MAX (privacy build)
  * v12.3: mod.read OFF actually sends receipts (dedicated orig IMP, no nil
  * fallback); reaction-read hooked too; Telegram overlay gets blur +
  * Потужно blue/yellow; in-app MAX strings swapped at runtime.
@@ -730,6 +730,37 @@ static UIColor *max_menuHairline(void) {
 
 @end
 
+// v12.36: the chat cell spans the full width, so centering on it always put
+// the menu mid-screen. Find the visible bubble inside the cell: union of
+// visible subviews narrower than the cell (full-width containers are walked
+// into, not counted). Returns the bubble in window coords, or the cell frame.
+static void max_unionBubble(UIView *v, CGFloat cellW, int depth,
+                            UIWindow *win, CGRect *acc) {
+    if (depth > 6) return;
+    for (UIView *sub in v.subviews) {
+        if (sub.hidden || sub.alpha < 0.02) continue;
+        CGSize sz = sub.bounds.size;
+        if (sz.width < 1 || sz.height < 1) continue;
+        if (sz.width >= cellW * 0.9) {           // container: look inside
+            max_unionBubble(sub, cellW, depth + 1, win, acc);
+            continue;
+        }
+        if (sz.width < 20 || sz.height < 14) continue;
+        CGRect f = [sub convertRect:sub.bounds toView:win];
+        *acc = CGRectIsNull(*acc) ? f : CGRectUnion(*acc, f);
+    }
+}
+
+static CGRect max_bubbleFrame(UIView *cell, UIWindow *win, CGRect cellFrame) {
+    CGRect acc = CGRectNull;
+    max_unionBubble(cell, cell.bounds.size.width, 0, win, &acc);
+    if (CGRectIsNull(acc) || acc.size.width < 30 || acc.size.height < 20)
+        return cellFrame;
+    acc = CGRectIntersection(acc, cellFrame);    // never outside the cell
+    if (CGRectIsNull(acc) || acc.size.width < 30) return cellFrame;
+    return acc;
+}
+
 static MAXMenuOverlay *g_overlay = nil;
 static void max_cancelPendingTaps(UIView *cell);
 
@@ -775,7 +806,6 @@ static void max_cancelPendingTaps(UIView *cell);
         _background.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0];
         _panel.transform = CGAffineTransformMakeScale(0.92, 0.92);
         _panel.alpha = 0;
-        snapshot.transform = CGAffineTransformIdentity;
         snapshot.alpha = 0;
     } completion:^(BOOL f) { finish(); }];
 }
@@ -828,35 +858,43 @@ static void max_cancelPendingTaps(UIView *cell);
     [ov addSubview:bg];
     ov->_background = bg;
 
-    // Telegram-style lifted bubble: snapshot of the long-pressed cell,
-    // placed UNDER the panel (panel must draw above the message).
+    // Telegram-style lifted bubble: snapshot of just the bubble (not the
+    // full-width cell), placed UNDER the panel.
+    CGRect bubble = max_bubbleFrame(cell, window, cellFrame);
+    BOOL rightSide = CGRectGetMidX(bubble) > CGRectGetMidX(window.bounds) + 8;
+    BOOL foundBubble = !CGRectEqualToRect(bubble, cellFrame);
+    maxlog(@"overlay: bubble=%@ cell=%@ side=%@", NSStringFromCGRect(bubble),
+           NSStringFromCGRect(cellFrame), foundBubble ? (rightSide ? @"R" : @"L") : @"C");
     UIImage *snapshot = nil;
     @try {
+        CGRect inCell = [window convertRect:bubble toView:cell];
         UIGraphicsImageRenderer *r =
-            [[UIGraphicsImageRenderer alloc] initWithSize:cell.bounds.size];
+            [[UIGraphicsImageRenderer alloc] initWithSize:inCell.size];
         snapshot = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-            [cell drawViewHierarchyInRect:cell.bounds afterScreenUpdates:NO];
+            [cell drawViewHierarchyInRect:CGRectMake(-inCell.origin.x, -inCell.origin.y,
+                                                     cell.bounds.size.width,
+                                                     cell.bounds.size.height)
+                       afterScreenUpdates:NO];
         }];
     } @catch (NSException *e) {
         snapshot = nil;
     }
     if (snapshot) {
-        // v12.33: prettier lifted bubble — rounded corners with a soft shadow.
         // masksToBounds clips a layer's own shadow, so split it: an outer
         // container carries the shadow (no clip), the inner image view clips to
         // rounded corners.
-        UIView *snapWrap = [[UIView alloc] initWithFrame:cellFrame];
+        UIView *snapWrap = [[UIView alloc] initWithFrame:bubble];
         snapWrap.userInteractionEnabled = NO;
         snapWrap.layer.shadowColor = [UIColor blackColor].CGColor;
-        snapWrap.layer.shadowOpacity = 0.28;
-        snapWrap.layer.shadowRadius = 18;
+        snapWrap.layer.shadowOpacity = 0.25;
+        snapWrap.layer.shadowRadius = 16;
         snapWrap.layer.shadowOffset = CGSizeMake(0, 6);
 
         UIImageView *snapView = [[UIImageView alloc] initWithFrame:snapWrap.bounds];
         snapView.image = snapshot;
         snapView.userInteractionEnabled = NO;
         snapView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        snapView.layer.cornerRadius = 20;
+        snapView.layer.cornerRadius = foundBubble ? 16 : 20;
         snapView.layer.cornerCurve = kCACornerCurveContinuous;
         snapView.layer.masksToBounds = YES;
         [snapWrap addSubview:snapView];
@@ -929,28 +967,46 @@ static void max_cancelPendingTaps(UIView *cell);
     panel.frame = CGRectMake(0, 0, panelWidth, y);
     blur.frame = panel.bounds;
 
-    // ---- position (Telegram-like): menu ABOVE the message bubble,
-    // below if there's no room above; horizontally centered on the bubble,
-    // clamped inside the screen.
-    CGFloat const margin = 10.0;
-    CGFloat const safeTop = 54.0;    // status bar / dynamic island
-    CGFloat const safeBottom = 40.0;
-    CGFloat wx = cellFrame.origin.x + (cellFrame.size.width - panelWidth) / 2;
-    wx = MAX(margin, MIN(wx, window.bounds.size.width - panelWidth - margin));
-
+    // ---- position (v12.36, Telegram-like): the menu hugs the bubble's side:
+    // own (right) messages get a right-aligned menu, incoming ones a
+    // left-aligned one. Prefer BELOW the bubble, then above; if neither fits
+    // (tall photo), slide/shrink the lifted bubble up so the menu fits below.
+    CGFloat const margin = 10.0, gap = 8.0;
+    CGFloat const safeTop = MAX(54.0, window.safeAreaInsets.top + 8);
+    CGFloat const safeBottom = MAX(34.0, window.safeAreaInsets.bottom + 8);
+    CGFloat const H = window.bounds.size.height, W = window.bounds.size.width;
     CGFloat panelH = panel.bounds.size.height;
+
+    CGRect target = bubble;   // where the lifted bubble ends up
     CGFloat wy;
-    if (cellFrame.origin.y - panelH - 10 >= safeTop) {
-        wy = cellFrame.origin.y - panelH - 10;               // above the bubble
-    } else if (CGRectGetMaxY(cellFrame) + panelH + 10 <=
-               window.bounds.size.height - safeBottom) {
-        wy = CGRectGetMaxY(cellFrame) + 10;                  // below
+    if (CGRectGetMaxY(bubble) + gap + panelH <= H - safeBottom) {
+        wy = CGRectGetMaxY(bubble) + gap;                       // below
+    } else if (bubble.origin.y - gap - panelH >= safeTop) {
+        wy = bubble.origin.y - gap - panelH;                    // above
     } else {
-        // neither fits: clamp to the safe area (bubble is tall on screen)
-        wy = MAX(safeTop, MIN(cellFrame.origin.y - panelH - 6,
-                              window.bounds.size.height - safeBottom - panelH));
+        CGFloat avail = H - safeTop - safeBottom - gap - panelH;
+        CGFloat sc = MIN(1.0, MAX(0.35, avail / MAX(bubble.size.height, 1)));
+        CGSize ts = CGSizeMake(bubble.size.width * sc, bubble.size.height * sc);
+        CGFloat tx = rightSide ? CGRectGetMaxX(bubble) - ts.width
+                   : (foundBubble ? bubble.origin.x
+                                  : CGRectGetMidX(bubble) - ts.width / 2);
+        CGFloat ty = MAX(safeTop, MIN(bubble.origin.y,
+                                      H - safeBottom - gap - panelH - ts.height));
+        target = CGRectMake(tx, ty, ts.width, ts.height);
+        wy = CGRectGetMaxY(target) + gap;
     }
-    panel.center = CGPointMake(wx + panelWidth / 2, wy + panelH / 2);
+
+    CGFloat wx;
+    if (!foundBubble)      wx = CGRectGetMidX(target) - panelWidth / 2;
+    else if (rightSide)    wx = CGRectGetMaxX(target) - panelWidth;
+    else                   wx = target.origin.x;
+    wx = MAX(margin, MIN(wx, W - panelWidth - margin));
+    wy = MAX(safeTop, MIN(wy, H - safeBottom - panelH));
+    // grow from the bubble's corner, like Telegram
+    CGFloat ax = !foundBubble ? 0.5 : (rightSide ? 1.0 : 0.0);
+    CGFloat ay = (wy >= CGRectGetMaxY(target)) ? 0.0 : 1.0;
+    panel.layer.anchorPoint = CGPointMake(ax, ay);
+    panel.center = CGPointMake(wx + panelWidth * ax, wy + panelH * ay);
 
     [window addSubview:ov];
 
@@ -974,12 +1030,8 @@ static void max_cancelPendingTaps(UIView *cell);
 
     // entrance animation
     UIView *snapView = ov->_snapshotView;
-    panel.transform = CGAffineTransformMakeScale(0.96, 0.96);
+    panel.transform = CGAffineTransformMakeScale(0.6, 0.6);
     panel.alpha = 0;
-    if (snapView) {
-        snapView.alpha = 0;
-        snapView.transform = CGAffineTransformMakeTranslation(0, 6);
-    }
     [UIView animateWithDuration:0.32 delay:0
          usingSpringWithDamping:0.82 initialSpringVelocity:0.45
                         options:UIViewAnimationOptionCurveEaseOut
@@ -987,10 +1039,8 @@ static void max_cancelPendingTaps(UIView *cell);
         panel.transform = CGAffineTransformIdentity;
         panel.alpha = 1;
         bg.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.28];
-        if (snapView) {
-            snapView.alpha = 1;
-            snapView.transform = CGAffineTransformIdentity;
-        }
+        if (snapView && !CGRectEqualToRect(target, bubble))
+            snapView.frame = target;   // slide/shrink a tall bubble up
     } completion:nil];
 
     return YES;
@@ -1176,8 +1226,12 @@ static void max_installBrandIcons(void) {
 }
 
 // ============================================================================
-#pragma mark - Brand strings: MAX → Потужно (runtime)
+#pragma mark - Brand strings (v12.36: name is plain "MAX"; runtime string swap off)
 // ============================================================================
+
+// v12.36: the app is called plain "MAX" again (home screen, Siri, CallKit).
+// In-app MAX/Макс strings are left as they are (no runtime rewrite).
+static NSString *const kBrandName = @"MAX";
 
 static IMP orig_localized = NULL;
 static IMP orig_infoDict = NULL;
@@ -1239,7 +1293,7 @@ static id hook_infoDict(id self, SEL _cmd) {
     g_inBrandHook = YES;
     NSMutableDictionary *m = [d mutableCopy];
     id dn = m[@"CFBundleDisplayName"];
-    if ([dn isKindOfClass:[NSString class]]) m[@"CFBundleDisplayName"] = @"Потужно";
+    if ([dn isKindOfClass:[NSString class]]) m[@"CFBundleDisplayName"] = kBrandName;
     // CFBundleName / CFBundleExecutable stay MAX — dyld and codesign look them up.
     static NSArray *usageKeys = nil;
     static dispatch_once_t once;
@@ -1251,18 +1305,14 @@ static id hook_infoDict(id self, SEL _cmd) {
             @"NSPhotoLibraryUsageDescription",
         ];
     });
-    for (NSString *k in usageKeys) {
-        id v = m[k];
-        NSString *b = max_rebrandString(v);
-        if (b && ![b isEqual:v]) m[k] = b;
-    }
+    (void)usageKeys;   // v12.36: usage texts keep the stock "MAX" wording
     id alt = m[@"INAlternativeAppNames"];
     if ([alt isKindOfClass:[NSArray class]]) {
         NSMutableArray *na = [NSMutableArray array];
         for (id item in alt) {
             if ([item isKindOfClass:[NSDictionary class]]) {
                 NSMutableDictionary *im = [item mutableCopy];
-                im[@"INAlternativeAppName"] = @"Потужно";
+                im[@"INAlternativeAppName"] = kBrandName;
                 [na addObject:im];
             } else {
                 [na addObject:item];
@@ -1281,18 +1331,15 @@ static id hook_objectForInfo(id self, SEL _cmd, NSString *key) {
         : nil;
     if (g_inBrandHook) return v;
     if (self != g_mainBundle) return v;
-    if ([key isEqualToString:@"CFBundleDisplayName"]) return @"Потужно";
-    if (!max_isDisplayInfoKey(key)) return v;   // NEVER rewrite Executable/Name/id
-    g_inBrandHook = YES;
-    id branded = max_rebrandString(v);
-    g_inBrandHook = NO;
-    return branded ?: v;
+    if ([key isEqualToString:@"CFBundleDisplayName"]) return kBrandName;
+    (void)max_isDisplayInfoKey;   // v12.36: everything else passes through
+    return v;
 }
 
 static void max_installBrandStrings(void) {
     g_mainBundle = [NSBundle mainBundle];
-    orig_localized = swizzle([NSBundle class],
-        @selector(localizedStringForKey:value:table:), (IMP)hook_localized);
+    // v12.36: no in-app string rewrite — the brand is MAX again.
+    (void)hook_localized;
     orig_infoDict = swizzle([NSBundle class],
         @selector(infoDictionary), (IMP)hook_infoDict);
     orig_objectForInfo = swizzle([NSBundle class],
@@ -1369,9 +1416,9 @@ static void max_forceProviderName(id cfg) {
         NSString *cur = nil;
         if ([cfg respondsToSelector:@selector(localizedName)])
             cur = ((id(*)(id,SEL))objc_msgSend)(cfg, @selector(localizedName));
-        if ([cur isEqualToString:@"Потужно"]) return;   // already branded
-        [cfg setValue:@"Потужно" forKey:@"localizedName"];  // KVC -> _localizedName
-        maxlog(@"callkit: provider name \"%@\" -> Потужно", cur);
+        if ([cur isEqualToString:kBrandName]) return;   // already branded
+        [cfg setValue:kBrandName forKey:@"localizedName"];  // KVC -> _localizedName
+        maxlog(@"callkit: provider name \"%@\" -> %@", cur, kBrandName);
     } @catch (NSException *e) { maxlog(@"callkit: force name err %@", e); }
 }
 
@@ -1392,7 +1439,7 @@ static id hook_cxInit(id self, SEL _cmd) {
 // and rebrand any MAX/макс token so it never leaks the old brand.
 static IMP g_origCXSetCaller = NULL;
 static void hook_cxSetCaller(id self, SEL _cmd, NSString *name) {
-    NSString *branded = max_rebrandString(name);
+    NSString *branded = name;   // v12.36: brand is MAX — nothing to rewrite
     maxlog(@"callkit: CXCallUpdate.localizedCallerName set \"%@\"%@", name,
            [branded isEqualToString:name] ? @"" :
            [NSString stringWithFormat:@" -> \"%@\"", branded]);
@@ -4238,7 +4285,7 @@ static void maxmods_init(void) {
     if ([[NSUserDefaults standardUserDefaults] objectForKey:@"mod.logs"] != nil)
         g_logsEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"mod.logs"];
 
-    maxlog(@"v12.35 loading (neutral design; Моды = long-press Settings; photo long-press guard)...");
+    maxlog(@"v12.36 loading (name MAX; new icon; side-anchored menu)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4422,5 +4469,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.35 loaded OK — log: %@", max_logPath());
+    maxlog(@"v12.36 loaded OK — log: %@", max_logPath());
 }
