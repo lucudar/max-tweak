@@ -10,7 +10,7 @@ re-signed IPA. The rebranded build is called **Потужно**.
 ## Features
 
 ### Privacy (the «Моды» screen)
-Long-press the tab bar to open **Моды**. Toggles are stored on-device and take
+Long-press the **Settings** tab to open **Моды**. Toggles are stored on-device and take
 effect immediately:
 
 - **Не отправлять «прочитано»** (`mod.read`) — the other side never sees your

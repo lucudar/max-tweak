@@ -618,11 +618,14 @@ static UIWindow *max_currentWindow(void) {
     return UIApplication.sharedApplication.keyWindow;
 }
 
-static UIColor *max_potuzhnoBlue(void) {
-    return [UIColor colorWithRed:0.0 green:87.0/255.0 blue:183.0/255.0 alpha:1.0];
-}
-static UIColor *max_potuzhnoYellow(void) {
-    return [UIColor colorWithRed:1.0 green:215.0/255.0 blue:0.0 alpha:1.0];
+// v12.35: neutral chrome (no flag colors) — system label for rows, a
+// hairline that adapts to light/dark.
+static UIColor *max_menuHairline(void) {
+    return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+        return tc.userInterfaceStyle == UIUserInterfaceStyleDark
+            ? [UIColor colorWithWhite:1 alpha:0.10]
+            : [UIColor colorWithWhite:0 alpha:0.08];
+    }];
 }
 
 // A menu row: fixed-size leading icon + left-aligned title, laid out by hand.
@@ -645,13 +648,13 @@ static UIColor *max_potuzhnoYellow(void) {
 
 - (instancetype)initWithFrame:(CGRect)frame action:(UIAction *)action {
     if ((self = [super initWithFrame:frame])) {
-        UIColor *tint = max_potuzhnoBlue();
+        UIColor *tint = UIColor.labelColor;
         if (action.attributes & UIMenuElementAttributesDestructive)
             tint = [UIColor systemRedColor];
         _action = action;
         _actionTitle = action.title ?: @"";
 
-        _highlightView = [[UIView alloc] initWithFrame:self.bounds];
+        _highlightView = [[UIView alloc] initWithFrame:CGRectInset(self.bounds, 6, 2)];
         _highlightView.autoresizingMask =
             UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         _highlightView.backgroundColor =
@@ -661,6 +664,7 @@ static UIColor *max_potuzhnoYellow(void) {
                     : [UIColor colorWithWhite:0 alpha:0.06];
             }];
         _highlightView.layer.cornerRadius = 12;
+        _highlightView.layer.cornerCurve = kCACornerCurveContinuous;
         _highlightView.hidden = YES;
         [self addSubview:_highlightView];
 
@@ -727,6 +731,7 @@ static UIColor *max_potuzhnoYellow(void) {
 @end
 
 static MAXMenuOverlay *g_overlay = nil;
+static void max_cancelPendingTaps(UIView *cell);
 
 @implementation MAXMenuOverlay {
     UIControl *_background;        // tap-outside to dismiss
@@ -860,31 +865,31 @@ static MAXMenuOverlay *g_overlay = nil;
         ov->_snapshotView = snapWrap;   // animations transform the wrapper
     }
 
-    // Card: shadow wrapper + material blur. Solid fill previously looked
-    // cheap against chat wallpaper; blur + Потужно flag strip is the
-    // replacement chrome for MAX's system menu.
+    // Card: shadow wrapper + material blur. v12.35: neutral chrome — soft
+    // black shadow, thick system material, hairline border (no flag colors).
     BOOL dark = window.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark;
     UIView *panel = [[UIView alloc] initWithFrame:CGRectZero];
-    panel.layer.cornerRadius = 20;
+    panel.layer.cornerRadius = 22;
     panel.layer.cornerCurve = kCACornerCurveContinuous;
-    panel.layer.shadowColor = max_potuzhnoBlue().CGColor;
-    panel.layer.shadowOpacity = dark ? 0.45 : 0.22;
-    panel.layer.shadowRadius = 18;
-    panel.layer.shadowOffset = CGSizeMake(0, 8);
+    panel.layer.shadowColor = [UIColor blackColor].CGColor;
+    panel.layer.shadowOpacity = dark ? 0.50 : 0.18;
+    panel.layer.shadowRadius = 24;
+    panel.layer.shadowOffset = CGSizeMake(0, 10);
     [ov addSubview:panel];
     ov->_panel = panel;
 
     UIBlurEffectStyle style = dark
-        ? UIBlurEffectStyleSystemMaterialDark
-        : UIBlurEffectStyleSystemMaterialLight;
+        ? UIBlurEffectStyleSystemThickMaterialDark
+        : UIBlurEffectStyleSystemThickMaterialLight;
     UIVisualEffectView *blur =
         [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:style]];
     blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    blur.layer.cornerRadius = 20;
+    blur.layer.cornerRadius = 22;
     blur.layer.cornerCurve = kCACornerCurveContinuous;
     blur.layer.masksToBounds = YES;
     blur.layer.borderWidth = 0.5;
-    blur.layer.borderColor = [max_potuzhnoBlue() colorWithAlphaComponent:dark ? 0.45 : 0.28].CGColor;
+    blur.layer.borderColor = [UIColor colorWithWhite:dark ? 1 : 0
+                                               alpha:dark ? 0.14 : 0.06].CGColor;
     [panel addSubview:blur];
 
     UIView *rowsHost = blur.contentView;
@@ -914,7 +919,7 @@ static MAXMenuOverlay *g_overlay = nil;
         if (i + 1 < actions.count) {
             UIView *sep = [[UIView alloc]
                 initWithFrame:CGRectMake(16, y, panelWidth - 32, 0.5)];
-            sep.backgroundColor = [max_potuzhnoBlue() colorWithAlphaComponent:dark ? 0.28 : 0.16];
+            sep.backgroundColor = max_menuHairline();
             [rowsHost addSubview:sep];
             y += 0.5;
         }
@@ -923,15 +928,6 @@ static MAXMenuOverlay *g_overlay = nil;
 
     panel.frame = CGRectMake(0, 0, panelWidth, y);
     blur.frame = panel.bounds;
-
-    // Flag strip on the leading edge (blue over yellow).
-    CGFloat const stripW = 3.0;
-    UIView *blueStrip = [[UIView alloc] initWithFrame:CGRectMake(0, 0, stripW, y / 2.0)];
-    blueStrip.backgroundColor = max_potuzhnoBlue();
-    UIView *yellowStrip = [[UIView alloc] initWithFrame:CGRectMake(0, y / 2.0, stripW, y / 2.0)];
-    yellowStrip.backgroundColor = max_potuzhnoYellow();
-    [rowsHost addSubview:blueStrip];
-    [rowsHost addSubview:yellowStrip];
 
     // ---- position (Telegram-like): menu ABOVE the message bubble,
     // below if there's no room above; horizontally centered on the bubble,
@@ -957,6 +953,14 @@ static MAXMenuOverlay *g_overlay = nil;
     panel.center = CGPointMake(wx + panelWidth / 2, wy + panelH / 2);
 
     [window addSubview:ov];
+
+    // v12.35: the finger is still down on the cell — kill its pending tap so
+    // lifting it doesn't open the photo viewer under the menu.
+    __weak UIView *weakCell = cell;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIView *c = weakCell;
+        if (c) max_cancelPendingTaps(c);
+    });
 
     UIImpactFeedbackGenerator *haptic =
         [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
@@ -993,6 +997,96 @@ static MAXMenuOverlay *g_overlay = nil;
 }
 
 @end
+
+// ============================================================================
+#pragma mark - Photo long-press: don't open the viewer under our menu (v12.35)
+//
+// Our overlay returns nil from the context-menu config, so the system menu
+// never claims the touch: when the finger lifts, the photo's own tap
+// recognizer (or the collection-view selection) still fires and the media
+// viewer opens on top of the menu. Fix in two layers:
+//   1) at present time, cancel in-flight tap recognizers on the long-pressed
+//      cell and its ancestors (toggle enabled -> state resets to cancelled);
+//   2) while the overlay is up, swallow item selection in the chat and any
+//      media-viewer present/push.
+// ============================================================================
+
+static void max_cancelTapsIn(UIView *v, int depth) {
+    if (!v || depth > 12) return;
+    for (UIGestureRecognizer *g in v.gestureRecognizers) {
+        if (![g isKindOfClass:[UITapGestureRecognizer class]] || !g.enabled) continue;
+        g.enabled = NO;
+        g.enabled = YES;
+    }
+    if ([v isKindOfClass:[UIControl class]] && ((UIControl *)v).isTracking)
+        [(UIControl *)v cancelTrackingWithEvent:nil];
+    for (UIView *sub in v.subviews) max_cancelTapsIn(sub, depth + 1);
+}
+
+static void max_cancelPendingTaps(UIView *cell) {
+    max_cancelTapsIn(cell, 0);
+    for (UIView *a = cell.superview; a; a = a.superview)
+        for (UIGestureRecognizer *g in a.gestureRecognizers)
+            if ([g isKindOfClass:[UITapGestureRecognizer class]] && g.enabled) {
+                g.enabled = NO;
+                g.enabled = YES;
+            }
+}
+
+static BOOL max_isMediaViewerVC(UIViewController *vc) {
+    if ([vc isKindOfClass:[UINavigationController class]])
+        vc = ((UINavigationController *)vc).viewControllers.firstObject ?: vc;
+    NSString *cls = NSStringFromClass(vc.class);
+    for (NSString *k in @[ @"Media", @"Photo", @"Viewer", @"Gallery" ])
+        if ([cls rangeOfString:k].location != NSNotFound) return YES;
+    return NO;
+}
+
+static IMP orig_presentVC = NULL;
+static void hook_presentVC(UIViewController *self, SEL _cmd, UIViewController *vc,
+                           BOOL animated, void (^completion)(void)) {
+    if ([MAXMenuOverlay isShowing] && max_isMediaViewerVC(vc)) {
+        maxlog(@"photo-guard: blocked present %@ under menu", NSStringFromClass(vc.class));
+        return;
+    }
+    ((void(*)(id,SEL,id,BOOL,id))orig_presentVC)(self, _cmd, vc, animated, completion);
+}
+
+static IMP orig_pushVC = NULL;
+static void hook_pushVC(UINavigationController *self, SEL _cmd, UIViewController *vc,
+                        BOOL animated) {
+    if ([MAXMenuOverlay isShowing] && max_isMediaViewerVC(vc)) {
+        maxlog(@"photo-guard: blocked push %@ under menu", NSStringFromClass(vc.class));
+        return;
+    }
+    ((void(*)(id,SEL,id,BOOL))orig_pushVC)(self, _cmd, vc, animated);
+}
+
+static IMP orig_cvDidSelect = NULL;
+static void hook_cvDidSelect(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *ip) {
+    if ([MAXMenuOverlay isShowing]) {
+        maxlog(@"photo-guard: swallowed didSelect under menu");
+        [cv deselectItemAtIndexPath:ip animated:NO];
+        return;
+    }
+    if (orig_cvDidSelect)
+        ((void(*)(id,SEL,id,id))orig_cvDidSelect)(self, _cmd, cv, ip);
+}
+
+static void max_installPhotoGuard(void) {
+    orig_presentVC = swizzle([UIViewController class],
+        @selector(presentViewController:animated:completion:), (IMP)hook_presentVC);
+    orig_pushVC = swizzle([UINavigationController class],
+        @selector(pushViewController:animated:), (IMP)hook_pushVC);
+    Class chatDetail = objc_getClass("_TtC14OMChatDetailUI20ChatDetailController");
+    if (chatDetail && max_ownInstanceMethod(chatDetail,
+            @selector(collectionView:didSelectItemAtIndexPath:)))
+        orig_cvDidSelect = swizzle(chatDetail,
+            @selector(collectionView:didSelectItemAtIndexPath:), (IMP)hook_cvDidSelect);
+    maxlog(@"photo-guard: present=%@ push=%@ didSelect=%@",
+           orig_presentVC ? @"OK" : @"MISS", orig_pushVC ? @"OK" : @"MISS",
+           orig_cvDidSelect ? @"OK" : @"-");
+}
 
 // ============================================================================
 #pragma mark - Ad & junk blocker
@@ -3581,68 +3675,15 @@ static ModEntry max_modEntries[] = {
 };
 static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntries[0]);
 
-@implementation MAXModsViewController {
-    UIView *_hdrCard;
-    UIView *_hdrBand;
-    UILabel *_hdrTitle;
-}
-
-// Потужно flag header: blue top half + yellow bottom half + wordmark. Built
-// once here; sized to the live table width in max_layoutHeader (a fixed-width
-// tableHeaderView does not auto-stretch, which left it cut off on the right).
-- (UIView *)max_makeHeader {
-    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320, 136)];
-
-    _hdrCard = [[UIView alloc] initWithFrame:CGRectZero];
-    _hdrCard.layer.cornerRadius = 18;
-    _hdrCard.layer.cornerCurve = kCACornerCurveContinuous;
-    _hdrCard.layer.masksToBounds = YES;
-    _hdrCard.backgroundColor = max_potuzhnoBlue();
-    [header addSubview:_hdrCard];
-
-    _hdrBand = [[UIView alloc] initWithFrame:CGRectZero];   // yellow lower half
-    _hdrBand.backgroundColor = max_potuzhnoYellow();
-    [_hdrCard addSubview:_hdrBand];
-
-    _hdrTitle = [[UILabel alloc] initWithFrame:CGRectZero];
-    _hdrTitle.textAlignment = NSTextAlignmentCenter;
-    _hdrTitle.font = [UIFont systemFontOfSize:30 weight:UIFontWeightHeavy];
-    _hdrTitle.text = @"ПОТУЖНО";
-    _hdrTitle.textColor = UIColor.whiteColor;
-    _hdrTitle.layer.shadowColor = [UIColor colorWithWhite:0 alpha:0.35].CGColor;
-    _hdrTitle.layer.shadowOffset = CGSizeMake(0, 1);
-    _hdrTitle.layer.shadowOpacity = 1;
-    _hdrTitle.layer.shadowRadius = 3;
-    [_hdrCard addSubview:_hdrTitle];
-
-    return header;
-}
-
-- (void)max_layoutHeader {
-    UIView *header = self.tableView.tableHeaderView;
-    if (!header) return;
-    CGFloat w = self.tableView.bounds.size.width;
-    if (w < 1) return;
-    CGFloat const inset = 16, top = 12, cardH = 104;
-    CGFloat hdrH = top + cardH + 16;
-    // resize the header view itself, then re-assign so the table picks up
-    // the new height (assigning is what forces UITableView to re-measure).
-    if (header.frame.size.width != w || header.frame.size.height != hdrH) {
-        header.frame = CGRectMake(0, 0, w, hdrH);
-        self.tableView.tableHeaderView = header;
-    }
-    _hdrCard.frame = CGRectMake(inset, top, w - inset * 2, cardH);
-    _hdrBand.frame = CGRectMake(0, cardH / 2, _hdrCard.bounds.size.width, cardH / 2);
-    _hdrTitle.frame = _hdrCard.bounds;
-}
+@implementation MAXModsViewController
 
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"Моды";
-    // v12.33: Потужно flag banner removed — cleaner list, title stays in navbar.
+    // v12.33: banner removed; v12.35: neutral system look (no flag colors).
     self.tableView.tableHeaderView = nil;
-    if (@available(iOS 13.0, *))
-        self.navigationController.navigationBar.tintColor = max_potuzhnoBlue();
+    self.navigationController.navigationBar.prefersLargeTitles = YES;
+    self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeAlways;
 }
 
 - (void)viewDidLayoutSubviews {
@@ -3659,7 +3700,7 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
        forSection:(NSInteger)section {
     if ([view isKindOfClass:[UITableViewHeaderFooterView class]]) {
         UITableViewHeaderFooterView *h = (UITableViewHeaderFooterView *)view;
-        h.textLabel.textColor = max_potuzhnoBlue();
+        h.textLabel.textColor = UIColor.secondaryLabelColor;
         h.textLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
     }
 }
@@ -3688,7 +3729,6 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
                                         reuseIdentifier:kLogTgl];
                 cell.selectionStyle = UITableViewCellSelectionStyleNone;
                 UISwitch *sw = [UISwitch new];
-                sw.onTintColor = max_potuzhnoBlue();
                 [sw addTarget:self action:@selector(logsToggleChanged:)
                      forControlEvents:UIControlEventValueChanged];
                 cell.accessoryView = sw;
@@ -3714,7 +3754,8 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
         cell.textLabel.text = titles[a];
         cell.imageView.image = [UIImage systemImageNamed:icons[a]];
         cell.imageView.tintColor = (a == 2)
-            ? [UIColor systemRedColor] : max_potuzhnoBlue();
+            ? [UIColor systemRedColor] : UIColor.secondaryLabelColor;
+        cell.textLabel.textColor = (a == 2) ? [UIColor systemRedColor] : UIColor.labelColor;
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         return cell;
     }
@@ -3723,22 +3764,17 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
                                     reuseIdentifier:kModCell];
         UISwitch *sw = [UISwitch new];
-        sw.onTintColor = max_potuzhnoBlue();
         [sw addTarget:self action:@selector(switchChanged:)
              forControlEvents:UIControlEventValueChanged];
         cell.accessoryView = sw;
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        cell.textLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+        cell.textLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightMedium];
         cell.detailTextLabel.numberOfLines = 0;
-        // leading Потужно accent bar on each mod row
-        UIView *accent = [[UIView alloc] initWithFrame:CGRectMake(0, 6, 3, 40)];
-        accent.tag = 7001;
-        accent.backgroundColor = max_potuzhnoYellow();
-        accent.layer.cornerRadius = 1.5;
-        [cell.contentView addSubview:accent];
+        cell.detailTextLabel.font = [UIFont systemFontOfSize:13];
     }
-    UIView *accent = [cell.contentView viewWithTag:7001];
-    accent.frame = CGRectMake(0, 6, 3, cell.contentView.bounds.size.height - 12);
+    cell.imageView.image = [UIImage systemImageNamed:
+        ip.row == 0 ? @"eye.slash" : @"ellipsis.bubble"];
+    cell.imageView.tintColor = UIColor.secondaryLabelColor;
     ModEntry e = max_modEntries[ip.row];
     cell.textLabel.text = e.title;
     cell.detailTextLabel.text = e.subtitle;
@@ -3830,30 +3866,6 @@ static NSUInteger const kModCount = sizeof(max_modEntries) / sizeof(max_modEntri
 
 @end
 
-static BOOL max_tabHasMods(UITabBarController *tbc) {
-    for (UIViewController *vc in tbc.viewControllers) {
-        if ([vc isKindOfClass:[MAXModsViewController class]]) return YES;
-        if ([vc isKindOfClass:[UINavigationController class]]) {
-            UIViewController *top = ((UINavigationController *)vc).topViewController;
-            if ([top isKindOfClass:[MAXModsViewController class]]) return YES;
-        }
-    }
-    return NO;
-}
-
-static UINavigationController *max_makeModsNav(void) {
-    MAXModsViewController *vc = [[MAXModsViewController alloc]
-        initWithStyle:UITableViewStyleGrouped];
-    UINavigationController *nav = [[UINavigationController alloc]
-        initWithRootViewController:vc];
-    UITabBarItem *item = [[UITabBarItem alloc]
-        initWithTitle:@"Моды"
-                image:[UIImage systemImageNamed:@"gearshape.2"]
-                  tag:999];
-    nav.tabBarItem = item;
-    return nav;
-}
-
 static void max_injectModsTab(void);
 static void maxmods_tabBarLongPressImp(id self, SEL _cmd,
                                        UILongPressGestureRecognizer *gesture);
@@ -3899,17 +3911,8 @@ static void max_injectModsTab(void) {
             class_addMethod([tbc class], @selector(maxmods_tabBarLongPress:),
                             (IMP)maxmods_tabBarLongPressImp, "v@:@");
         max_attachModsLongPress(tbc);
-
-        if (max_tabHasMods(tbc)) return;   // tab already there
-        if (tbc.viewControllers.count < 2) { max_retryModsTab(); return; }
-        NSMutableArray *vcs = [tbc.viewControllers mutableCopy];
-        [vcs addObject:max_makeModsNav()];
-        [tbc setViewControllers:vcs animated:NO];
-        // the app uses a custom tab bar that may not relayout on its own
-        [tbc.view setNeedsLayout];
-        [tbc.view layoutIfNeeded];
-        maxlog(@"mods: tab injected (root=%@)",
-               NSStringFromClass(win.rootViewController.class));
+        // v12.35: no dedicated Моды tab any more — the only entry is a
+        // long-press on the Settings tab button.
         return;
     }
     max_retryModsTab();
@@ -3931,6 +3934,36 @@ static void max_periodicModsTabCheck(void) {
 // how the controller tree is wrapped. Long-press the Settings/Profile tab
 // (the last one) for 0.5s to open the Моды screen as a modal.
 // ============================================================================
+
+// v12.35: is the press on the Settings tab button (the LAST tab control)?
+// Hit-test the window, climb to the tab control, and compare it with its
+// sibling controls — Settings is the right-most one.
+static BOOL max_pressIsOnSettingsTab(UILongPressGestureRecognizer *gesture) {
+    UIWindow *win = gesture.view.window ?: (UIWindow *)
+        ([gesture.view isKindOfClass:[UIWindow class]] ? gesture.view : nil);
+    if (!win) return NO;
+    CGPoint p = [gesture locationInView:win];
+    UIView *hit = [win hitTest:p withEvent:nil];
+    UIView *ctl = nil;
+    for (UIView *v = hit; v && v != win; v = v.superview) {
+        NSString *cls = NSStringFromClass(v.class);
+        if ([cls rangeOfString:@"TabBarControl"].location != NSNotFound ||
+            [cls isEqualToString:@"UITabBarButton"]) { ctl = v; break; }
+    }
+    if (!ctl || !ctl.superview) {
+        maxlog(@"mods: LP not on a tab control (hit=%@)", NSStringFromClass(hit.class));
+        return NO;
+    }
+    CGFloat maxX = -1; UIView *last = nil;
+    for (UIView *sib in ctl.superview.subviews) {
+        if (sib.class != ctl.class || sib.hidden || sib.alpha < 0.01) continue;
+        CGRect f = [sib convertRect:sib.bounds toView:win];
+        if (CGRectGetMinX(f) > maxX) { maxX = CGRectGetMinX(f); last = sib; }
+    }
+    BOOL ok = (last == ctl);
+    maxlog(@"mods: LP on tab control %@ — settings=%d", NSStringFromClass(ctl.class), (int)ok);
+    return ok;
+}
 
 static void maxmods_tabBarLongPressImp(id self, SEL _cmd,
                                        UILongPressGestureRecognizer *gesture) {
@@ -3955,6 +3988,7 @@ static void maxmods_tabBarLongPressImp(id self, SEL _cmd,
         maxlog(@"mods: BAR long-press BEGAN on %@ at x=%.0f w=%.0f",
                NSStringFromClass(gv.class), point.x, gv.bounds.size.width);
     }
+    if (!max_pressIsOnSettingsTab(gesture)) return;
 
     UIViewController *host = nil;
     UIResponder *responder = gv;
@@ -4204,7 +4238,7 @@ static void maxmods_init(void) {
     if ([[NSUserDefaults standardUserDefaults] objectForKey:@"mod.logs"] != nil)
         g_logsEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"mod.logs"];
 
-    maxlog(@"v12.34 loading (logs toggle honored from first line; banner off; rounded menu)...");
+    maxlog(@"v12.35 loading (neutral design; Моды = long-press Settings; photo long-press guard)...");
 
     // 0) Crash catcher first: if anything below (or the async server response
     //    handling) kills the process, the backtrace lands in this log.
@@ -4241,6 +4275,8 @@ static void maxmods_init(void) {
     } else {
         maxlog(@"WARNING: ChatDetailController class not found");
     }
+
+    max_installPhotoGuard();   // v12.35: long-press on a photo doesn't open it
 
     // 3) Ads & junk blocker: promo banners, informer banners, suggested
     //    chats, myTarget ad id — all neutralized.
@@ -4291,10 +4327,9 @@ static void maxmods_init(void) {
     // mod.del ("Видеть удалённые") removed in v12.30 — hooks not installed.
     max_installSysmenuDiagnostics();
 
-    // 6) «Моды» entry points:
-    //    a) long-press (0.5s) the LAST tab (Settings) — the reliable way,
-    //       ported from the old tweak (7a437bb);
-    //    b) keep trying to inject a dedicated tab as well.
+    // 6) «Моды» entry: long-press (0.5s) the Settings tab button only
+    //    (v12.35 — the dedicated tab is gone; max_injectModsTab now just
+    //    keeps the recognizer attached to the live tab bar).
     {
         Class tabBarVC = objc_getClass("_TtC7OMUIKit16TabBarController");
         if (tabBarVC) {
@@ -4387,5 +4422,5 @@ static void maxmods_init(void) {
     }
     maxlog(@"========================================================");
 
-    maxlog(@"v12.34 loaded OK (logs toggle honored at startup) — log: %@", max_logPath());
+    maxlog(@"v12.35 loaded OK — log: %@", max_logPath());
 }
